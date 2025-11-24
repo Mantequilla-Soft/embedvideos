@@ -175,6 +175,62 @@ export class Database {
     await keysCollection.updateOne({ key }, { $set: { lastUsed: new Date() } });
   }
 
+  // User Stats Methods
+  async incrementUserUpload(username: string, fileSize: number): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const usersCollection = this.db.collection<User>('embed-users');
+    await usersCollection.updateOne(
+      { username },
+      {
+        $inc: {
+          'stats.totalUploads': 1,
+          'stats.totalStorageUsed': fileSize
+        },
+        $set: {
+          'stats.lastUpload': new Date(),
+          lastActivity: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+  }
+
+  async incrementUserSuccess(username: string): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const usersCollection = this.db.collection<User>('embed-users');
+    await usersCollection.updateOne(
+      { username },
+      {
+        $inc: { 'stats.successfulUploads': 1 },
+        $set: {
+          lastActivity: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+  }
+
+  async incrementUserFailure(username: string): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const usersCollection = this.db.collection<User>('embed-users');
+    await usersCollection.updateOne(
+      { username },
+      {
+        $inc: { 'stats.failedUploads': 1 },
+        $set: {
+          lastActivity: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+  }
+
   // Encoding Job Management Methods
   async createJob(job: EncodingJob): Promise<void> {
     if (!this.db) {

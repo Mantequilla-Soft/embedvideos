@@ -11,7 +11,7 @@ import { generateApiKey } from './utils/keyGenerator';
 import { createApiKeyMiddleware } from './middleware/auth';
 import { createAdminAuthMiddleware } from './middleware/adminAuth';
 import { loadConfig } from './config/config';
-import { pinFile, unpinFile } from './utils/ipfs';
+import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
 
 dotenv.config();
@@ -165,12 +165,26 @@ const tusServer = new Server({
         const input_cid = await pinFile(filePath);
         console.log(`File pinned successfully: ${input_cid}`);
         
+        // Announce to DHT for better discoverability
+        try {
+          await announceDHT(input_cid);
+        } catch (dhtError) {
+          console.warn(`DHT announcement failed (non-critical): ${dhtError}`);
+        }
+        
         // Update video with input_cid
         await database.updateVideoStatus(permlink, 'processing', {
           size: upload.size || null,
           input_cid,
           encodingProgress: 0,
         });
+        
+        // Update user stats for successful upload
+        try {
+          await database.incrementUserUpload(owner, upload.size || 0);
+        } catch (statsError) {
+          console.warn(`Failed to update user stats: ${statsError}`);
+        }
         
         // Create encoding job
         await database.createJob({
@@ -255,6 +269,13 @@ app.post('/webhook', async (req: Request, res: Response) => {
       await database.updateJobStatus(owner, permlink, 'completed', {
         webhookReceivedAt: new Date(),
       });
+      
+      // Update user stats for successful encoding
+      try {
+        await database.incrementUserSuccess(owner);
+      } catch (statsError) {
+        console.warn(`Failed to update user success stats: ${statsError}`);
+      }
 
       // Unpin the input_cid now that encoding is complete
       try {
@@ -281,6 +302,13 @@ app.post('/webhook', async (req: Request, res: Response) => {
         webhookReceivedAt: new Date(),
         lastError: encoderError || 'Encoding failed',
       });
+      
+      // Update user stats for failed encoding
+      try {
+        await database.incrementUserFailure(owner);
+      } catch (statsError) {
+        console.warn(`Failed to update user failure stats: ${statsError}`);
+      }
 
       // Unpin the input_cid since encoding failed and we won't retry
       try {

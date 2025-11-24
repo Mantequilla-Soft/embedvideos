@@ -35,6 +35,30 @@ export async function pinFile(filePath: string): Promise<string> {
 }
 
 /**
+ * Announce CID to DHT for better discoverability
+ * @param cid IPFS CID to announce
+ */
+export async function announceDHT(cid: string): Promise<void> {
+  // Try local daemon first
+  try {
+    console.log(`Announcing to DHT via local daemon: ${cid}`);
+    await provideDHT('http://127.0.0.1:5001', cid);
+    console.log(`Successfully announced to DHT via local daemon: ${cid}`);
+  } catch (localError) {
+    console.warn(`Local IPFS daemon DHT announce failed: ${localError}`);
+  }
+  
+  // Try supernode
+  try {
+    console.log(`Announcing to DHT via supernode: ${cid}`);
+    await provideDHT(config.ipfsSupernodeEndpoint, cid);
+    console.log(`Successfully announced to DHT via supernode: ${cid}`);
+  } catch (supernodeError) {
+    console.warn(`Supernode IPFS DHT announce failed: ${supernodeError}`);
+  }
+}
+
+/**
  * Unpin a CID from IPFS
  * @param cid IPFS CID to unpin
  */
@@ -126,6 +150,42 @@ async function unpinFromIpfs(apiUrl: string, cid: string): Promise<void> {
         if (res.statusCode !== 200) {
           console.error(`IPFS unpin API error response: ${data}`);
           reject(new Error(`IPFS unpin API error: ${res.statusCode} ${res.statusMessage}`));
+          return;
+        }
+        resolve();
+      });
+    });
+    
+    req.on('error', (error) => {
+      reject(error);
+    });
+    
+    req.end();
+  });
+}
+
+async function provideDHT(apiUrl: string, cid: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${apiUrl}/api/v0/dht/provide?arg=${cid}`);
+    const isHttps = url.protocol === 'https:';
+    const client = isHttps ? https : http;
+    
+    const req = client.request({
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'POST',
+    }, (res) => {
+      let data = '';
+      
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          console.error(`IPFS DHT provide API error response: ${data}`);
+          reject(new Error(`IPFS DHT provide API error: ${res.statusCode} ${res.statusMessage}`));
           return;
         }
         resolve();
