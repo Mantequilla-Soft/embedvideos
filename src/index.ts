@@ -13,6 +13,7 @@ import { createAdminAuthMiddleware } from './middleware/adminAuth';
 import { loadConfig } from './config/config';
 import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
+import { CleanupService } from './utils/cleanup';
 
 dotenv.config();
 
@@ -24,6 +25,9 @@ app.set('trust proxy', true);
 
 // Initialize database
 const database = new Database(config.mongoUri, config.mongoDbName, config.mongoCollectionVideos);
+
+// Initialize cleanup service
+const cleanupService = new CleanupService(config.uploadDir, config.cleanupRetentionDays);
 
 // Middleware
 app.use(cors());
@@ -486,6 +490,47 @@ app.patch('/admin/users/:username/ban', requireAdminAuth, async (req: Request, r
   }
 });
 
+// Admin: Cleanup preview (protected)
+app.get('/admin/cleanup/preview', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const preview = await cleanupService.previewCleanup();
+    const totalMB = (preview.totalSize / (1024 * 1024)).toFixed(2);
+    res.json({
+      filesCount: preview.files.length,
+      totalSizeMB: totalMB,
+      retentionDays: config.cleanupRetentionDays,
+      files: preview.files.map(f => ({
+        name: f.name,
+        sizeMB: (f.size / (1024 * 1024)).toFixed(2),
+        ageDays: f.age.toFixed(1),
+      })),
+    });
+  } catch (error) {
+    console.error('Error previewing cleanup:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Manual cleanup trigger (protected)
+app.post('/admin/cleanup/run', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    console.log('Manual cleanup triggered by admin');
+    const stats = await cleanupService.runCleanup();
+    const mbFreed = (stats.bytesFreed / (1024 * 1024)).toFixed(2);
+    res.json({
+      success: true,
+      filesScanned: stats.filesScanned,
+      filesDeleted: stats.filesDeleted,
+      bytesFreed: stats.bytesFreed,
+      mbFreed,
+      errors: stats.errors,
+    });
+  } catch (error) {
+    console.error('Error running cleanup:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Mount TUS server - handle all HTTP methods
 app.all('/uploads', tusServer.handle.bind(tusServer));
 app.all('/uploads/*', tusServer.handle.bind(tusServer));
@@ -524,6 +569,13 @@ async function start() {
     dispatcher = new JobDispatcher(database, config);
     dispatcher.start(30); // Poll every 30 seconds
     
+    // Start cleanup service
+    if (config.cleanupEnabled) {
+      cleanupService.start(config.cleanupIntervalHours);
+    } else {
+      console.log('Cleanup service disabled');
+    }
+    
     app.listen(config.port, () => {
       console.log(`Server running on port ${config.port}`);
       console.log(`TUS endpoint: http://localhost:${config.port}/uploads`);
@@ -540,6 +592,7 @@ process.on('SIGTERM', async () => {
   if (dispatcher) {
     dispatcher.stop();
   }
+  cleanupService.stop();
   await database.close();
   process.exit(0);
 });
@@ -549,6 +602,7 @@ process.on('SIGINT', async () => {
   if (dispatcher) {
     dispatcher.stop();
   }
+  cleanupService.stop();
   await database.close();
   process.exit(0);
 });

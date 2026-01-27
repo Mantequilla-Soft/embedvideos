@@ -22,6 +22,9 @@ export interface Config {
   encoders: EncoderConfig[];
   webhookApiKey: string;
   webhookUrl: string;
+  cleanupEnabled: boolean;
+  cleanupIntervalHours: number;
+  cleanupRetentionDays: number;
 }
 
 function parseEncoders(): EncoderConfig[] {
@@ -70,5 +73,8 @@ export function loadConfig(): Config {
     encoders: parseEncoders(),
     webhookApiKey: process.env.WEBHOOK_API_KEY || '',
     webhookUrl: process.env.WEBHOOK_URL || '',
+    cleanupEnabled: process.env.CLEANUP_ENABLED !== 'false',
+    cleanupIntervalHours: parseInt(process.env.CLEANUP_INTERVAL_HOURS || '24', 10),
+    cleanupRetentionDays: parseInt(process.env.CLEANUP_RETENTION_DAYS || '7', 10),
   };
 }

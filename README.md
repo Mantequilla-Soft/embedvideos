@@ -258,6 +258,33 @@ The dispatcher runs every 30 seconds:
 
 See [ENCODERS.md](./ENCODERS.md) for multi-encoder configuration details.
 
+### Automatic File Cleanup
+
+The service includes an automatic cleanup system to prevent disk space exhaustion:
+- **Scheduled Cleanup**: Runs automatically at configurable intervals (default: every 24 hours)
+- **Retention Period**: Deletes temporary upload files older than configured days (default: 7 days)
+- **Manual Trigger**: Admin endpoint to run cleanup on-demand
+- **Preview Mode**: Check what files would be deleted without actually deleting them
+
+**Configuration:**
+```env
+CLEANUP_ENABLED=true                # Enable/disable cleanup (default: true)
+CLEANUP_INTERVAL_HOURS=24          # How often to run cleanup (default: 24)
+CLEANUP_RETENTION_DAYS=7           # Delete files older than this (default: 7)
+```
+
+**Admin Endpoints:**
+- `GET /admin/cleanup/preview` - Preview files that would be deleted
+- `POST /admin/cleanup/run` - Manually trigger cleanup
+
+**What Gets Cleaned:**
+- Abandoned TUS uploads (files never completed)
+- Failed IPFS pinning uploads (pinning failed, file left behind)
+- Orphaned `.json` metadata files
+- Any temporary files older than retention period
+
+Files are only deleted after successful IPFS pinning or after exceeding the retention period, ensuring no data loss for active uploads.
+
 ## Embed URL Format
 
 Videos are accessible via embed URLs in the following format:
