@@ -128,6 +128,7 @@ const tusServer = new Server({
         frontend_app,
         status: 'uploading',
         input_cid: null,
+        ipfs_pin_endpoint: null,
         manifest_cid: null,
         thumbnail_url: null,
         short,
@@ -166,8 +167,8 @@ const tusServer = new Server({
         // Pin file to IPFS
         const filePath = (upload.storage as any).path;
         console.log(`Pinning file to IPFS: ${filePath}`);
-        const input_cid = await pinFile(filePath);
-        console.log(`File pinned successfully: ${input_cid}`);
+        const { cid: input_cid, endpoint: ipfs_pin_endpoint } = await pinFile(filePath);
+        console.log(`File pinned successfully: ${input_cid} at ${ipfs_pin_endpoint}`);
         
         // Announce to DHT for better discoverability
         try {
@@ -176,10 +177,11 @@ const tusServer = new Server({
           console.warn(`DHT announcement failed (non-critical): ${dhtError}`);
         }
         
-        // Update video with input_cid
+        // Update video with input_cid and pin location
         await database.updateVideoStatus(permlink, 'processing', {
           size: upload.size || null,
           input_cid,
+          ipfs_pin_endpoint,
           encodingProgress: 0,
         });
         
@@ -284,9 +286,9 @@ app.post('/webhook', async (req: Request, res: Response) => {
       // Unpin the input_cid now that encoding is complete
       try {
         const video = await database.getVideo(permlink);
-        if (video && video.input_cid) {
-          console.log(`Unpinning input file for ${owner}/${permlink}: ${video.input_cid}`);
-          await unpinFile(video.input_cid);
+        if (video && video.input_cid && video.ipfs_pin_endpoint) {
+          console.log(`Unpinning input file for ${owner}/${permlink}: ${video.input_cid} from ${video.ipfs_pin_endpoint}`);
+          await unpinFile(video.input_cid, video.ipfs_pin_endpoint);
         }
       } catch (unpinError) {
         console.warn(`Failed to unpin input_cid for ${owner}/${permlink}:`, unpinError);
@@ -314,17 +316,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
         console.warn(`Failed to update user failure stats: ${statsError}`);
       }
 
-      // Unpin the input_cid since encoding failed and we won't retry
-      try {
-        const video = await database.getVideo(permlink);
-        if (video && video.input_cid) {
-          console.log(`Unpinning failed input file for ${owner}/${permlink}: ${video.input_cid}`);
-          await unpinFile(video.input_cid);
-        }
-      } catch (unpinError) {
-        console.warn(`Failed to unpin input_cid for ${owner}/${permlink}:`, unpinError);
-        // Continue despite unpin failure
-      }
+      // DO NOT unpin on failure - keep the file for potential retry or debugging
 
       console.error(`Video encoding failed: ${owner}/${permlink} - Error: ${encoderError}`);
       res.json({ success: true, message: 'Webhook processed (failure recorded)' });

@@ -9,15 +9,17 @@ const config = loadConfig();
 /**
  * Pin a file to IPFS using local daemon first, fallback to supernode
  * @param filePath Absolute path to the file to pin
- * @returns IPFS CID of the pinned file
+ * @returns Object with CID and endpoint where it was pinned
  */
-export async function pinFile(filePath: string): Promise<string> {
+export async function pinFile(filePath: string): Promise<{ cid: string; endpoint: string }> {
+  const localEndpoint = 'http://127.0.0.1:5001';
+  
   // Try local daemon first
   try {
-    console.log(`Attempting to pin to local IPFS daemon: http://127.0.0.1:5001`);
-    const cid = await addToIpfs('http://127.0.0.1:5001', filePath);
+    console.log(`Attempting to pin to local IPFS daemon: ${localEndpoint}`);
+    const cid = await addToIpfs(localEndpoint, filePath);
     console.log(`Successfully pinned to local daemon: ${cid}`);
-    return cid;
+    return { cid, endpoint: localEndpoint };
   } catch (localError) {
     console.warn(`Local IPFS daemon failed: ${localError}`);
     console.log(`Falling back to supernode: ${config.ipfsSupernodeEndpoint}`);
@@ -26,7 +28,7 @@ export async function pinFile(filePath: string): Promise<string> {
     try {
       const cid = await addToIpfs(config.ipfsSupernodeEndpoint, filePath);
       console.log(`Successfully pinned to supernode: ${cid}`);
-      return cid;
+      return { cid, endpoint: config.ipfsSupernodeEndpoint };
     } catch (supernodeError) {
       console.error(`Supernode IPFS failed: ${supernodeError}`);
       throw new Error(`Failed to pin file to IPFS: ${supernodeError}`);
@@ -59,26 +61,18 @@ export async function announceDHT(cid: string): Promise<void> {
 }
 
 /**
- * Unpin a CID from IPFS
+ * Unpin a CID from IPFS at specific endpoint
  * @param cid IPFS CID to unpin
+ * @param endpoint IPFS endpoint where the file was pinned
  */
-export async function unpinFile(cid: string): Promise<void> {
-  // Try local daemon first
+export async function unpinFile(cid: string, endpoint: string): Promise<void> {
   try {
-    console.log(`Attempting to unpin from local IPFS daemon: ${cid}`);
-    await unpinFromIpfs('http://127.0.0.1:5001', cid);
-    console.log(`Successfully unpinned from local daemon: ${cid}`);
-  } catch (localError) {
-    console.warn(`Local IPFS daemon unpin failed: ${localError}`);
-  }
-  
-  // Try supernode
-  try {
-    console.log(`Attempting to unpin from supernode: ${cid}`);
-    await unpinFromIpfs(config.ipfsSupernodeEndpoint, cid);
-    console.log(`Successfully unpinned from supernode: ${cid}`);
-  } catch (supernodeError) {
-    console.warn(`Supernode IPFS unpin failed: ${supernodeError}`);
+    console.log(`Attempting to unpin from ${endpoint}: ${cid}`);
+    await unpinFromIpfs(endpoint, cid);
+    console.log(`Successfully unpinned from ${endpoint}: ${cid}`);
+  } catch (error) {
+    console.warn(`IPFS unpin failed at ${endpoint}: ${error}`);
+    throw error;
   }
 }
 

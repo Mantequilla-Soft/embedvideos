@@ -8,6 +8,7 @@ export interface VideoMetadata {
   frontend_app: string;
   status: VideoStatus;
   input_cid: string | null;
+  ipfs_pin_endpoint: string | null;
   manifest_cid: string | null;
   thumbnail_url: string | null;
   short: boolean;
