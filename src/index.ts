@@ -30,8 +30,25 @@ const database = new Database(config.mongoUri, config.mongoDbName, config.mongoC
 const cleanupService = new CleanupService(config.uploadDir, config.cleanupRetentionDays);
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  exposedHeaders: ['X-Embed-URL', 'x-embed-url'],
+}));
 app.use(express.json());
+
+// Ensure X-Embed-URL is exposed via CORS on TUS upload routes
+// (The @tus/server sets its own Access-Control-Expose-Headers, overriding Express cors middleware)
+app.use('/uploads', (req, res, next) => {
+  const origSetHeader = res.setHeader.bind(res);
+  res.setHeader = function(name: string, value: any) {
+    if (name.toLowerCase() === 'access-control-expose-headers' && typeof value === 'string') {
+      if (!value.includes('X-Embed-URL')) {
+        value = value + ', X-Embed-URL';
+      }
+    }
+    return origSetHeader(name, value);
+  } as any;
+  next();
+});
 app.use(express.static('public'));
 
 // Create auth middleware
@@ -136,6 +153,13 @@ const tusServer = new Server({
         size,
         encodingProgress: 0,
         originalFilename,
+        hive_author: null,
+        hive_permlink: null,
+        hive_title: null,
+        hive_body: null,
+        hive_tags: null,
+        listed_on_3speak: frontend_app === '3speak-tv',
+        processed: false,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -161,7 +185,13 @@ const tusServer = new Server({
     const frontend_app = upload.metadata?.frontend_app;
     const short = upload.metadata?.short === 'true';
     const originalFilename = upload.metadata?.originalFilename;
-    
+
+    // Set embed URL on finish response too (so tus-js-client can capture it)
+    if (permlink && owner) {
+      const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
+      res.setHeader('X-Embed-URL', embedUrl);
+    }
+
     if (permlink && owner && upload.storage) {
       try {
         // Pin file to IPFS
@@ -372,6 +402,38 @@ app.post('/video/:permlink/thumbnail', requireApiKey, async (req: Request, res: 
     res.json({ success: true, thumbnail_url });
   } catch (error) {
     console.error('Error updating thumbnail:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Link embed video to a Hive post (protected)
+app.post('/video/:permlink/hive', requireApiKey, async (req: Request, res: Response) => {
+  try {
+    const { permlink } = req.params;
+    const { hive_author, hive_permlink, hive_title, hive_body, hive_tags } = req.body;
+
+    if (!hive_author || !hive_permlink) {
+      return res.status(400).json({ error: 'hive_author and hive_permlink are required' });
+    }
+
+    const video = await database.getVideo(permlink);
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+
+    await database.updateVideoStatus(permlink, video.status, {
+      hive_author,
+      hive_permlink,
+      processed: true,
+      ...(hive_title ? { hive_title } : {}),
+      ...(hive_body ? { hive_body } : {}),
+      ...(hive_tags ? { hive_tags } : {}),
+    });
+
+    console.log(`Hive link set for ${video.owner}/${permlink} -> @${hive_author}/${hive_permlink}`);
+    res.json({ success: true, permlink, hive_author, hive_permlink });
+  } catch (error) {
+    console.error('Error linking Hive post:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

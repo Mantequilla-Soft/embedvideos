@@ -16,6 +16,13 @@ export interface VideoMetadata {
   size: number | null;
   encodingProgress: number;
   originalFilename: string | null;
+  hive_author: string | null;
+  hive_permlink: string | null;
+  hive_title: string | null;
+  hive_body: string | null;
+  hive_tags: string[] | null;
+  listed_on_3speak: boolean;
+  processed: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
