@@ -424,11 +424,12 @@ app.post('/video/:permlink/hive', requireApiKey, async (req: Request, res: Respo
     await database.updateVideoStatus(permlink, video.status, {
       hive_author,
       hive_permlink,
+      embed_url: `@${hive_author}/${hive_permlink}`,
       processed: true,
       ...(hive_title ? { hive_title } : {}),
       ...(hive_body ? { hive_body } : {}),
       ...(hive_tags ? { hive_tags } : {}),
-    });
+    } as any);
 
     console.log(`Hive link set for ${video.owner}/${permlink} -> @${hive_author}/${hive_permlink}`);
     res.json({ success: true, permlink, hive_author, hive_permlink });
