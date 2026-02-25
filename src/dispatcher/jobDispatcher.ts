@@ -153,6 +153,7 @@ export class JobDispatcher {
       encoderJobId: result.job_id,
       assignedWorker: encoder.name,
       assignedAt: new Date(),
+      lastError: null, // clear stale error if any
     });
   }
 }
