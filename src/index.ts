@@ -232,6 +232,8 @@ const tusServer = new Server({
           assignedAt: null,
           attemptCount: 0,
           lastError: null,
+          encodingProgress: null,
+          encodingStage: null,
           webhookReceivedAt: null,
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -360,6 +362,43 @@ app.post('/webhook', async (req: Request, res: Response) => {
   }
 });
 
+// Webhook endpoint for encoder progress pings
+app.post('/webhook/progress', async (req: Request, res: Response) => {
+  try {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== config.webhookApiKey) {
+      console.warn('Progress webhook received with invalid API key');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { owner, permlink, progress, stage } = req.body;
+
+    if (!owner || !permlink || typeof progress !== 'number') {
+      return res.status(400).json({ error: 'owner, permlink, and progress (number) are required' });
+    }
+
+    const job = await database.getJob(owner, permlink);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    await database.updateJobStatus(owner, permlink, 'encoding', {
+      encodingProgress: progress,
+      encodingStage: stage ?? null,
+    });
+
+    await database.updateVideoStatus(permlink, 'processing', {
+      encodingProgress: progress,
+    });
+
+    console.log(`Progress update: ${owner}/${permlink} - ${progress}%${stage ? ` (${stage})` : ''}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Progress webhook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get video metadata endpoint
 app.get('/video/:permlink', async (req: Request, res: Response) => {
   try {
@@ -435,6 +474,40 @@ app.post('/video/:permlink/hive', requireApiKey, async (req: Request, res: Respo
     res.json({ success: true, permlink, hive_author, hive_permlink });
   } catch (error) {
     console.error('Error linking Hive post:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Force re-dispatch a stuck job (protected)
+app.post('/admin/jobs/:owner/:permlink/redispatch', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { owner, permlink } = req.params;
+
+    const job = await database.getJob(owner, permlink);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const video = await database.getVideo(permlink);
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+
+    if (!video.input_cid) {
+      return res.status(400).json({ error: 'Video has no input_cid — nothing to dispatch' });
+    }
+
+    await database.resetJob(owner, permlink);
+    await database.updateVideoStatus(permlink, 'processing', { encodingProgress: 0 });
+
+    console.log(`Job manually reset to pending by admin: ${owner}/${permlink} (was: ${job.status})`);
+    res.json({
+      success: true,
+      message: 'Job reset to pending. Dispatcher will pick it up on the next cycle.',
+      job: { owner, permlink, previousStatus: job.status },
+    });
+  } catch (error) {
+    console.error('Error re-dispatching job:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

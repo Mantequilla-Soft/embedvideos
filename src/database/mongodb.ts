@@ -71,6 +71,8 @@ export interface EncodingJob {
   assignedAt: Date | null;
   attemptCount: number;
   lastError: string | null;
+  encodingProgress: number | null;
+  encodingStage: string | null;
   webhookReceivedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -296,6 +298,29 @@ export class Database {
     await jobsCollection.updateOne(
       { owner, permlink },
       { $inc: { attemptCount: 1 }, $set: { updatedAt: new Date() } }
+    );
+  }
+
+  async resetJob(owner: string, permlink: string): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    await jobsCollection.updateOne(
+      { owner, permlink },
+      {
+        $set: {
+          status: 'pending',
+          attemptCount: 0,
+          assignedWorker: null,
+          encoderJobId: null,
+          assignedAt: null,
+          lastError: null,
+          encodingProgress: null,
+          encodingStage: null,
+          updatedAt: new Date(),
+        },
+      }
     );
   }
 
