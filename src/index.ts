@@ -659,6 +659,98 @@ app.post('/admin/cleanup/run', requireAdminAuth, async (req: Request, res: Respo
   }
 });
 
+// Admin: List all encoders (protected)
+app.get('/admin/encoders', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const encoders = await database.getAllEncoders();
+    res.json({ encoders });
+  } catch (error) {
+    console.error('Error fetching encoders:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Add encoder (protected)
+app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { name, url, apiKey, enabled = true } = req.body;
+
+    if (!name || !url || !apiKey) {
+      return res.status(400).json({ error: 'name, url, and apiKey are required' });
+    }
+
+    const existing = await database.getEncoder(name);
+    if (existing) {
+      return res.status(409).json({ error: `Encoder '${name}' already exists` });
+    }
+
+    await database.createEncoder({
+      name,
+      url,
+      apiKey,
+      enabled,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    console.log(`Encoder added: ${name} (${url})`);
+    res.json({ success: true, name, url, enabled });
+  } catch (error) {
+    console.error('Error adding encoder:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Update encoder (enable/disable, change url or apiKey) (protected)
+app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const { url, apiKey, enabled } = req.body;
+
+    const encoder = await database.getEncoder(name);
+    if (!encoder) {
+      return res.status(404).json({ error: 'Encoder not found' });
+    }
+
+    const updates: Record<string, any> = {};
+    if (url !== undefined) updates.url = url;
+    if (apiKey !== undefined) updates.apiKey = apiKey;
+    if (enabled !== undefined) updates.enabled = enabled;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update (url, apiKey, enabled)' });
+    }
+
+    await database.updateEncoder(name, updates);
+
+    console.log(`Encoder updated: ${name}`);
+    res.json({ success: true, name, updates });
+  } catch (error) {
+    console.error('Error updating encoder:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Remove encoder (protected)
+app.delete('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+
+    const encoder = await database.getEncoder(name);
+    if (!encoder) {
+      return res.status(404).json({ error: 'Encoder not found' });
+    }
+
+    await database.deleteEncoder(name);
+
+    console.log(`Encoder removed: ${name}`);
+    res.json({ success: true, name });
+  } catch (error) {
+    console.error('Error removing encoder:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Mount TUS server - handle all HTTP methods
 app.all('/uploads', tusServer.handle.bind(tusServer));
 app.all('/uploads/*', tusServer.handle.bind(tusServer));
@@ -684,13 +776,30 @@ async function start() {
       console.log('Demo API key created');
     }
     
-    // Log encoder configuration
-    const enabledEncoders = config.encoders.filter(e => e.enabled);
-    if (enabledEncoders.length > 0) {
-      console.log(`Encoders available (${enabledEncoders.length}):`);
-      enabledEncoders.forEach(e => console.log(`  - ${e.name}: ${e.url}`));
+    // Seed encoders from env var if the DB collection is empty (backwards-compatible)
+    const existingEncoders = await database.getAllEncoders();
+    if (existingEncoders.length === 0 && config.encoders.length > 0) {
+      console.log(`Seeding ${config.encoders.length} encoder(s) from env into DB...`);
+      for (const e of config.encoders) {
+        await database.createEncoder({
+          name: e.name,
+          url: e.url,
+          apiKey: e.apiKey,
+          enabled: e.enabled,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        console.log(`  Seeded encoder: ${e.name}`);
+      }
+    }
+
+    // Log current encoder pool
+    const activeEncoders = (await database.getAllEncoders()).filter(e => e.enabled);
+    if (activeEncoders.length > 0) {
+      console.log(`Encoders available (${activeEncoders.length}):`);
+      activeEncoders.forEach(e => console.log(`  - ${e.name}: ${e.url}`));
     } else {
-      console.warn('⚠️  No encoders configured! Jobs will fail to dispatch.');
+      console.warn('⚠️  No enabled encoders in DB! Jobs will fail to dispatch.');
     }
     
     // Start job dispatcher

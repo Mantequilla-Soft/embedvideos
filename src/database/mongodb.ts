@@ -60,6 +60,15 @@ export interface ApiKey {
   lastUsed: Date | null;
 }
 
+export interface Encoder {
+  name: string;
+  url: string;
+  apiKey: string;
+  enabled: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export type JobStatus = 'pending' | 'encoding' | 'completed' | 'failed';
 
 export interface EncodingJob {
@@ -368,6 +377,51 @@ export class Database {
       { username },
       { $set: { banned, updatedAt: new Date() } }
     );
+  }
+
+  // Encoder Management Methods
+  async getAllEncoders(): Promise<Encoder[]> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    return encodersCollection.find({}).sort({ createdAt: 1 }).toArray();
+  }
+
+  async getEncoder(name: string): Promise<Encoder | null> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    return encodersCollection.findOne({ name });
+  }
+
+  async createEncoder(encoder: Encoder): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.createIndex({ name: 1 }, { unique: true });
+    await encodersCollection.insertOne(encoder);
+  }
+
+  async updateEncoder(name: string, data: Partial<Encoder>): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.updateOne(
+      { name },
+      { $set: { ...data, updatedAt: new Date() } }
+    );
+  }
+
+  async deleteEncoder(name: string): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.deleteOne({ name });
   }
 
   async close(): Promise<void> {
