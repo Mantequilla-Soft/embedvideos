@@ -8,6 +8,7 @@ A modern, scalable video upload and encoding service with TUS resumable uploads,
 - **Instant Embed URLs**: Get playable embed URLs immediately upon upload start
 - **IPFS Storage**: Automatic pinning to IPFS (local daemon + supernode fallback)
 - **Multi-Encoder Support**: Round-robin load balancing across multiple encoder nodes
+- **Encoder Management**: Add, update, enable/disable encoders via admin panel or API
 - **Job Dispatcher**: Automatic job queuing and distribution to available encoders
 - **Webhook Callbacks**: Secure encoder-to-service communication for status updates
 - **MongoDB Integration**: Tracks videos, jobs, and API keys
@@ -161,7 +162,7 @@ upload.start();
 ├── public/
 │   ├── index.html             # Landing page with integration docs
 │   ├── demo.html              # Upload demo interface
-│   └── admin.html             # API key management panel
+│   └── admin.html             # Admin panel (API keys & encoder management)
 ├── scripts/
 │   ├── dropOldIndex.ts        # Database maintenance utilities
 │   └── testEncoder.ts         # Encoder testing script
@@ -185,6 +186,7 @@ interface VideoMetadata {
   frontend_app: string;         // Frontend application identifier
   status: 'uploading' | 'processing' | 'published' | 'failed' | 'deleted';
   input_cid: string | null;     // IPFS CID of uploaded file
+  ipfs_pin_endpoint: string | null; // IPFS endpoint used for pinning
   manifest_cid: string | null;  // IPFS CID of HLS manifest
   thumbnail_url: string | null; // Video thumbnail URL
   short: boolean;               // Is short-form video (≤60s, 480p max)
@@ -192,6 +194,17 @@ interface VideoMetadata {
   size: number | null;          // File size in bytes
   encodingProgress: number;     // Encoding progress (0-100)
   originalFilename: string | null; // Original filename
+  hive_author: string | null;   // Linked Hive post author
+  hive_permlink: string | null; // Linked Hive post permlink
+  hive_title: string | null;    // Hive post title
+  hive_body: string | null;     // Hive post body
+  hive_tags: string[] | null;   // Hive post tags
+  embed_url: string | null;     // Embed URL path (e.g., @user/permlink)
+  embed_title: string | null;   // Display title for embed (set by frontend)
+  listed_on_3speak: boolean;    // Whether listed on 3speak.tv
+  processed: boolean;           // Whether fully processed
+  processedAt: Date | null;     // When processing completed (set by frontend)
+  views: number;                // View count (set by player/analytics)
   createdAt: Date;              // Upload start timestamp
   updatedAt: Date;              // Last modification timestamp
 }
@@ -223,6 +236,19 @@ interface ApiKey {
   key: string;                  // Hashed API key
   name: string;                 // Application name
   createdAt: Date;              // Creation timestamp
+}
+```
+
+### Encoder
+
+```typescript
+interface Encoder {
+  name: string;                 // Unique encoder name
+  url: string;                  // Encoder API endpoint URL
+  apiKey: string;               // Encoder authentication key
+  enabled: boolean;             // Whether encoder is active
+  createdAt: Date;              // Creation timestamp
+  updatedAt: Date;              // Last modification timestamp
 }
 ```
 
@@ -276,6 +302,31 @@ CLEANUP_RETENTION_DAYS=7           # Delete files older than this (default: 7)
 **Admin Endpoints:**
 - `GET /admin/cleanup/preview` - Preview files that would be deleted
 - `POST /admin/cleanup/run` - Manually trigger cleanup
+
+### Encoder Management
+
+Encoders can be configured via environment variables (for initial seeding) or managed dynamically through the admin panel at `/admin.html`.
+
+**Initial Setup (Environment Variable):**
+```env
+ENCODERS=[{"name":"encoder1","url":"https://encoder.example.com","apiKey":"key","enabled":true}]
+```
+
+On first startup, encoders from the env var are seeded into MongoDB. After that, encoders are managed via the database.
+
+**Admin API Endpoints:**
+- `GET /admin/encoders` - List all encoders (API keys excluded)
+- `POST /admin/encoders` - Add a new encoder
+- `PATCH /admin/encoders/:name` - Update encoder (URL, API key, enable/disable)
+- `DELETE /admin/encoders/:name` - Remove an encoder
+
+**Add Encoder Example:**
+```bash
+curl -X POST http://localhost:3001/admin/encoders \
+  -H "X-Admin-Password: your-admin-password" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "encoder2", "url": "https://encoder2.example.com", "apiKey": "secret-key"}'
+```
 
 **What Gets Cleaned:**
 - Abandoned TUS uploads (files never completed)

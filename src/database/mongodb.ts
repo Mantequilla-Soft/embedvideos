@@ -21,8 +21,12 @@ export interface VideoMetadata {
   hive_title: string | null;
   hive_body: string | null;
   hive_tags: string[] | null;
+  embed_url: string | null;
+  embed_title: string | null;
   listed_on_3speak: boolean;
   processed: boolean;
+  processedAt: Date | null;
+  views: number;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -158,8 +158,12 @@ const tusServer = new Server({
         hive_title: null,
         hive_body: null,
         hive_tags: null,
+        embed_url: null,
+        embed_title: null,
         listed_on_3speak: frontend_app === '3speak-tv',
         processed: false,
+        processedAt: null,
+        views: 0,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -468,7 +472,7 @@ app.post('/video/:permlink/hive', requireApiKey, async (req: Request, res: Respo
       ...(hive_title ? { hive_title } : {}),
       ...(hive_body ? { hive_body } : {}),
       ...(hive_tags ? { hive_tags } : {}),
-    } as any);
+    });
 
     console.log(`Hive link set for ${video.owner}/${permlink} -> @${hive_author}/${hive_permlink}`);
     res.json({ success: true, permlink, hive_author, hive_permlink });
