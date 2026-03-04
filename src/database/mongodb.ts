@@ -100,6 +100,11 @@ export class Database {
     await this.client.connect();
     this.db = this.client.db(dbName);
     this.collection = this.db.collection<VideoMetadata>(collectionName);
+    
+    // Create indexes
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.createIndex({ name: 1 }, { unique: true });
+    
     console.log('Connected to MongoDB');
   }
 
@@ -401,7 +406,6 @@ export class Database {
       throw new Error('Database not connected');
     }
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
-    await encodersCollection.createIndex({ name: 1 }, { unique: true });
     await encodersCollection.insertOne(encoder);
   }
 

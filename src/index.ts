@@ -659,11 +659,13 @@ app.post('/admin/cleanup/run', requireAdminAuth, async (req: Request, res: Respo
   }
 });
 
-// Admin: List all encoders (protected)
+// Admin: List all encoders (protected) - API keys are stripped for security
 app.get('/admin/encoders', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const encoders = await database.getAllEncoders();
-    res.json({ encoders });
+    // Strip apiKey from response to prevent exposure
+    const sanitized = encoders.map(({ apiKey, ...rest }) => rest);
+    res.json({ encoders: sanitized });
   } catch (error) {
     console.error('Error fetching encoders:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -677,6 +679,13 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
 
     if (!name || !url || !apiKey) {
       return res.status(400).json({ error: 'name, url, and apiKey are required' });
+    }
+
+    // Validate URL format
+    try {
+      new URL(url);
+    } catch {
+      return res.status(400).json({ error: 'Invalid URL format' });
     }
 
     const existing = await database.getEncoder(name);
@@ -713,7 +722,15 @@ app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: R
     }
 
     const updates: Record<string, any> = {};
-    if (url !== undefined) updates.url = url;
+    if (url !== undefined) {
+      // Validate URL format
+      try {
+        new URL(url);
+      } catch {
+        return res.status(400).json({ error: 'Invalid URL format' });
+      }
+      updates.url = url;
+    }
     if (apiKey !== undefined) updates.apiKey = apiKey;
     if (enabled !== undefined) updates.enabled = enabled;
 
