@@ -21,8 +21,12 @@ export interface VideoMetadata {
   hive_title: string | null;
   hive_body: string | null;
   hive_tags: string[] | null;
+  embed_url: string | null;
+  embed_title: string | null;
   listed_on_3speak: boolean;
   processed: boolean;
+  processedAt: Date | null;
+  views: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -60,6 +64,15 @@ export interface ApiKey {
   lastUsed: Date | null;
 }
 
+export interface Encoder {
+  name: string;
+  url: string;
+  apiKey: string;
+  enabled: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export type JobStatus = 'pending' | 'encoding' | 'completed' | 'failed';
 
 export interface EncodingJob {
@@ -91,6 +104,11 @@ export class Database {
     await this.client.connect();
     this.db = this.client.db(dbName);
     this.collection = this.db.collection<VideoMetadata>(collectionName);
+    
+    // Create indexes
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.createIndex({ name: 1 }, { unique: true });
+    
     console.log('Connected to MongoDB');
   }
 
@@ -368,6 +386,50 @@ export class Database {
       { username },
       { $set: { banned, updatedAt: new Date() } }
     );
+  }
+
+  // Encoder Management Methods
+  async getAllEncoders(): Promise<Encoder[]> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    return encodersCollection.find({}).sort({ createdAt: 1 }).toArray();
+  }
+
+  async getEncoder(name: string): Promise<Encoder | null> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    return encodersCollection.findOne({ name });
+  }
+
+  async createEncoder(encoder: Encoder): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.insertOne(encoder);
+  }
+
+  async updateEncoder(name: string, data: Partial<Encoder>): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.updateOne(
+      { name },
+      { $set: { ...data, updatedAt: new Date() } }
+    );
+  }
+
+  async deleteEncoder(name: string): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.deleteOne({ name });
   }
 
   async close(): Promise<void> {

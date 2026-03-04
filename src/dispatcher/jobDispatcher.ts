@@ -14,18 +14,19 @@ export class JobDispatcher {
   }
 
   /**
-   * Get next encoder using round-robin
+   * Get next encoder using round-robin (reads live list from DB)
    */
-  private getNextEncoder() {
-    const enabledEncoders = this.config.encoders.filter(e => e.enabled);
-    
+  private async getNextEncoder() {
+    const allEncoders = await this.database.getAllEncoders();
+    const enabledEncoders = allEncoders.filter(e => e.enabled);
+
     if (enabledEncoders.length === 0) {
       throw new Error('No enabled encoders available');
     }
-    
+
     const encoder = enabledEncoders[this.currentEncoderIndex % enabledEncoders.length];
     this.currentEncoderIndex++;
-    
+
     return encoder;
   }
 
@@ -126,7 +127,7 @@ export class JobDispatcher {
     };
 
     // Select encoder using round-robin
-    const encoder = this.getNextEncoder();
+    const encoder = await this.getNextEncoder();
     console.log(`Dispatching job to encoder [${encoder.name}]: ${owner}/${permlink}`);
     console.log(`Encoder request payload:`, JSON.stringify(encoderRequest, null, 2));
 

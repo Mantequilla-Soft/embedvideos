@@ -247,6 +247,52 @@
     
     <div class="card">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <h3 style="margin: 0;">⚙️ Encoder Pool</h3>
+        <button class="btn btn-small" onclick="loadEncoders()">🔄 Refresh</button>
+      </div>
+
+      <div id="encoderFormTitle" style="font-weight: 600; margin-bottom: 10px; font-size: 14px; color: #333;">Add Encoder</div>
+      <form id="encoderForm" onsubmit="submitEncoderForm(event)">
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px; align-items: end;">
+          <div class="form-group" style="margin-bottom: 0;">
+            <label for="encoderName">Name</label>
+            <input type="text" id="encoderName" placeholder="e.g., snapie-1" required>
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label for="encoderUrl">URL</label>
+            <input type="text" id="encoderUrl" placeholder="https://encoder.example.com" required>
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label for="encoderApiKey">API Key</label>
+            <input type="text" id="encoderApiKey" placeholder="Encoder API key" required>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <button type="submit" class="btn" id="encoderSubmitBtn">Add</button>
+            <button type="button" class="btn" id="encoderCancelBtn" onclick="cancelEncoderEdit()" style="display: none; background: #6c757d;">Cancel</button>
+          </div>
+        </div>
+      </form>
+
+      <table id="encodersTable">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>URL</th>
+            <th>Status</th>
+            <th>Added</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="encodersTableBody">
+          <tr>
+            <td colspan="5" style="text-align: center; padding: 30px; color: #999;">Loading...</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
         <h3 style="margin: 0;">👥 User Management</h3>
         <button class="btn btn-small" onclick="loadUsers()">🔄 Refresh</button>
       </div>
@@ -315,6 +361,7 @@
     // Load keys on page load
     if (checkAuth()) {
       loadKeys();
+      loadEncoders();
     }
     
     // Create new API key
@@ -450,6 +497,165 @@
       setTimeout(() => el.style.display = 'none', 5000);
     }
     
+    // Encoder management
+    let currentEncoders = [];
+    let editingEncoder = null;
+
+    async function loadEncoders() {
+      try {
+        const response = await fetch('/admin/encoders', {
+          headers: { 'X-Admin-Password': adminPassword }
+        });
+        const data = await response.json();
+        currentEncoders = data.encoders || [];
+
+        const tbody = document.getElementById('encodersTableBody');
+
+        if (currentEncoders.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 30px; color: #999;">No encoders configured</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = currentEncoders.map(enc => `
+          <tr>
+            <td><strong>${enc.name}</strong></td>
+            <td><span style="font-family: monospace; font-size: 12px;">${enc.url}</span></td>
+            <td>
+              <span class="status-badge ${enc.enabled ? 'status-active' : 'status-inactive'}">
+                ${enc.enabled ? 'Enabled' : 'Disabled'}
+              </span>
+            </td>
+            <td>${new Date(enc.createdAt).toLocaleDateString()}</td>
+            <td style="display: flex; gap: 6px; flex-wrap: wrap;">
+              <button class="btn btn-small" onclick="editEncoder('${enc.name}')">Edit</button>
+              ${enc.enabled
+                ? `<button class="btn btn-small btn-danger" onclick="toggleEncoder('${enc.name}', false)">Disable</button>`
+                : `<button class="btn btn-small btn-success" onclick="toggleEncoder('${enc.name}', true)">Enable</button>`
+              }
+              <button class="btn btn-small btn-danger" onclick="deleteEncoder('${enc.name}')">Remove</button>
+            </td>
+          </tr>
+        `).join('');
+      } catch (error) {
+        showError('Failed to load encoders: ' + error.message);
+      }
+    }
+
+    function editEncoder(name) {
+      const enc = currentEncoders.find(e => e.name === name);
+      if (!enc) return;
+      editingEncoder = name;
+
+      document.getElementById('encoderFormTitle').textContent = `Edit Encoder: ${name}`;
+      document.getElementById('encoderName').value = name;
+      document.getElementById('encoderName').disabled = true;
+      document.getElementById('encoderUrl').value = enc.url;
+      document.getElementById('encoderApiKey').value = '';
+      document.getElementById('encoderApiKey').placeholder = 'Leave blank to keep existing key';
+      document.getElementById('encoderApiKey').required = false;
+      document.getElementById('encoderSubmitBtn').textContent = 'Save Changes';
+      document.getElementById('encoderCancelBtn').style.display = 'inline-block';
+      document.getElementById('encoderName').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    function cancelEncoderEdit() {
+      editingEncoder = null;
+      document.getElementById('encoderForm').reset();
+      document.getElementById('encoderFormTitle').textContent = 'Add Encoder';
+      document.getElementById('encoderName').disabled = false;
+      document.getElementById('encoderApiKey').placeholder = 'Encoder API key';
+      document.getElementById('encoderApiKey').required = true;
+      document.getElementById('encoderSubmitBtn').textContent = 'Add';
+      document.getElementById('encoderCancelBtn').style.display = 'none';
+    }
+
+    async function submitEncoderForm(e) {
+      e.preventDefault();
+      const url = document.getElementById('encoderUrl').value.trim();
+      const apiKey = document.getElementById('encoderApiKey').value.trim();
+
+      try {
+        if (editingEncoder) {
+          const updates = { url };
+          if (apiKey) updates.apiKey = apiKey;
+
+          const response = await fetch(`/admin/encoders/${encodeURIComponent(editingEncoder)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPassword },
+            body: JSON.stringify(updates)
+          });
+          const data = await response.json();
+
+          if (data.success) {
+            showSuccess(`Encoder '${editingEncoder}' updated`);
+            cancelEncoderEdit();
+            loadEncoders();
+          } else {
+            showError(data.error || 'Failed to update encoder');
+          }
+        } else {
+          const name = document.getElementById('encoderName').value.trim();
+          const response = await fetch('/admin/encoders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPassword },
+            body: JSON.stringify({ name, url, apiKey })
+          });
+          const data = await response.json();
+
+          if (data.success) {
+            showSuccess(`Encoder '${name}' added to pool`);
+            document.getElementById('encoderForm').reset();
+            loadEncoders();
+          } else {
+            showError(data.error || 'Failed to add encoder');
+          }
+        }
+      } catch (error) {
+        showError('Network error: ' + error.message);
+      }
+    }
+
+    async function toggleEncoder(name, enabled) {
+      try {
+        const response = await fetch(`/admin/encoders/${encodeURIComponent(name)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPassword },
+          body: JSON.stringify({ enabled })
+        });
+        const data = await response.json();
+
+        if (data.success) {
+          showSuccess(`Encoder '${name}' ${enabled ? 'enabled' : 'disabled'}`);
+          loadEncoders();
+        } else {
+          showError(data.error || 'Failed to update encoder');
+        }
+      } catch (error) {
+        showError('Network error: ' + error.message);
+      }
+    }
+
+    async function deleteEncoder(name) {
+      if (!confirm(`Remove encoder '${name}' from the pool?\n\nThis cannot be undone.`)) return;
+
+      try {
+        const response = await fetch(`/admin/encoders/${encodeURIComponent(name)}`, {
+          method: 'DELETE',
+          headers: { 'X-Admin-Password': adminPassword }
+        });
+        const data = await response.json();
+
+        if (data.success) {
+          showSuccess(`Encoder '${name}' removed`);
+          loadEncoders();
+        } else {
+          showError(data.error || 'Failed to remove encoder');
+        }
+      } catch (error) {
+        showError('Network error: ' + error.message);
+      }
+    }
+
     function logout() {
       localStorage.removeItem('adminPassword');
       alert('Logged out successfully');
