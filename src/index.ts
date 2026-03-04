@@ -797,11 +797,14 @@ async function start() {
       console.log('Demo API key created');
     }
     
-    // Seed encoders from env var if the DB collection is empty (backwards-compatible)
+    // Seed encoders from env var that don't already exist in DB (backwards-compatible)
     const existingEncoders = await database.getAllEncoders();
-    if (existingEncoders.length === 0 && config.encoders.length > 0) {
-      console.log(`Seeding ${config.encoders.length} encoder(s) from env into DB...`);
-      for (const e of config.encoders) {
+    const existingNames = new Set(existingEncoders.map(e => e.name));
+    const encodersToSeed = config.encoders.filter(e => !existingNames.has(e.name));
+    
+    if (encodersToSeed.length > 0) {
+      console.log(`Seeding ${encodersToSeed.length} new encoder(s) from env into DB...`);
+      for (const e of encodersToSeed) {
         await database.createEncoder({
           name: e.name,
           url: e.url,
