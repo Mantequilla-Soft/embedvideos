@@ -89,7 +89,7 @@ const tusServer = new Server({
       
       // Extract metadata from upload
       const owner = upload.metadata?.owner || upload.metadata?.username || 'unknown';
-      const permlink = generateVideoId();
+      const permlink = upload.metadata?.permlink || generateVideoId();
       const frontend_app = upload.metadata?.frontend_app || 'unknown';
       const short = upload.metadata?.short === 'true';
       const size = upload.size || null;
