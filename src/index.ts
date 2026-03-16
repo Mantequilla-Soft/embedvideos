@@ -94,6 +94,7 @@ const tusServer = new Server({
       const short = upload.metadata?.short === 'true';
       const size = upload.size || null;
       const originalFilename = upload.metadata?.filename || null;
+      const duration = upload.metadata?.duration ? parseFloat(upload.metadata.duration) : null;
       
       console.log(`Upload metadata - short flag: "${upload.metadata?.short}" -> parsed as: ${short}`);
       
@@ -149,7 +150,7 @@ const tusServer = new Server({
         manifest_cid: null,
         thumbnail_url: null,
         short,
-        duration: null,
+        duration,
         size,
         encodingProgress: 0,
         originalFilename,
@@ -164,7 +165,8 @@ const tusServer = new Server({
         updatedAt: new Date(),
       });
 
-      console.log(`Upload created: ${owner}/${permlink} [${frontend_app}] (${short ? 'short' : 'long'}, ${size} bytes)`);
+      const permSource = upload.metadata?.permlink ? 'client' : 'generated';
+      console.log(`Upload created: ${owner}/${permlink} [${frontend_app}] (${short ? 'short' : 'long'}, ${size} bytes, permlink: ${permSource}, duration: ${duration ?? 'unknown'})`);
       
       // Return the embed URL immediately
       const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
