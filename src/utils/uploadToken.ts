@@ -42,6 +42,10 @@ export function verifyUploadToken(token: string, secret: string): UploadTokenCla
   const [payload, signature] = parts;
   const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
 
+  // Length check before timingSafeEqual to avoid TypeError on mismatched buffer sizes
+  if (signature.length !== expectedSignature.length) {
+    return null;
+  }
   if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature))) {
     return null;
   }

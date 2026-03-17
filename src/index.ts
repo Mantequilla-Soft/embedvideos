@@ -103,12 +103,20 @@ const tusServer = new Server({
           return res;
         }
 
-        // Enforce max file size from token
-        if (upload.size && tokenClaims.maxFileSize && upload.size > tokenClaims.maxFileSize) {
-          res.statusCode = 413;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ error: 'File size exceeds token limit' }));
-          return res;
+        // Enforce max file size from token — require explicit Upload-Length
+        if (tokenClaims.maxFileSize) {
+          if (!upload.size) {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Upload-Length header is required for token-based uploads' }));
+            return res;
+          }
+          if (upload.size > tokenClaims.maxFileSize) {
+            res.statusCode = 413;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'File size exceeds token limit' }));
+            return res;
+          }
         }
       } else {
         res.statusCode = 401;
@@ -840,7 +848,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       jti: generateTokenId(),
       owner,
       app: frontend_app || apiKeyData?.app_name || 'unknown',
-      issuedByKey: apiKeyData?.key?.slice(0, 12) + '...' || 'unknown',
+      issuedByKey: apiKeyData?.app_name || 'unknown',
       short: !!short,
       maxFileSize,
       allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
@@ -876,7 +884,11 @@ async function start() {
     await database.connect(config.mongoDbName, config.mongoCollectionVideos);
 
     // Initialize upload token collection (TTL indexes for auto-cleanup)
-    await database.initUploadTokenCollection();
+    if (config.uploadTokenSecret) {
+      await database.initUploadTokenCollection();
+    } else {
+      console.log('Upload token auth disabled (UPLOAD_TOKEN_SECRET not set)');
+    }
 
     // Ensure demo API key exists
     const demoKey = await database.getApiKey(config.demoApiKey);
