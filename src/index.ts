@@ -14,6 +14,7 @@ import { loadConfig } from './config/config';
 import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
 import { CleanupService } from './utils/cleanup';
+import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 
 dotenv.config();
 
@@ -65,33 +66,82 @@ const tusServer = new Server({
   respectForwardedHeaders: true,
   async onUploadCreate(req, res, upload) {
     try {
-      // Validate API key for TUS uploads
-      const apiKey = req.headers['x-api-key'] as string || 
-                     req.headers['authorization']?.replace('Bearer ', '');
-      
-      if (!apiKey) {
+      // Auth: support both X-API-Key (server-to-server) and Bearer upload tokens (client-side)
+      const xApiKey = req.headers['x-api-key'] as string | undefined;
+      const bearerToken = req.headers['authorization']?.replace('Bearer ', '');
+      let tokenClaims: UploadTokenClaims | null = null;
+
+      if (xApiKey) {
+        // Traditional API key auth
+        const keyData = await database.getApiKey(xApiKey);
+        if (!keyData || !keyData.active) {
+          res.statusCode = 401;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Invalid or inactive API key' }));
+          return res;
+        }
+        database.updateApiKeyLastUsed(xApiKey).catch(console.error);
+      } else if (bearerToken && config.uploadTokenSecret) {
+        // Upload token auth (client-side flow)
+        tokenClaims = verifyUploadToken(bearerToken, config.uploadTokenSecret);
+        if (!tokenClaims) {
+          res.statusCode = 401;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Invalid or expired upload token' }));
+          return res;
+        }
+
+        // Enforce allowedOrigins if specified in the token
+        if (tokenClaims.allowedOrigins && tokenClaims.allowedOrigins.length > 0) {
+          const origin = req.headers.origin as string | undefined;
+          if (!origin || !tokenClaims.allowedOrigins.includes(origin)) {
+            res.statusCode = 403;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Origin not allowed for this upload token' }));
+            return res;
+          }
+        }
+
+        // Single-use enforcement: consume token BEFORE file-size checks.
+        // This is intentional — prevents probing file size limits with the same token.
+        const consumed = await database.consumeUploadToken(
+          tokenClaims.jti,
+          new Date(tokenClaims.exp * 1000)
+        );
+        if (!consumed) {
+          res.statusCode = 403;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Upload token has already been used' }));
+          return res;
+        }
+
+        // Enforce max file size from token — require explicit Upload-Length
+        if (tokenClaims.maxFileSize) {
+          if (!upload.size) {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Upload-Length header is required for token-based uploads' }));
+            return res;
+          }
+          if (upload.size > tokenClaims.maxFileSize) {
+            res.statusCode = 413;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'File size exceeds token limit' }));
+            return res;
+          }
+        }
+      } else {
         res.statusCode = 401;
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'API key required' }));
+        res.end(JSON.stringify({ error: 'API key or upload token required' }));
         return res;
       }
-      
-      const keyData = await database.getApiKey(apiKey);
-      if (!keyData || !keyData.active) {
-        res.statusCode = 401;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'Invalid or inactive API key' }));
-        return res;
-      }
-      
-      // Update last used timestamp
-      database.updateApiKeyLastUsed(apiKey).catch(console.error);
-      
-      // Extract metadata from upload
-      const owner = upload.metadata?.owner || upload.metadata?.username || 'unknown';
+
+      // Extract metadata — token claims override client metadata when present
+      const owner = tokenClaims?.owner || upload.metadata?.owner || upload.metadata?.username || 'unknown';
       const permlink = upload.metadata?.permlink || generateVideoId();
-      const frontend_app = upload.metadata?.frontend_app || 'unknown';
-      const short = upload.metadata?.short === 'true';
+      const frontend_app = tokenClaims?.app || upload.metadata?.frontend_app || 'unknown';
+      const short = tokenClaims ? tokenClaims.short : upload.metadata?.short === 'true';
       const size = upload.size || null;
       const originalFilename = upload.metadata?.filename || null;
       const duration = upload.metadata?.duration ? parseFloat(upload.metadata.duration) : null;
@@ -774,6 +824,66 @@ app.delete('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: 
   }
 });
 
+// Upload Token endpoint — server-to-server only (requires API key)
+// Frontends call their own backend, which calls this endpoint to get a short-lived
+// upload token. The frontend then uses the token to upload directly via TUS.
+app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) => {
+  try {
+    if (!config.uploadTokenSecret) {
+      return res.status(503).json({
+        error: 'Upload tokens are not configured',
+        message: 'Set UPLOAD_TOKEN_SECRET to enable upload tokens',
+      });
+    }
+
+    const { owner, frontend_app, short = false, allowed_origins = [], max_file_size, ttl } = req.body;
+
+    if (!owner || typeof owner !== 'string') {
+      return res.status(422).json({ error: 'owner (string) is required' });
+    }
+
+    // Resolve TTL: request → default → 3600
+    const tokenTtl = Math.min(
+      typeof ttl === 'number' && ttl > 0 ? ttl : config.uploadTokenDefaultTtl,
+      config.uploadTokenMaxTtl
+    );
+
+    // Resolve max file size: request → default → 1GB
+    const maxFileSize = typeof max_file_size === 'number' && max_file_size > 0
+      ? Math.min(max_file_size, config.uploadTokenMaxFileSize)
+      : config.uploadTokenMaxFileSize;
+
+    const now = Math.floor(Date.now() / 1000);
+    const apiKeyData = (req as any).apiKey;
+
+    const claims: UploadTokenClaims = {
+      jti: generateTokenId(),
+      owner,
+      app: frontend_app || apiKeyData?.app_name || 'unknown',
+      issuedByKey: apiKeyData?.app_name || 'unknown',
+      short: !!short,
+      maxFileSize,
+      allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
+      iat: now,
+      exp: now + tokenTtl,
+    };
+
+    const token = signUploadToken(claims, config.uploadTokenSecret);
+    const expiresAt = new Date(claims.exp * 1000).toISOString();
+
+    console.log(`Upload token issued: ${owner} via ${claims.app} (ttl=${tokenTtl}s, jti=${claims.jti.slice(0, 8)}...)`);
+
+    res.status(201).json({
+      token,
+      upload_url: `${req.protocol}://${req.get('host')}/uploads`,
+      expires_at: expiresAt,
+    });
+  } catch (error) {
+    console.error('Error creating upload token:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Mount TUS server - handle all HTTP methods
 app.all('/uploads', tusServer.handle.bind(tusServer));
 app.all('/uploads/*', tusServer.handle.bind(tusServer));
@@ -784,7 +894,14 @@ let dispatcher: JobDispatcher;
 async function start() {
   try {
     await database.connect(config.mongoDbName, config.mongoCollectionVideos);
-    
+
+    // Initialize upload token collection (TTL indexes for auto-cleanup)
+    if (config.uploadTokenSecret) {
+      await database.initUploadTokenCollection();
+    } else {
+      console.log('Upload token auth disabled (UPLOAD_TOKEN_SECRET not set)');
+    }
+
     // Ensure demo API key exists
     const demoKey = await database.getApiKey(config.demoApiKey);
     if (!demoKey) {
