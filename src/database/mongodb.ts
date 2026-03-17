@@ -432,6 +432,42 @@ export class Database {
     await encodersCollection.deleteOne({ name });
   }
 
+  // Upload Token single-use tracking
+  // Uses a lightweight collection with TTL index for automatic cleanup
+
+  async initUploadTokenCollection(): Promise<void> {
+    if (!this.db) throw new Error('Database not connected');
+    const col = this.db.collection('embed-upload-tokens');
+    // Auto-delete consumed tokens after 24h (cleanup safety net)
+    await col.createIndex({ consumedAt: 1 }, { expireAfterSeconds: 86400 });
+    // Also expire by the token's own expiry
+    await col.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await col.createIndex({ jti: 1 }, { unique: true });
+  }
+
+  /**
+   * Try to consume a token (mark as used). Returns true if successful,
+   * false if the token was already consumed.
+   * Uses atomic upsert to prevent race conditions.
+   */
+  async consumeUploadToken(jti: string, expiresAt: Date): Promise<boolean> {
+    if (!this.db) throw new Error('Database not connected');
+    const col = this.db.collection('embed-upload-tokens');
+    try {
+      await col.insertOne({
+        jti,
+        consumedAt: new Date(),
+        expiresAt,
+      });
+      return true; // Token consumed successfully (first use)
+    } catch (err: any) {
+      if (err?.code === 11000) {
+        return false; // Duplicate key — token already consumed
+      }
+      throw err;
+    }
+  }
+
   async close(): Promise<void> {
     await this.client.close();
   }

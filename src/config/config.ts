@@ -25,6 +25,10 @@ export interface Config {
   cleanupEnabled: boolean;
   cleanupIntervalHours: number;
   cleanupRetentionDays: number;
+  uploadTokenSecret: string;
+  uploadTokenDefaultTtl: number;
+  uploadTokenMaxTtl: number;
+  uploadTokenMaxFileSize: number;
 }
 
 function parseEncoders(): EncoderConfig[] {
@@ -76,5 +80,9 @@ export function loadConfig(): Config {
     cleanupEnabled: process.env.CLEANUP_ENABLED !== 'false',
     cleanupIntervalHours: parseInt(process.env.CLEANUP_INTERVAL_HOURS || '24', 10),
     cleanupRetentionDays: parseInt(process.env.CLEANUP_RETENTION_DAYS || '7', 10),
+    uploadTokenSecret: process.env.UPLOAD_TOKEN_SECRET || '',
+    uploadTokenDefaultTtl: parseInt(process.env.UPLOAD_TOKEN_DEFAULT_TTL || '600', 10),
+    uploadTokenMaxTtl: parseInt(process.env.UPLOAD_TOKEN_MAX_TTL || '1800', 10),
+    uploadTokenMaxFileSize: parseInt(process.env.UPLOAD_TOKEN_MAX_FILE_SIZE || String(1024 * 1024 * 1024), 10),
   };
 }
