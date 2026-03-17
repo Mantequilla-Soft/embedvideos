@@ -302,7 +302,7 @@ const upload = new tus.Upload(file, {
   },
   metadata: {
     filename: file.name,
-    filetype: file.type
+    filetype: file.type,
     // owner, frontend_app, short are already in the token
   },
   onError: (error) =&gt; console.error('Upload failed:', error),

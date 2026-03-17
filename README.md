@@ -133,19 +133,23 @@ curl -X POST https://embed.3speak.tv/uploads/token \
 ## API Endpoints
 
 ### Health Check
-```
+
+```http
 GET /health
 ```
+
 Returns the service status.
 
 ### Get Video Metadata
-```
+
+```http
 GET /video/:permlink
 ```
 Retrieves metadata for a specific video, including encoding progress. This endpoint is **public** (no auth required) and can be polled to track upload and encoding status. See [Tracking Progress](#tracking-progress) below.
 
 ### TUS Upload Endpoint
-```
+
+```http
 POST /uploads
 ```
 TUS protocol endpoint for video uploads. Requires either `X-API-Key` header or `Authorization: Bearer <upload-token>`.
@@ -160,7 +164,8 @@ TUS protocol endpoint for video uploads. Requires either `X-API-Key` header or `
 - `X-Embed-URL`: The embed URL for the video (format: `https://play.3speak.tv/embed?v={owner}/{permlink}`)
 
 ### Request Upload Token
-```
+
+```http
 POST /uploads/token
 ```
 Generates a short-lived, single-use upload token. Requires `X-API-Key` header. See [Authentication](#authentication) for details.
@@ -242,7 +247,7 @@ const upload = new tus.Upload(file, {
   },
   metadata: {
     filename: file.name,
-    filetype: file.type
+    filetype: file.type,
     // owner, frontend_app, short are already in the token — no need to set them
   },
   onError: (error) => {
@@ -306,7 +311,7 @@ pollProgress();
 
 **Status lifecycle:**
 
-```
+```text
 uploading → processing → published
                 ↘ failed
 ```
