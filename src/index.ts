@@ -91,7 +91,19 @@ const tusServer = new Server({
           return res;
         }
 
-        // Single-use enforcement: try to consume the token
+        // Enforce allowedOrigins if specified in the token
+        if (tokenClaims.allowedOrigins && tokenClaims.allowedOrigins.length > 0) {
+          const origin = req.headers.origin as string | undefined;
+          if (!origin || !tokenClaims.allowedOrigins.includes(origin)) {
+            res.statusCode = 403;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Origin not allowed for this upload token' }));
+            return res;
+          }
+        }
+
+        // Single-use enforcement: consume token BEFORE file-size checks.
+        // This is intentional — prevents probing file size limits with the same token.
         const consumed = await database.consumeUploadToken(
           tokenClaims.jti,
           new Date(tokenClaims.exp * 1000)
