@@ -12,6 +12,8 @@ A modern, scalable video upload and encoding service with TUS resumable uploads,
 - **Job Dispatcher**: Automatic job queuing and distribution to available encoders
 - **Webhook Callbacks**: Secure encoder-to-service communication for status updates
 - **MongoDB Integration**: Tracks videos, jobs, and API keys
+- **Upload Tokens**: Short-lived, signed tokens for secure client-side uploads without exposing API keys
+- **Encoding Progress**: Real-time encoding progress tracking via polling
 - **API Key Management**: Secure admin panel for managing application access
 - **RESTful API**: Simple endpoints for video metadata and management
 
@@ -48,6 +50,8 @@ MONGODB_URI=mongodb://user:pass@host:27017/threespeak
 ENCODERS=[{"name":"encoder1","url":"https://encoder.example.com","apiKey":"key","enabled":true}]
 WEBHOOK_API_KEY=your-secure-webhook-key
 WEBHOOK_URL=https://embed.3speak.tv/webhook
+# Optional: enable upload tokens for secure client-side uploads
+UPLOAD_TOKEN_SECRET=your-random-secret-here
 ```
 
 See [.env.example](./.env.example) for complete configuration options.
@@ -72,6 +76,60 @@ npm run build
 npm start
 ```
 
+## Authentication
+
+The service supports two authentication methods for uploads. Both are fully supported — choose the one that fits your architecture.
+
+### Option 1: Direct API Key (Server-to-Server / Mobile Apps)
+
+Pass the API key directly in the `X-API-Key` header. This is the simplest integration and is appropriate when:
+- Your uploads happen server-side (your backend uploads on behalf of users)
+- You're building a mobile app where the key is bundled in the binary (not exposed in browser DevTools)
+
+### Option 2: Upload Tokens (Web Apps / Client-Side Uploads)
+
+For web applications where JavaScript runs in the browser, exposing the API key in network requests is a security risk. Upload tokens solve this:
+
+1. **Your backend** (which holds the API key) requests a short-lived token from the embed service
+2. **Your frontend** uses that token to upload directly — the API key never reaches the browser
+
+Tokens are HMAC-SHA256 signed, single-use, and time-limited (default 10 min, max 30 min).
+
+**Requesting a token (server-side):**
+```bash
+curl -X POST https://embed.3speak.tv/uploads/token \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "owner": "username",
+    "frontend_app": "your-app-name",
+    "short": false,
+    "allowed_origins": ["https://your-app.com"],
+    "max_file_size": 1073741824,
+    "ttl": 600
+  }'
+```
+
+**Response:**
+```json
+{
+  "token": "eyJ...",
+  "upload_url": "https://embed.3speak.tv/uploads",
+  "expires_at": "2026-03-17T12:10:00.000Z"
+}
+```
+
+**Token parameters:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `owner` | string | **Required.** Username of the video owner |
+| `frontend_app` | string | **Required.** Your application identifier |
+| `short` | boolean | **Required.** `true` for short-form videos (≤60s, 480p) |
+| `allowed_origins` | string[] | CORS origins allowed to use this token (recommended for web) |
+| `max_file_size` | number | Max upload size in bytes (capped by server config, default 1GB) |
+| `ttl` | number | Token lifetime in seconds (capped by server config, default 600s) |
+
 ## API Endpoints
 
 ### Health Check
@@ -82,28 +140,34 @@ Returns the service status.
 
 ### Get Video Metadata
 ```
-GET /video/:videoId
+GET /video/:permlink
 ```
-Retrieves metadata for a specific video.
+Retrieves metadata for a specific video, including encoding progress. This endpoint is **public** (no auth required) and can be polled to track upload and encoding status. See [Tracking Progress](#tracking-progress) below.
 
 ### TUS Upload Endpoint
 ```
 POST /uploads
 ```
-TUS protocol endpoint for video uploads.
+TUS protocol endpoint for video uploads. Requires either `X-API-Key` header or `Authorization: Bearer <upload-token>`.
 
 **Required Metadata:**
-- `owner` or `username`: The username for the video owner
-- `frontend_app`: Frontend application identifier (for tracking and billing)
-- `short`: String `"true"` or `"false"` - whether this is a short-form video
+- `owner` or `username`: The username for the video owner (ignored when using upload tokens — the token carries this)
+- `frontend_app`: Frontend application identifier (ignored when using upload tokens)
+- `short`: String `"true"` or `"false"` - whether this is a short-form video (ignored when using upload tokens)
 - `filename`: (optional) Original filename
 
 **Response Headers:**
 - `X-Embed-URL`: The embed URL for the video (format: `https://play.3speak.tv/embed?v={owner}/{permlink}`)
 
-## Upload Example
+### Request Upload Token
+```
+POST /uploads/token
+```
+Generates a short-lived, single-use upload token. Requires `X-API-Key` header. See [Authentication](#authentication) for details.
 
-Using the TUS JavaScript client:
+## Upload Examples
+
+### Direct API Key (Server-to-Server / Mobile)
 
 ```javascript
 import * as tus from 'tus-js-client';
@@ -111,12 +175,15 @@ import * as tus from 'tus-js-client';
 const file = document.getElementById('file-input').files[0];
 
 const upload = new tus.Upload(file, {
-  endpoint: 'http://localhost:3000/uploads',
+  endpoint: 'https://embed.3speak.tv/uploads',
+  headers: {
+    'X-API-Key': 'your-api-key'
+  },
   metadata: {
     filename: file.name,
     owner: 'chessfighter',
-    frontend_app: 'my-video-app',  // Your app identifier
-    short: 'false',  // 'true' for short-form videos
+    frontend_app: 'my-video-app',
+    short: 'false',
     filetype: file.type
   },
   onError: (error) => {
@@ -130,7 +197,6 @@ const upload = new tus.Upload(file, {
     console.log('Upload completed!');
   },
   onAfterResponse: (req, res) => {
-    // Get the embed URL from response headers
     const embedUrl = res.getHeader('X-Embed-URL');
     console.log('Embed URL:', embedUrl);
     // Example: https://play.3speak.tv/embed?v=chessfighter/yn77aj9g
@@ -139,6 +205,113 @@ const upload = new tus.Upload(file, {
 
 upload.start();
 ```
+
+### Upload Token (Web App — Recommended for Browsers)
+
+**Step 1 — Your backend requests a token:**
+
+```javascript
+// Server-side (Node.js, Python, etc.)
+const response = await fetch('https://embed.3speak.tv/uploads/token', {
+  method: 'POST',
+  headers: {
+    'X-API-Key': process.env.EMBED_API_KEY,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    owner: 'chessfighter',
+    frontend_app: 'my-video-app',
+    short: false,
+    allowed_origins: ['https://my-video-app.com'],
+    ttl: 600
+  })
+});
+
+const { token, upload_url, expires_at } = await response.json();
+// Send `token` and `upload_url` to your frontend
+```
+
+**Step 2 — Your frontend uploads with the token:**
+
+```javascript
+// Client-side (browser)
+const upload = new tus.Upload(file, {
+  endpoint: uploadUrl,  // from your backend
+  headers: {
+    'Authorization': `Bearer ${token}`  // from your backend
+  },
+  metadata: {
+    filename: file.name,
+    filetype: file.type
+    // owner, frontend_app, short are already in the token — no need to set them
+  },
+  onError: (error) => {
+    console.error('Upload failed:', error);
+  },
+  onProgress: (bytesUploaded, bytesTotal) => {
+    const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2);
+    console.log(`Uploaded ${percentage}%`);
+  },
+  onSuccess: () => {
+    console.log('Upload completed!');
+  },
+  onAfterResponse: (req, res) => {
+    const embedUrl = res.getHeader('X-Embed-URL');
+    console.log('Embed URL:', embedUrl);
+  }
+});
+
+upload.start();
+```
+
+## Tracking Progress
+
+After starting an upload, you can track the video's status and encoding progress by polling the public `GET /video/:permlink` endpoint. Extract the `permlink` from the embed URL returned in the `X-Embed-URL` header.
+
+**Key fields to monitor:**
+
+| Field | Description |
+|-------|-------------|
+| `status` | `uploading` → `processing` → `published` (or `failed`) |
+| `encodingProgress` | Encoding percentage (0–100). Updates in real-time as the encoder works. |
+
+**Example — polling for progress:**
+
+```javascript
+const permlink = embedUrl.split('/').pop(); // e.g. "yn77aj9g"
+
+async function pollProgress() {
+  const res = await fetch(`https://embed.3speak.tv/video/${permlink}`);
+  const video = await res.json();
+
+  console.log(`Status: ${video.status}, Progress: ${video.encodingProgress}%`);
+
+  if (video.status === 'published') {
+    console.log('Video is ready!');
+    console.log('Manifest CID:', video.manifest_cid);
+    return;
+  }
+
+  if (video.status === 'failed') {
+    console.error('Encoding failed');
+    return;
+  }
+
+  // Poll every 5 seconds while uploading/processing
+  setTimeout(pollProgress, 5000);
+}
+
+pollProgress();
+```
+
+**Status lifecycle:**
+
+```
+uploading → processing → published
+                ↘ failed
+```
+
+The embed player handles all states automatically (showing upload/processing animations), so the embed URL is usable immediately — but polling lets your app show custom progress UI.
 
 ## Project Structure
 
@@ -157,7 +330,8 @@ upload.start();
 │   ├── utils/
 │   │   ├── videoId.ts         # Video ID generator
 │   │   ├── keyGenerator.ts    # API key generator
-│   │   └── ipfs.ts            # IPFS pinning utilities
+│   │   ├── ipfs.ts            # IPFS pinning utilities
+│   │   └── uploadToken.ts     # Upload token signing and verification
 │   └── index.ts               # Main server file
 ├── public/
 │   ├── index.html             # Landing page with integration docs
