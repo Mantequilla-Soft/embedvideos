@@ -21,7 +21,7 @@ A modern, scalable video upload and encoding service with TUS resumable uploads,
 - MongoDB 6.0+
 - IPFS daemon (for local pinning) or access to IPFS gateway
 - npm or yarn
-- One or more encoder nodes (see [3speak-encoder](https://github.com/your-repo))
+- One or more encoder nodes (see [3speak-encoder](https://github.com/Mantequilla-Soft/3speakencoder))
 
 ## Installation
 
