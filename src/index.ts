@@ -168,6 +168,7 @@ const tusServer = new Server({
             failedUploads: 0,
             lastUpload: null,
           },
+          premium: false,
           trustLevel: 'new',
           adminNotes: '',
           firstSeen: new Date(),
@@ -472,6 +473,22 @@ app.get('/video/:permlink', async (req: Request, res: Response) => {
   }
 });
 
+// Check if a user has premium status (protected by API key)
+app.get('/users/:username/premium', requireApiKey, async (req: Request, res: Response) => {
+  try {
+    const { username } = req.params;
+    const user = await database.getUser(username);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const premium = user.premium ?? false;
+    res.json({ username, premium });
+  } catch (error) {
+    console.error('Error checking premium status:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Update video thumbnail endpoint (protected)
 app.post('/video/:permlink/thumbnail', requireApiKey, async (req: Request, res: Response) => {
   try {
@@ -670,6 +687,31 @@ app.patch('/admin/users/:username/ban', requireAdminAuth, async (req: Request, r
     res.json({ success: true, username, banned });
   } catch (error) {
     console.error('Error banning user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Set/remove premium status (protected)
+app.patch('/admin/users/:username/premium', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { username } = req.params;
+    const { premium } = req.body;
+
+    if (typeof premium !== 'boolean') {
+      return res.status(400).json({ error: 'premium must be a boolean' });
+    }
+
+    const user = await database.getUser(username);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    await database.setUserPremium(username, premium);
+
+    console.log(`User ${username} premium status set to ${premium}`);
+    res.json({ success: true, username, premium });
+  } catch (error) {
+    console.error('Error setting premium status:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

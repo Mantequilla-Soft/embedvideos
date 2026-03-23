@@ -113,6 +113,9 @@ export class JobDispatcher {
       throw new Error(`Video has no input_cid: ${permlink}`);
     }
 
+    // Look up premium status for this user
+    const premium = await this.database.isUserPremium(owner);
+
     // Prepare encoder request with full IPFS gateway URL
     const ipfsGateway = 'https://ipfs.3speak.tv/ipfs';
     const encoderRequest = {
@@ -120,6 +123,7 @@ export class JobDispatcher {
       permlink,
       input_cid: `${ipfsGateway}/${video.input_cid}`,
       short: video.short,
+      premium,
       webhook_url: this.config.webhookUrl,
       api_key: this.config.webhookApiKey,
       frontend_app: video.frontend_app,
