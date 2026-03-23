@@ -253,7 +253,7 @@
 
       <div id="encoderFormTitle" style="font-weight: 600; margin-bottom: 10px; font-size: 14px; color: #333;">Add Encoder</div>
       <form id="encoderForm" onsubmit="submitEncoderForm(event)">
-        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px; align-items: end;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto auto; gap: 10px; align-items: end;">
           <div class="form-group" style="margin-bottom: 0;">
             <label for="encoderName">Name</label>
             <input type="text" id="encoderName" placeholder="e.g., snapie-1" required>
@@ -265,6 +265,14 @@
           <div class="form-group" style="margin-bottom: 0;">
             <label for="encoderApiKey">API Key</label>
             <input type="text" id="encoderApiKey" placeholder="Encoder API key" required>
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label for="encoderTier">Tier</label>
+            <select id="encoderTier" style="width: 100%; padding: 10px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 14px;">
+              <option value="standard">Standard</option>
+              <option value="performance">Performance</option>
+              <option value="lite">Lite</option>
+            </select>
           </div>
           <div style="display: flex; gap: 6px;">
             <button type="submit" class="btn" id="encoderSubmitBtn">Add</button>
@@ -278,6 +286,7 @@
           <tr>
             <th>Name</th>
             <th>URL</th>
+            <th>Tier</th>
             <th>Status</th>
             <th>Added</th>
             <th>Actions</th>
@@ -285,7 +294,7 @@
         </thead>
         <tbody id="encodersTableBody">
           <tr>
-            <td colspan="5" style="text-align: center; padding: 30px; color: #999;">Loading...</td>
+            <td colspan="6" style="text-align: center; padding: 30px; color: #999;">Loading...</td>
           </tr>
         </tbody>
       </table>
@@ -512,14 +521,19 @@
         const tbody = document.getElementById('encodersTableBody');
 
         if (currentEncoders.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 30px; color: #999;">No encoders configured</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 30px; color: #999;">No encoders configured</td></tr>';
           return;
         }
 
-        tbody.innerHTML = currentEncoders.map(enc => `
+        const tierColors = { performance: 'background: #fff3cd; color: #856404;', standard: 'background: #cce5ff; color: #004085;', lite: 'background: #e2e3e5; color: #383d41;' };
+        tbody.innerHTML = currentEncoders.map(enc => {
+          const tier = enc.tier || 'standard';
+          const tierStyle = tierColors[tier] || tierColors.standard;
+          return `
           <tr>
             <td><strong>${enc.name}</strong></td>
             <td><span style="font-family: monospace; font-size: 12px;">${enc.url}</span></td>
+            <td><span class="status-badge" style="${tierStyle}">${tier}</span></td>
             <td>
               <span class="status-badge ${enc.enabled ? 'status-active' : 'status-inactive'}">
                 ${enc.enabled ? 'Enabled' : 'Disabled'}
@@ -535,7 +549,7 @@
               <button class="btn btn-small btn-danger" onclick="deleteEncoder('${enc.name}')">Remove</button>
             </td>
           </tr>
-        `).join('');
+        `}).join('');
       } catch (error) {
         showError('Failed to load encoders: ' + error.message);
       }
@@ -553,6 +567,7 @@
       document.getElementById('encoderApiKey').value = '';
       document.getElementById('encoderApiKey').placeholder = 'Leave blank to keep existing key';
       document.getElementById('encoderApiKey').required = false;
+      document.getElementById('encoderTier').value = enc.tier || 'standard';
       document.getElementById('encoderSubmitBtn').textContent = 'Save Changes';
       document.getElementById('encoderCancelBtn').style.display = 'inline-block';
       document.getElementById('encoderName').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -573,10 +588,11 @@
       e.preventDefault();
       const url = document.getElementById('encoderUrl').value.trim();
       const apiKey = document.getElementById('encoderApiKey').value.trim();
+      const tier = document.getElementById('encoderTier').value;
 
       try {
         if (editingEncoder) {
-          const updates = { url };
+          const updates = { url, tier };
           if (apiKey) updates.apiKey = apiKey;
 
           const response = await fetch(`/admin/encoders/${encodeURIComponent(editingEncoder)}`, {
@@ -598,7 +614,7 @@
           const response = await fetch('/admin/encoders', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPassword },
-            body: JSON.stringify({ name, url, apiKey })
+            body: JSON.stringify({ name, url, apiKey, tier })
           });
           const data = await response.json();
 

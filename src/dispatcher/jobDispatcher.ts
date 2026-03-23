@@ -1,4 +1,4 @@
-import { Database } from '../database/mongodb';
+import { Database, Encoder, EncoderTier } from '../database/mongodb';
 import { Config } from '../config/config';
 
 export class JobDispatcher {
@@ -6,7 +6,8 @@ export class JobDispatcher {
   private config: Config;
   private intervalId: NodeJS.Timeout | null = null;
   private isRunning = false;
-  private currentEncoderIndex = 0;
+  // Per-tier round-robin counters
+  private tierCounters: Record<string, number> = {};
 
   constructor(database: Database, config: Config) {
     this.database = database;
@@ -14,19 +15,78 @@ export class JobDispatcher {
   }
 
   /**
-   * Get next encoder using round-robin (reads live list from DB)
+   * Get next encoder using tier-aware selection with round-robin within tier.
+   *
+   * Dispatch rules:
+   *   Premium jobs → managed performance, fallback to managed standard. Never lite, never community.
+   *   Free jobs    → standard or lite (any access), fallback managed standard. Never performance.
+   *   Short videos → any enabled encoder (trivial 480p/60s job).
+   *
+   * File size is checked against encoder.maxFileSize when set.
    */
-  private async getNextEncoder() {
+  private async getNextEncoder(premium: boolean, fileSize: number, isShort: boolean) {
     const allEncoders = await this.database.getAllEncoders();
-    const enabledEncoders = allEncoders.filter(e => e.enabled);
+    const enabledManaged = allEncoders.filter(e =>
+      e.enabled && (e.access ?? 'managed') === 'managed'
+    );
 
-    if (enabledEncoders.length === 0) {
-      throw new Error('No enabled encoders available');
+    if (isShort) {
+      // Short videos — any enabled managed encoder will do
+      return this.roundRobin(enabledManaged, 'any');
     }
 
-    const encoder = enabledEncoders[this.currentEncoderIndex % enabledEncoders.length];
-    this.currentEncoderIndex++;
+    if (premium) {
+      // Premium: try performance first, then standard. Never lite.
+      const perfEncoders = this.filterByTierAndSize(enabledManaged, 'performance', fileSize);
+      if (perfEncoders.length > 0) return this.roundRobin(perfEncoders, 'performance');
 
+      const stdEncoders = this.filterByTierAndSize(enabledManaged, 'standard', fileSize);
+      if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, 'standard');
+
+      throw new Error('No suitable managed encoders available for premium job');
+    }
+
+    // Free user: try standard first, then lite. Never performance.
+    const allEnabled = allEncoders.filter(e => e.enabled);
+
+    const stdEncoders = this.filterByTierAndSize(allEnabled, 'standard', fileSize);
+    if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, 'free-standard');
+
+    const liteEncoders = this.filterByTierAndSize(allEnabled, 'lite', fileSize);
+    if (liteEncoders.length > 0) return this.roundRobin(liteEncoders, 'free-lite');
+
+    // Last resort for free: managed standard (even if already tried, this covers edge cases)
+    const managedStd = this.filterByTierAndSize(enabledManaged, 'standard', fileSize);
+    if (managedStd.length > 0) return this.roundRobin(managedStd, 'free-fallback');
+
+    throw new Error('No suitable encoders available for free job');
+  }
+
+  /**
+   * Filter encoders by tier and file size capacity.
+   * Encoders without a tier field default to 'standard'.
+   * Encoders without maxFileSize accept any file size.
+   */
+  private filterByTierAndSize(encoders: Encoder[], tier: EncoderTier, fileSize: number): Encoder[] {
+    return encoders.filter(e => {
+      const encoderTier = e.tier ?? 'standard';
+      if (encoderTier !== tier) return false;
+      if (e.maxFileSize && fileSize > e.maxFileSize) return false;
+      return true;
+    });
+  }
+
+  /**
+   * Round-robin selection within a group of encoders.
+   * Each tier key gets its own counter to avoid skew.
+   */
+  private roundRobin(encoders: Encoder[], tierKey: string): Encoder {
+    if (encoders.length === 0) {
+      throw new Error(`No encoders available for tier: ${tierKey}`);
+    }
+    const counter = this.tierCounters[tierKey] ?? 0;
+    const encoder = encoders[counter % encoders.length];
+    this.tierCounters[tierKey] = counter + 1;
     return encoder;
   }
 
@@ -77,7 +137,7 @@ export class JobDispatcher {
           await this.dispatchJob(job.owner, job.permlink);
         } catch (error) {
           console.error(`Failed to dispatch job ${job.owner}/${job.permlink}:`, error);
-          
+
           // Increment attempt count and set error
           await this.database.incrementJobAttempt(job.owner, job.permlink);
           await this.database.updateJobStatus(job.owner, job.permlink, 'pending', {
@@ -115,6 +175,7 @@ export class JobDispatcher {
 
     // Look up premium status for this user
     const premium = await this.database.isUserPremium(owner);
+    const fileSize = video.size ?? 0;
 
     // Prepare encoder request with full IPFS gateway URL
     const ipfsGateway = 'https://ipfs.3speak.tv/ipfs';
@@ -130,9 +191,11 @@ export class JobDispatcher {
       originalFilename: video.originalFilename,
     };
 
-    // Select encoder using round-robin
-    const encoder = await this.getNextEncoder();
-    console.log(`Dispatching job to encoder [${encoder.name}]: ${owner}/${permlink}`);
+    // Select encoder using tier-aware routing
+    const encoder = await this.getNextEncoder(premium, fileSize, video.short);
+    const encoderTier = encoder.tier ?? 'standard';
+    const encoderAccess = encoder.access ?? 'managed';
+    console.log(`Dispatching job to [${encoder.name}] (${encoderAccess}/${encoderTier}): ${owner}/${permlink} [premium=${premium}, size=${fileSize}]`);
     console.log(`Encoder request payload:`, JSON.stringify(encoderRequest, null, 2));
 
     // Call encoder API
