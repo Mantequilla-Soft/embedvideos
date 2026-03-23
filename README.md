@@ -147,6 +147,23 @@ GET /video/:permlink
 ```
 Retrieves metadata for a specific video, including encoding progress. This endpoint is **public** (no auth required) and can be polled to track upload and encoding status. See [Tracking Progress](#tracking-progress) below.
 
+### Check User Premium Status
+
+```http
+GET /users/:username/premium
+```
+Returns whether a user has premium status (multi-resolution encoding). Requires `X-API-Key` header.
+
+**Response:**
+```json
+{
+  "username": "coolmole",
+  "premium": false
+}
+```
+
+Frontends use this to adjust upload size limits in the UI before requesting an upload token.
+
 ### TUS Upload Endpoint
 
 ```http
@@ -514,6 +531,30 @@ curl -X POST http://localhost:3001/admin/encoders \
 - Any temporary files older than retention period
 
 Files are only deleted after successful IPFS pinning or after exceeding the retention period, ensuring no data loss for active uploads.
+
+### User Management
+
+Users are created automatically on first upload. Admins can manage users via the admin panel at `/admin.html` or the API.
+
+**Admin API Endpoints:**
+- `GET /admin/users` - List all users (supports `?search=`, `?limit=`, `?skip=`)
+- `PATCH /admin/users/:username/ban` - Ban/unban a user (body: `{ "banned": true }`)
+- `PATCH /admin/users/:username/premium` - Grant/revoke premium (body: `{ "premium": true }`)
+
+**Premium Users:**
+
+Premium users get multi-resolution encoding (1080p, 720p, 480p) instead of the default 480p-only. The `premium` flag is sent to encoders at dispatch time.
+
+- Frontends check premium status via `GET /users/:username/premium` (API key required)
+- Admins toggle it via `PATCH /admin/users/:username/premium` or the admin panel
+
+**Grant Premium Example:**
+```bash
+curl -X PATCH http://localhost:3001/admin/users/coolmole/premium \
+  -H "X-Admin-Password: your-admin-password" \
+  -H "Content-Type: application/json" \
+  -d '{"premium": true}'
+```
 
 ## Embed URL Format
 

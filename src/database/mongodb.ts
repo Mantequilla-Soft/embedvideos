@@ -47,6 +47,7 @@ export interface User {
     failedUploads: number;
     lastUpload: Date | null;
   };
+  premium?: boolean;
   trustLevel: 'new' | 'trusted' | 'verified' | 'restricted';
   adminNotes: string;
   firstSeen: Date;
@@ -385,6 +386,28 @@ export class Database {
     await usersCollection.updateOne(
       { username },
       { $set: { banned, updatedAt: new Date() } }
+    );
+  }
+
+  // Premium User Methods
+
+  async isUserPremium(username: string): Promise<boolean> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const usersCollection = this.db.collection<User>('embed-users');
+    const user = await usersCollection.findOne({ username });
+    return user?.premium ?? false;
+  }
+
+  async setUserPremium(username: string, premium: boolean): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const usersCollection = this.db.collection<User>('embed-users');
+    await usersCollection.updateOne(
+      { username },
+      { $set: { premium, updatedAt: new Date() } }
     );
   }
 
