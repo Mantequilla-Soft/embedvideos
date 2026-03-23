@@ -405,10 +405,13 @@ export class Database {
       throw new Error('Database not connected');
     }
     const usersCollection = this.db.collection<User>('embed-users');
-    await usersCollection.updateOne(
+    const result = await usersCollection.updateOne(
       { username },
       { $set: { premium, updatedAt: new Date() } }
     );
+    if (result.matchedCount === 0) {
+      throw new Error(`User not found: ${username}`);
+    }
   }
 
   // Encoder Management Methods

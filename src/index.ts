@@ -477,7 +477,11 @@ app.get('/video/:permlink', async (req: Request, res: Response) => {
 app.get('/users/:username/premium', requireApiKey, async (req: Request, res: Response) => {
   try {
     const { username } = req.params;
-    const premium = await database.isUserPremium(username);
+    const user = await database.getUser(username);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const premium = user.premium ?? false;
     res.json({ username, premium });
   } catch (error) {
     console.error('Error checking premium status:', error);

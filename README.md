@@ -152,9 +152,11 @@ Retrieves metadata for a specific video, including encoding progress. This endpo
 ```http
 GET /users/:username/premium
 ```
-Returns whether a user has premium status (multi-resolution encoding). Requires `X-API-Key` header.
+
+Returns whether a user has premium status (multi-resolution encoding). Requires `X-API-Key` header. Returns 404 if the user does not exist.
 
 **Response:**
+
 ```json
 {
   "username": "coolmole",
@@ -549,6 +551,7 @@ Premium users get multi-resolution encoding (1080p, 720p, 480p) instead of the d
 - Admins toggle it via `PATCH /admin/users/:username/premium` or the admin panel
 
 **Grant Premium Example:**
+
 ```bash
 curl -X PATCH http://localhost:3001/admin/users/coolmole/premium \
   -H "X-Admin-Password: your-admin-password" \
