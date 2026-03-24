@@ -75,7 +75,7 @@ export interface Encoder {
   enabled: boolean;
   access?: EncoderAccess;
   tier?: EncoderTier;
-  maxFileSize?: number;
+  maxFileSize?: number | null;
   createdAt: Date;
   updatedAt: Date;
 }

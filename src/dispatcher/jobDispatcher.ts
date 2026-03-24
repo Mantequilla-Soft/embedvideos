@@ -19,12 +19,12 @@ export class JobDispatcher {
    *
    * Dispatch rules:
    *   Premium jobs → managed performance, fallback to managed standard. Never lite, never community.
-   *   Free jobs    → standard or lite (any access), fallback managed standard. Never performance.
+   *   Free jobs    → standard or lite (any access). Never performance.
    *   Short videos → any managed encoder (any tier), filtered by maxFileSize. Fast turnaround, but 480p doesn't need performance tier.
    *
    * File size is checked against encoder.maxFileSize when set.
    */
-  private async getNextEncoder(premium: boolean, fileSize: number, isShort: boolean) {
+  private async getNextEncoder(premium: boolean, fileSize: number | null, isShort: boolean) {
     const allEncoders = await this.database.getAllEncoders();
     const enabledManaged = allEncoders.filter(e =>
       e.enabled && (e.access ?? 'managed') === 'managed'
@@ -33,7 +33,7 @@ export class JobDispatcher {
     if (isShort) {
       // Short videos — managed only (fast turnaround), any tier (480p doesn't need GPU)
       const eligibleShort = enabledManaged.filter(
-        e => !e.maxFileSize || fileSize <= e.maxFileSize
+        e => e.maxFileSize == null || (fileSize != null && fileSize <= e.maxFileSize)
       );
       if (eligibleShort.length > 0) return this.roundRobin(eligibleShort, 'short');
       // Fallback: ignore maxFileSize if no encoder qualifies
@@ -60,10 +60,6 @@ export class JobDispatcher {
     const liteEncoders = this.filterByTierAndSize(allEnabled, 'lite', fileSize);
     if (liteEncoders.length > 0) return this.roundRobin(liteEncoders, 'free-lite');
 
-    // Last resort for free: managed standard (even if already tried, this covers edge cases)
-    const managedStd = this.filterByTierAndSize(enabledManaged, 'standard', fileSize);
-    if (managedStd.length > 0) return this.roundRobin(managedStd, 'free-fallback');
-
     throw new Error('No suitable encoders available for free job');
   }
 
@@ -72,11 +68,12 @@ export class JobDispatcher {
    * Encoders without a tier field default to 'standard'.
    * Encoders without maxFileSize accept any file size.
    */
-  private filterByTierAndSize(encoders: Encoder[], tier: EncoderTier, fileSize: number): Encoder[] {
+  private filterByTierAndSize(encoders: Encoder[], tier: EncoderTier, fileSize: number | null): Encoder[] {
     return encoders.filter(e => {
       const encoderTier = e.tier ?? 'standard';
       if (encoderTier !== tier) return false;
-      if (e.maxFileSize && fileSize > e.maxFileSize) return false;
+      // Unknown file size → only allow encoders with no cap
+      if (e.maxFileSize != null && (fileSize == null || fileSize > e.maxFileSize)) return false;
       return true;
     });
   }
@@ -180,7 +177,7 @@ export class JobDispatcher {
 
     // Look up premium status for this user
     const premium = await this.database.isUserPremium(owner);
-    const fileSize = video.size ?? 0;
+    const fileSize = video.size ?? null;
 
     // Prepare encoder request with full IPFS gateway URL
     const ipfsGateway = 'https://ipfs.3speak.tv/ipfs';
