@@ -20,7 +20,7 @@ export class JobDispatcher {
    * Dispatch rules:
    *   Premium jobs → managed performance, fallback to managed standard. Never lite, never community.
    *   Free jobs    → standard or lite (any access), fallback managed standard. Never performance.
-   *   Short videos → any enabled encoder (trivial 480p/60s job).
+   *   Short videos → any managed encoder (any tier), filtered by maxFileSize. Fast turnaround, but 480p doesn't need performance tier.
    *
    * File size is checked against encoder.maxFileSize when set.
    */
@@ -31,8 +31,13 @@ export class JobDispatcher {
     );
 
     if (isShort) {
-      // Short videos — any enabled managed encoder will do
-      return this.roundRobin(enabledManaged, 'any');
+      // Short videos — managed only (fast turnaround), any tier (480p doesn't need GPU)
+      const eligibleShort = enabledManaged.filter(
+        e => !e.maxFileSize || fileSize <= e.maxFileSize
+      );
+      if (eligibleShort.length > 0) return this.roundRobin(eligibleShort, 'short');
+      // Fallback: ignore maxFileSize if no encoder qualifies
+      return this.roundRobin(enabledManaged, 'short');
     }
 
     if (premium) {

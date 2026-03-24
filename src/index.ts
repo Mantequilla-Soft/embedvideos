@@ -795,6 +795,13 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
     if (!validTiers.includes(tier)) {
       return res.status(400).json({ error: `tier must be one of: ${validTiers.join(', ')}` });
     }
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean' });
+    }
+    if (maxFileSize !== undefined && maxFileSize !== null &&
+        (typeof maxFileSize !== 'number' || !Number.isFinite(maxFileSize) || maxFileSize <= 0)) {
+      return res.status(400).json({ error: 'maxFileSize must be a positive number or null' });
+    }
 
     const existing = await database.getEncoder(name);
     if (existing) {
@@ -843,7 +850,12 @@ app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: R
       updates.url = url;
     }
     if (apiKey !== undefined) updates.apiKey = apiKey;
-    if (enabled !== undefined) updates.enabled = enabled;
+    if (enabled !== undefined) {
+      if (typeof enabled !== 'boolean') {
+        return res.status(400).json({ error: 'enabled must be a boolean' });
+      }
+      updates.enabled = enabled;
+    }
     if (access !== undefined) {
       const validAccess = ['managed', 'community'];
       if (!validAccess.includes(access)) {
@@ -858,7 +870,13 @@ app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: R
       }
       updates.tier = tier;
     }
-    if (maxFileSize !== undefined) updates.maxFileSize = maxFileSize;
+    if (maxFileSize !== undefined) {
+      if (maxFileSize !== null &&
+          (typeof maxFileSize !== 'number' || !Number.isFinite(maxFileSize) || maxFileSize <= 0)) {
+        return res.status(400).json({ error: 'maxFileSize must be a positive number or null' });
+      }
+      updates.maxFileSize = maxFileSize;
+    }
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
