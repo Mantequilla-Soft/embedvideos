@@ -65,11 +65,17 @@ export interface ApiKey {
   lastUsed: Date | null;
 }
 
+export type EncoderAccess = 'managed' | 'community';
+export type EncoderTier = 'performance' | 'standard' | 'lite';
+
 export interface Encoder {
   name: string;
   url: string;
   apiKey: string;
   enabled: boolean;
+  access?: EncoderAccess;
+  tier?: EncoderTier;
+  maxFileSize?: number | null;
   createdAt: Date;
   updatedAt: Date;
 }

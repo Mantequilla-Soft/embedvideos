@@ -773,7 +773,7 @@ app.get('/admin/encoders', requireAdminAuth, async (req: Request, res: Response)
 // Admin: Add encoder (protected)
 app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response) => {
   try {
-    const { name, url, apiKey, enabled = true } = req.body;
+    const { name, url, apiKey, enabled = true, access = 'managed', tier = 'standard', maxFileSize } = req.body;
 
     if (!name || !url || !apiKey) {
       return res.status(400).json({ error: 'name, url, and apiKey are required' });
@@ -786,6 +786,23 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
       return res.status(400).json({ error: 'Invalid URL format' });
     }
 
+    // Validate access and tier values
+    const validAccess = ['managed', 'community'];
+    const validTiers = ['performance', 'standard', 'lite'];
+    if (!validAccess.includes(access)) {
+      return res.status(400).json({ error: `access must be one of: ${validAccess.join(', ')}` });
+    }
+    if (!validTiers.includes(tier)) {
+      return res.status(400).json({ error: `tier must be one of: ${validTiers.join(', ')}` });
+    }
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean' });
+    }
+    if (maxFileSize !== undefined && maxFileSize !== null &&
+        (typeof maxFileSize !== 'number' || !Number.isFinite(maxFileSize) || maxFileSize <= 0)) {
+      return res.status(400).json({ error: 'maxFileSize must be a positive number or null' });
+    }
+
     const existing = await database.getEncoder(name);
     if (existing) {
       return res.status(409).json({ error: `Encoder '${name}' already exists` });
@@ -796,12 +813,15 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
       url,
       apiKey,
       enabled,
+      access,
+      tier,
+      ...(maxFileSize !== undefined && { maxFileSize }),
       createdAt: new Date(),
       updatedAt: new Date(),
     });
 
-    console.log(`Encoder added: ${name} (${url})`);
-    res.json({ success: true, name, url, enabled });
+    console.log(`Encoder added: ${name} (${url}) [${access}/${tier}]`);
+    res.json({ success: true, name, url, enabled, access, tier });
   } catch (error) {
     console.error('Error adding encoder:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -812,7 +832,7 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
 app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { name } = req.params;
-    const { url, apiKey, enabled } = req.body;
+    const { url, apiKey, enabled, access, tier, maxFileSize } = req.body;
 
     const encoder = await database.getEncoder(name);
     if (!encoder) {
@@ -830,10 +850,36 @@ app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: R
       updates.url = url;
     }
     if (apiKey !== undefined) updates.apiKey = apiKey;
-    if (enabled !== undefined) updates.enabled = enabled;
+    if (enabled !== undefined) {
+      if (typeof enabled !== 'boolean') {
+        return res.status(400).json({ error: 'enabled must be a boolean' });
+      }
+      updates.enabled = enabled;
+    }
+    if (access !== undefined) {
+      const validAccess = ['managed', 'community'];
+      if (!validAccess.includes(access)) {
+        return res.status(400).json({ error: `access must be one of: ${validAccess.join(', ')}` });
+      }
+      updates.access = access;
+    }
+    if (tier !== undefined) {
+      const validTiers = ['performance', 'standard', 'lite'];
+      if (!validTiers.includes(tier)) {
+        return res.status(400).json({ error: `tier must be one of: ${validTiers.join(', ')}` });
+      }
+      updates.tier = tier;
+    }
+    if (maxFileSize !== undefined) {
+      if (maxFileSize !== null &&
+          (typeof maxFileSize !== 'number' || !Number.isFinite(maxFileSize) || maxFileSize <= 0)) {
+        return res.status(400).json({ error: 'maxFileSize must be a positive number or null' });
+      }
+      updates.maxFileSize = maxFileSize;
+    }
 
     if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: 'No valid fields to update (url, apiKey, enabled)' });
+      return res.status(400).json({ error: 'No valid fields to update' });
     }
 
     await database.updateEncoder(name, updates);
