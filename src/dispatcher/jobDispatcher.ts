@@ -128,11 +128,27 @@ export class JobDispatcher {
     const stalledJobs = await this.database.getStalledJobs(2);
     for (const job of stalledJobs) {
       try {
-        console.warn(`Stalled job detected: ${job.owner}/${job.permlink} on [${job.assignedWorker}], last update ${job.updatedAt.toISOString()}`);
-        await this.database.resetJob(job.owner, job.permlink);
-        console.log(`Stalled job reset to pending: ${job.owner}/${job.permlink}`);
+        console.warn(`Stalled job detected: ${job.owner}/${job.permlink} on [${job.assignedWorker}], last update ${job.updatedAt.toISOString()} (attempt ${job.attemptCount + 1}/3)`);
+
+        if (job.attemptCount >= 2) {
+          // This will be the 3rd attempt — mark as permanently failed
+          await this.database.updateJobStatus(job.owner, job.permlink, 'failed', {
+            lastError: `Stalled ${job.attemptCount + 1} times — giving up`,
+          });
+          await this.database.updateVideoStatus(job.permlink, 'failed');
+          console.error(`Job ${job.owner}/${job.permlink} failed after stalling ${job.attemptCount + 1} times`);
+          continue;
+        }
+
+        // Atomically reset only if still encoding (prevents race with webhook completion)
+        const wasReset = await this.database.resetStalledJob(job.owner, job.permlink);
+        if (wasReset) {
+          console.log(`Stalled job reset to pending: ${job.owner}/${job.permlink}`);
+        } else {
+          console.log(`Stalled job ${job.owner}/${job.permlink} already changed status, skipping reset`);
+        }
       } catch (error) {
-        console.error(`Failed to reset stalled job ${job.owner}/${job.permlink}:`, error);
+        console.error(`Failed to handle stalled job ${job.owner}/${job.permlink}:`, error);
       }
     }
   }

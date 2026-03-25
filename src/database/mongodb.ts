@@ -349,6 +349,30 @@ export class Database {
     );
   }
 
+  async resetStalledJob(owner: string, permlink: string): Promise<boolean> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    const result = await jobsCollection.updateOne(
+      { owner, permlink, status: 'encoding' },
+      {
+        $set: {
+          status: 'pending',
+          assignedWorker: null,
+          encoderJobId: null,
+          assignedAt: null,
+          lastError: 'Reset due to stall (no progress update)',
+          encodingProgress: null,
+          encodingStage: null,
+          updatedAt: new Date(),
+        },
+        $inc: { attemptCount: 1 },
+      }
+    );
+    return result.modifiedCount > 0;
+  }
+
   async getStalledJobs(minutesOld: number): Promise<EncodingJob[]> {
     if (!this.db) {
       throw new Error('Database not connected');

@@ -309,7 +309,7 @@
             <option value="7d">Last 7 Days</option>
             <option value="30d">Last 30 Days</option>
           </select>
-          <button class="btn btn-small" onclick="loadEncoderStats()">🔄 Refresh</button>
+          <button type="button" class="btn btn-small" onclick="loadEncoderStats()">🔄 Refresh</button>
         </div>
       </div>
 
@@ -760,7 +760,7 @@
           const rateColor = enc.successRate >= 90 ? '#27ae60' : enc.successRate >= 70 ? '#f39c12' : '#e74c3c';
           const tierColor = tierColors[enc.tier] || '#95a5a6';
           return `<tr>
-            <td><strong>${enc.encoderName}</strong></td>
+            <td><strong>${escapeHtml(enc.encoderName)}</strong></td>
             <td><span style="background:${tierColor};color:white;padding:2px 8px;border-radius:10px;font-size:11px;">${enc.tier}</span></td>
             <td>${enc.totalJobs}</td>
             <td style="color:${rateColor};font-weight:600;">${enc.successRate}%</td>
@@ -771,6 +771,12 @@
       } catch (error) {
         console.error('Failed to load encoder stats:', error);
       }
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
     }
 
     function formatTime(ms) {
