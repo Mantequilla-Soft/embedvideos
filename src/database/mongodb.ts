@@ -373,6 +373,24 @@ export class Database {
     return result.modifiedCount > 0;
   }
 
+  async failStalledJob(owner: string, permlink: string, error: string): Promise<boolean> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    const result = await jobsCollection.updateOne(
+      { owner, permlink, status: 'encoding' },
+      {
+        $set: {
+          status: 'failed',
+          lastError: error,
+          updatedAt: new Date(),
+        },
+      }
+    );
+    return result.modifiedCount > 0;
+  }
+
   async getStalledJobs(minutesOld: number): Promise<EncodingJob[]> {
     if (!this.db) {
       throw new Error('Database not connected');

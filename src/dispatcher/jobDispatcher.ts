@@ -131,12 +131,17 @@ export class JobDispatcher {
         console.warn(`Stalled job detected: ${job.owner}/${job.permlink} on [${job.assignedWorker}], last update ${job.updatedAt.toISOString()} (attempt ${job.attemptCount + 1}/3)`);
 
         if (job.attemptCount >= 2) {
-          // This will be the 3rd attempt — mark as permanently failed
-          await this.database.updateJobStatus(job.owner, job.permlink, 'failed', {
-            lastError: `Stalled ${job.attemptCount + 1} times — giving up`,
-          });
-          await this.database.updateVideoStatus(job.permlink, 'failed');
-          console.error(`Job ${job.owner}/${job.permlink} failed after stalling ${job.attemptCount + 1} times`);
+          // 3rd stall — atomically fail only if still encoding
+          const wasFailed = await this.database.failStalledJob(
+            job.owner, job.permlink,
+            `Stalled ${job.attemptCount + 1} times — giving up`
+          );
+          if (wasFailed) {
+            await this.database.updateVideoStatus(job.permlink, 'failed');
+            console.error(`Job ${job.owner}/${job.permlink} failed after stalling ${job.attemptCount + 1} times`);
+          } else {
+            console.log(`Stalled job ${job.owner}/${job.permlink} already changed status, skipping failure`);
+          }
           continue;
         }
 
