@@ -761,7 +761,7 @@
           const tierColor = tierColors[enc.tier] || '#95a5a6';
           return `<tr>
             <td><strong>${escapeHtml(enc.encoderName)}</strong></td>
-            <td><span style="background:${tierColor};color:white;padding:2px 8px;border-radius:10px;font-size:11px;">${enc.tier}</span></td>
+            <td><span style="background:${tierColor};color:white;padding:2px 8px;border-radius:10px;font-size:11px;">${escapeHtml(enc.tier)}</span></td>
             <td>${enc.totalJobs}</td>
             <td style="color:${rateColor};font-weight:600;">${enc.successRate}%</td>
             <td>${formatTime(enc.avgEncodeTimeMs)}</td>
@@ -770,6 +770,8 @@
         }).join('');
       } catch (error) {
         console.error('Failed to load encoder stats:', error);
+        document.getElementById('statsTableBody').innerHTML =
+          '<tr><td colspan="6" style="text-align:center;padding:30px;color:#e74c3c;">Network error loading stats</td></tr>';
       }
     }
 
