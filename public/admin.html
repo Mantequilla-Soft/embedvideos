@@ -302,6 +302,55 @@
 
     <div class="card">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <h3 style="margin: 0;">📊 Encoder Stats</h3>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <select id="statsPeriod" onchange="loadEncoderStats()" style="padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px;">
+            <option value="24h">Last 24 Hours</option>
+            <option value="7d">Last 7 Days</option>
+            <option value="30d">Last 30 Days</option>
+          </select>
+          <button class="btn btn-small" onclick="loadEncoderStats()">🔄 Refresh</button>
+        </div>
+      </div>
+
+      <div id="statsAggregate" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px;">
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 14px; text-align: center;">
+          <div style="font-size: 22px; font-weight: 700; color: #1a1a2e;" id="statTotalJobs">-</div>
+          <div style="font-size: 12px; color: #666; margin-top: 2px;">Total Jobs</div>
+        </div>
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 14px; text-align: center;">
+          <div style="font-size: 22px; font-weight: 700;" id="statSuccessRate">-</div>
+          <div style="font-size: 12px; color: #666; margin-top: 2px;">Success Rate</div>
+        </div>
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 14px; text-align: center;">
+          <div style="font-size: 22px; font-weight: 700; color: #1a1a2e;" id="statAvgTime">-</div>
+          <div style="font-size: 12px; color: #666; margin-top: 2px;">Avg Encode Time</div>
+        </div>
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 14px; text-align: center;">
+          <div style="font-size: 22px; font-weight: 700; color: #1a1a2e;" id="statJobsPerHour">-</div>
+          <div style="font-size: 12px; color: #666; margin-top: 2px;">Jobs / Hour</div>
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Encoder</th>
+            <th>Tier</th>
+            <th>Jobs</th>
+            <th>Success Rate</th>
+            <th>Avg Time</th>
+            <th>Failed</th>
+          </tr>
+        </thead>
+        <tbody id="statsTableBody">
+          <tr><td colspan="6" style="text-align: center; padding: 30px; color: #999;">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
         <h3 style="margin: 0;">👥 User Management</h3>
         <button class="btn btn-small" onclick="loadUsers()">🔄 Refresh</button>
       </div>
@@ -367,10 +416,11 @@
       return true;
     }
     
-    // Load keys on page load
+    // Load data on page load
     if (checkAuth()) {
       loadKeys();
       loadEncoders();
+      loadEncoderStats();
     }
     
     // Create new API key
@@ -670,6 +720,67 @@
       } catch (error) {
         showError('Network error: ' + error.message);
       }
+    }
+
+    // Encoder stats
+    async function loadEncoderStats() {
+      const period = document.getElementById('statsPeriod').value;
+      try {
+        const response = await fetch(`/admin/encoder-stats?period=${period}`, {
+          headers: { 'X-Admin-Password': adminPassword }
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          document.getElementById('statsTableBody').innerHTML =
+            '<tr><td colspan="6" style="text-align:center;padding:30px;color:#e74c3c;">Failed to load stats</td></tr>';
+          return;
+        }
+
+        const agg = data.aggregate;
+
+        // Update summary boxes
+        document.getElementById('statTotalJobs').textContent = agg.totalJobs;
+
+        const rateEl = document.getElementById('statSuccessRate');
+        rateEl.textContent = agg.successRate + '%';
+        rateEl.style.color = agg.successRate >= 90 ? '#27ae60' : agg.successRate >= 70 ? '#f39c12' : '#e74c3c';
+
+        document.getElementById('statAvgTime').textContent = formatTime(agg.avgEncodeTimeMs);
+        document.getElementById('statJobsPerHour').textContent = agg.jobsPerHour;
+
+        // Render per-encoder table
+        const tbody = document.getElementById('statsTableBody');
+        if (data.encoders.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#999;">No data for this period</td></tr>';
+          return;
+        }
+
+        const tierColors = { performance: '#f39c12', standard: '#3498db', lite: '#95a5a6' };
+        tbody.innerHTML = data.encoders.map(enc => {
+          const rateColor = enc.successRate >= 90 ? '#27ae60' : enc.successRate >= 70 ? '#f39c12' : '#e74c3c';
+          const tierColor = tierColors[enc.tier] || '#95a5a6';
+          return `<tr>
+            <td><strong>${enc.encoderName}</strong></td>
+            <td><span style="background:${tierColor};color:white;padding:2px 8px;border-radius:10px;font-size:11px;">${enc.tier}</span></td>
+            <td>${enc.totalJobs}</td>
+            <td style="color:${rateColor};font-weight:600;">${enc.successRate}%</td>
+            <td>${formatTime(enc.avgEncodeTimeMs)}</td>
+            <td style="color:${enc.failedJobs > 0 ? '#e74c3c' : '#999'}">${enc.failedJobs}</td>
+          </tr>`;
+        }).join('');
+      } catch (error) {
+        console.error('Failed to load encoder stats:', error);
+      }
+    }
+
+    function formatTime(ms) {
+      if (!ms || ms === 0) return '-';
+      if (ms < 1000) return ms + 'ms';
+      const seconds = Math.round(ms / 1000);
+      if (seconds < 60) return seconds + 's';
+      const minutes = Math.floor(seconds / 60);
+      const remainSec = seconds % 60;
+      return minutes + 'm ' + remainSec + 's';
     }
 
     function logout() {

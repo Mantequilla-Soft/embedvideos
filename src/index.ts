@@ -5,7 +5,7 @@ import { Server } from '@tus/server';
 import { FileStore } from '@tus/file-store';
 import path from 'path';
 import { unlinkSync } from 'fs';
-import { Database } from './database/mongodb';
+import { Database, Encoder } from './database/mongodb';
 import { generateVideoId } from './utils/videoId';
 import { generateApiKey } from './utils/keyGenerator';
 import { createApiKeyMiddleware } from './middleware/auth';
@@ -908,6 +908,100 @@ app.delete('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: 
     res.json({ success: true, name });
   } catch (error) {
     console.error('Error removing encoder:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Encoder stats (aggregated from embed-jobs) (protected)
+app.get('/admin/encoder-stats', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const period = (req.query.period as string) || '24h';
+    const periodMs: Record<string, number> = {
+      '24h': 24 * 60 * 60 * 1000,
+      '7d': 7 * 24 * 60 * 60 * 1000,
+      '30d': 30 * 24 * 60 * 60 * 1000,
+    };
+
+    if (!periodMs[period]) {
+      return res.status(400).json({ error: 'period must be one of: 24h, 7d, 30d' });
+    }
+
+    const since = new Date(Date.now() - periodMs[period]);
+    const jobs = await database.getCompletedJobStats(since);
+    const encoders = await database.getAllEncoders();
+
+    // Build encoder lookup for tier/access metadata
+    const encoderMap = new Map<string, Encoder>();
+    for (const enc of encoders) {
+      encoderMap.set(enc.name, enc);
+    }
+
+    // Group jobs by assignedWorker
+    const grouped = new Map<string, typeof jobs>();
+    for (const job of jobs) {
+      const worker = job.assignedWorker ?? 'unknown';
+      if (!grouped.has(worker)) grouped.set(worker, []);
+      grouped.get(worker)!.push(job);
+    }
+
+    // Compute per-encoder metrics
+    const encoderStats = Array.from(grouped.entries()).map(([encoderName, encoderJobs]) => {
+      const encoder = encoderMap.get(encoderName);
+      const completed = encoderJobs.filter(j => j.status === 'completed');
+      const failed = encoderJobs.filter(j => j.status === 'failed');
+
+      // Compute avg encode time from completed jobs with valid timestamps
+      const encodeTimes = completed
+        .filter(j => j.assignedAt && j.webhookReceivedAt)
+        .map(j => new Date(j.webhookReceivedAt!).getTime() - new Date(j.assignedAt!).getTime());
+      const avgEncodeTimeMs = encodeTimes.length > 0
+        ? Math.round(encodeTimes.reduce((a, b) => a + b, 0) / encodeTimes.length)
+        : 0;
+
+      return {
+        encoderName,
+        tier: encoder?.tier ?? 'standard',
+        access: encoder?.access ?? 'managed',
+        totalJobs: encoderJobs.length,
+        completedJobs: completed.length,
+        failedJobs: failed.length,
+        successRate: encoderJobs.length > 0
+          ? Math.round((completed.length / encoderJobs.length) * 1000) / 10
+          : 0,
+        avgEncodeTimeMs,
+      };
+    });
+
+    // Compute aggregate metrics
+    const totalJobs = jobs.length;
+    const totalCompleted = jobs.filter(j => j.status === 'completed').length;
+    const totalFailed = jobs.filter(j => j.status === 'failed').length;
+    const allEncodeTimes = jobs
+      .filter(j => j.status === 'completed' && j.assignedAt && j.webhookReceivedAt)
+      .map(j => new Date(j.webhookReceivedAt!).getTime() - new Date(j.assignedAt!).getTime());
+    const periodHours = periodMs[period] / (60 * 60 * 1000);
+
+    res.json({
+      period,
+      since: since.toISOString(),
+      aggregate: {
+        totalJobs,
+        completedJobs: totalCompleted,
+        failedJobs: totalFailed,
+        successRate: totalJobs > 0
+          ? Math.round((totalCompleted / totalJobs) * 1000) / 10
+          : 0,
+        avgEncodeTimeMs: allEncodeTimes.length > 0
+          ? Math.round(allEncodeTimes.reduce((a, b) => a + b, 0) / allEncodeTimes.length)
+          : 0,
+        jobsPerHour: periodHours > 0
+          ? Math.round((totalJobs / periodHours) * 10) / 10
+          : 0,
+      },
+      encoders: encoderStats,
+    });
+  } catch (error) {
+    console.error('Error fetching encoder stats:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

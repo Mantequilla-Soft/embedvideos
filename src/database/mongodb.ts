@@ -349,6 +349,29 @@ export class Database {
     );
   }
 
+  async getStalledJobs(minutesOld: number): Promise<EncodingJob[]> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const cutoffDate = new Date(Date.now() - minutesOld * 60 * 1000);
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    return jobsCollection.find({
+      status: 'encoding',
+      updatedAt: { $lt: cutoffDate }
+    }).toArray();
+  }
+
+  async getCompletedJobStats(since: Date): Promise<EncodingJob[]> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    return jobsCollection.find({
+      status: { $in: ['completed', 'failed'] },
+      updatedAt: { $gte: since }
+    }).toArray();
+  }
+
   // User management methods
   async getUser(username: string): Promise<User | null> {
     if (!this.db) {

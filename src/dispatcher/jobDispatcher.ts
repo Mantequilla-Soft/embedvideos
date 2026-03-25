@@ -122,10 +122,28 @@ export class JobDispatcher {
   }
 
   /**
+   * Detect and reset stalled encoding jobs (no progress update in 2+ minutes).
+   */
+  private async checkStalledJobs(): Promise<void> {
+    const stalledJobs = await this.database.getStalledJobs(2);
+    for (const job of stalledJobs) {
+      try {
+        console.warn(`Stalled job detected: ${job.owner}/${job.permlink} on [${job.assignedWorker}], last update ${job.updatedAt.toISOString()}`);
+        await this.database.resetJob(job.owner, job.permlink);
+        console.log(`Stalled job reset to pending: ${job.owner}/${job.permlink}`);
+      } catch (error) {
+        console.error(`Failed to reset stalled job ${job.owner}/${job.permlink}:`, error);
+      }
+    }
+  }
+
+  /**
    * Process pending jobs
    */
   private async processJobs(): Promise<void> {
     try {
+      await this.checkStalledJobs();
+
       const pendingJobs = await this.database.getPendingJobs(5);
 
       if (pendingJobs.length === 0) {
