@@ -122,10 +122,49 @@ export class JobDispatcher {
   }
 
   /**
+   * Detect and reset stalled encoding jobs (no progress update in 2+ minutes).
+   */
+  private async checkStalledJobs(): Promise<void> {
+    const stalledJobs = await this.database.getStalledJobs(2);
+    for (const job of stalledJobs) {
+      try {
+        console.warn(`Stalled job detected: ${job.owner}/${job.permlink} on [${job.assignedWorker}], last update ${job.updatedAt.toISOString()} (attempt ${job.attemptCount + 1}/3)`);
+
+        if (job.attemptCount >= 2) {
+          // 3rd stall — atomically fail only if still encoding
+          const wasFailed = await this.database.failStalledJob(
+            job.owner, job.permlink,
+            `Stalled ${job.attemptCount + 1} times — giving up`
+          );
+          if (wasFailed) {
+            await this.database.updateVideoStatus(job.permlink, 'failed');
+            console.error(`Job ${job.owner}/${job.permlink} failed after stalling ${job.attemptCount + 1} times`);
+          } else {
+            console.log(`Stalled job ${job.owner}/${job.permlink} already changed status, skipping failure`);
+          }
+          continue;
+        }
+
+        // Atomically reset only if still encoding (prevents race with webhook completion)
+        const wasReset = await this.database.resetStalledJob(job.owner, job.permlink);
+        if (wasReset) {
+          console.log(`Stalled job reset to pending: ${job.owner}/${job.permlink}`);
+        } else {
+          console.log(`Stalled job ${job.owner}/${job.permlink} already changed status, skipping reset`);
+        }
+      } catch (error) {
+        console.error(`Failed to handle stalled job ${job.owner}/${job.permlink}:`, error);
+      }
+    }
+  }
+
+  /**
    * Process pending jobs
    */
   private async processJobs(): Promise<void> {
     try {
+      await this.checkStalledJobs();
+
       const pendingJobs = await this.database.getPendingJobs(5);
 
       if (pendingJobs.length === 0) {
