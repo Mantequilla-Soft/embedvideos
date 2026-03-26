@@ -13,7 +13,7 @@ import { createAdminAuthMiddleware } from './middleware/adminAuth';
 import { loadConfig } from './config/config';
 import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
-import { unwrapJWS } from './utils/jws';
+import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
 import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 
@@ -507,7 +507,7 @@ app.post('/api/v0/gateway/updateNode', async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error('Community registration error:', error);
-    if (error instanceof Error && error.message.includes('JWS')) {
+    if (error instanceof JWSAuthError) {
       return res.status(401).json({ error: 'Invalid JWS signature' });
     }
     res.status(500).json({ error: 'Internal server error' });
@@ -560,7 +560,7 @@ app.post('/api/v0/gateway/myJob', async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error('Community job poll error:', error);
-    if (error instanceof Error && error.message.includes('JWS')) {
+    if (error instanceof JWSAuthError) {
       return res.status(401).json({ error: 'Invalid JWS signature' });
     }
     res.status(500).json({ error: 'Internal server error' });
@@ -581,7 +581,7 @@ app.post('/api/v0/gateway/heartbeat', async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Community heartbeat error:', error);
-    if (error instanceof Error && error.message.includes('JWS')) {
+    if (error instanceof JWSAuthError) {
       return res.status(401).json({ error: 'Invalid JWS signature' });
     }
     res.status(500).json({ error: 'Internal server error' });

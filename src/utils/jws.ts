@@ -3,8 +3,19 @@ import { DID } from 'dids';
 
 const did = new DID({ resolver: KeyResolver.getResolver() });
 
+export class JWSAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JWSAuthError';
+  }
+}
+
 export async function unwrapJWS(jws: any): Promise<{ payload: any; did: string }> {
-  const data = await did.verifyJWS(jws);
-  const encoderDid = data.kid.split('#')[0];
-  return { payload: data.payload, did: encoderDid };
+  try {
+    const data = await did.verifyJWS(jws);
+    const encoderDid = data.kid.split('#')[0];
+    return { payload: data.payload, did: encoderDid };
+  } catch (error) {
+    throw new JWSAuthError(error instanceof Error ? error.message : 'JWS verification failed');
+  }
 }
