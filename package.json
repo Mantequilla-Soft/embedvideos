@@ -21,10 +21,12 @@
     "@tus/file-store": "^1.5.0",
     "@tus/server": "^1.5.0",
     "cors": "^2.8.5",
+    "dids": "^5.0.3",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "form-data": "^4.0.5",
     "ipfs-http-client": "^60.0.1",
+    "key-did-resolver": "^4.0.0",
     "mongodb": "^6.3.0",
     "nanoid": "^3.3.7"
   },

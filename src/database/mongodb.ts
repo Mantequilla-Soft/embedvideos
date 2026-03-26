@@ -76,6 +76,13 @@ export interface Encoder {
   access?: EncoderAccess;
   tier?: EncoderTier;
   maxFileSize?: number | null;
+  // Community encoder fields
+  did?: string;
+  hiveAccount?: string;
+  peerId?: string;
+  commitHash?: string;
+  lastSeenAt?: Date;
+  banned?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -94,6 +101,10 @@ export interface EncodingJob {
   encodingProgress: number | null;
   encodingStage: string | null;
   webhookReceivedAt: Date | null;
+  // Denormalized for community job claiming
+  premium?: boolean;
+  short?: boolean;
+  fileSize?: number | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -115,6 +126,7 @@ export class Database {
     // Create indexes
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await encodersCollection.createIndex({ name: 1 }, { unique: true });
+    await encodersCollection.createIndex({ did: 1 }, { unique: true, sparse: true });
     
     console.log('Connected to MongoDB');
   }
@@ -527,6 +539,108 @@ export class Database {
     }
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await encodersCollection.deleteOne({ name });
+  }
+
+  // Community encoder methods
+
+  async getEncoderByDid(did: string): Promise<Encoder | null> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    return encodersCollection.findOne({ did });
+  }
+
+  async upsertCommunityEncoder(did: string, data: {
+    name?: string;
+    hiveAccount?: string;
+    peerId?: string;
+    commitHash?: string;
+  }): Promise<Encoder> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    const now = new Date();
+    const generatedName = data.name
+      ? `community-${data.name}`
+      : `community-${did.slice(-8)}`;
+
+    const result = await encodersCollection.findOneAndUpdate(
+      { did },
+      {
+        $set: {
+          ...(data.hiveAccount !== undefined && { hiveAccount: data.hiveAccount }),
+          ...(data.peerId !== undefined && { peerId: data.peerId }),
+          ...(data.commitHash !== undefined && { commitHash: data.commitHash }),
+          lastSeenAt: now,
+          updatedAt: now,
+        },
+        $setOnInsert: {
+          name: generatedName,
+          did,
+          url: '',
+          apiKey: '',
+          enabled: true,
+          access: 'community' as EncoderAccess,
+          tier: 'lite' as EncoderTier,
+          banned: false,
+          maxFileSize: null,
+          createdAt: now,
+        },
+      },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    return result!;
+  }
+
+  async updateEncoderLastSeen(did: string): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.updateOne(
+      { did },
+      { $set: { lastSeenAt: new Date() } }
+    );
+  }
+
+  async claimNextCommunityJob(encoderName: string, maxFileSize: number | null): Promise<EncodingJob | null> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    const now = new Date();
+
+    const filter: any = {
+      status: 'pending',
+      premium: { $ne: true },
+      short: { $ne: true },
+    };
+
+    if (maxFileSize != null) {
+      filter.$or = [
+        { fileSize: { $exists: false } },
+        { fileSize: null },
+        { fileSize: { $lte: maxFileSize } },
+      ];
+    }
+
+    const result = await jobsCollection.findOneAndUpdate(
+      filter,
+      {
+        $set: {
+          status: 'encoding' as JobStatus,
+          assignedWorker: encoderName,
+          assignedAt: now,
+          updatedAt: now,
+        },
+      },
+      { sort: { createdAt: 1 }, returnDocument: 'after' }
+    );
+
+    return result;
   }
 
   // Upload Token single-use tracking
