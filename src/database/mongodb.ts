@@ -78,6 +78,7 @@ export interface Encoder {
   maxFileSize?: number | null;
   // Community encoder fields
   did?: string;
+  displayName?: string;
   hiveAccount?: string;
   peerId?: string;
   commitHash?: string;
@@ -101,6 +102,7 @@ export interface EncodingJob {
   encodingProgress: number | null;
   encodingStage: string | null;
   webhookReceivedAt: Date | null;
+  callbackToken?: string | null;
   // Denormalized for community job claiming
   premium?: boolean;
   short?: boolean;
@@ -127,7 +129,11 @@ export class Database {
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await encodersCollection.createIndex({ name: 1 }, { unique: true });
     await encodersCollection.createIndex({ did: 1 }, { unique: true, sparse: true });
-    
+
+    // Index for community job claiming (findOneAndUpdate filter)
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    await jobsCollection.createIndex({ status: 1, premium: 1, short: 1, createdAt: 1 });
+
     console.log('Connected to MongoDB');
   }
 
@@ -562,14 +568,14 @@ export class Database {
     }
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     const now = new Date();
-    const generatedName = data.name
-      ? `community-${data.name}`
-      : `community-${did.slice(-8)}`;
+    // Name is always derived from DID — stable, unique, not user-controlled
+    const stableName = `community-${did.slice(-12)}`;
 
     const result = await encodersCollection.findOneAndUpdate(
       { did },
       {
         $set: {
+          ...(data.name !== undefined && { displayName: data.name }),
           ...(data.hiveAccount !== undefined && { hiveAccount: data.hiveAccount }),
           ...(data.peerId !== undefined && { peerId: data.peerId }),
           ...(data.commitHash !== undefined && { commitHash: data.commitHash }),
@@ -577,7 +583,7 @@ export class Database {
           updatedAt: now,
         },
         $setOnInsert: {
-          name: generatedName,
+          name: stableName,
           did,
           url: '',
           apiKey: '',
@@ -613,20 +619,21 @@ export class Database {
     const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
     const now = new Date();
 
+    // Require explicit premium: false and short: false — reject legacy jobs
+    // that lack these fields to prevent leaking premium/short work
     const filter: any = {
       status: 'pending',
-      premium: { $ne: true },
-      short: { $ne: true },
+      premium: false,
+      short: false,
     };
 
+    // Capped encoders only claim jobs with known size within bounds
+    // Uncapped encoders accept any size (including unknown)
     if (maxFileSize != null) {
-      filter.$or = [
-        { fileSize: { $exists: false } },
-        { fileSize: null },
-        { fileSize: { $lte: maxFileSize } },
-      ];
+      filter.fileSize = { $gt: 0, $lte: maxFileSize };
     }
 
+    const callbackToken = require('crypto').randomBytes(32).toString('hex');
     const result = await jobsCollection.findOneAndUpdate(
       filter,
       {
@@ -635,6 +642,7 @@ export class Database {
           assignedWorker: encoderName,
           assignedAt: now,
           updatedAt: now,
+          callbackToken,
         },
       },
       { sort: { createdAt: 1 }, returnDocument: 'after' }

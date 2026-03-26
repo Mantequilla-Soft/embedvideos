@@ -589,16 +589,20 @@
           const accessBadge = isCommunity
             ? '<span style="background:#9b59b6;color:white;padding:2px 6px;border-radius:10px;font-size:10px;">community</span>'
             : '<span style="background:#2c3e50;color:white;padding:2px 6px;border-radius:10px;font-size:10px;">managed</span>';
+          const safeName = escapeHtml(enc.name);
+          const displayLabel = enc.displayName ? escapeHtml(enc.displayName) : safeName;
           const infoCol = isCommunity
-            ? `<span style="font-size:11px;color:#666;">${enc.did ? 'did:...' + enc.did.slice(-8) : ''}</span>${enc.hiveAccount ? `<br><span style="font-size:11px;">@${enc.hiveAccount}</span>` : ''}`
-            : `<span style="font-family:monospace;font-size:11px;">${enc.url}</span>`;
+            ? `<span style="font-size:11px;color:#666;">${enc.did ? 'did:...' + escapeHtml(enc.did.slice(-8)) : ''}</span>${enc.hiveAccount ? `<br><span style="font-size:11px;">@${escapeHtml(enc.hiveAccount)}</span>` : ''}`
+            : `<span style="font-family:monospace;font-size:11px;">${escapeHtml(enc.url)}</span>`;
           const bannedBadge = enc.banned ? ' <span style="background:#e74c3c;color:white;padding:2px 6px;border-radius:10px;font-size:10px;">banned</span>' : '';
+          // Use data attributes for encoder name to avoid inline JS injection
+          const nameAttr = encodeURIComponent(enc.name);
 
           return `
           <tr>
-            <td>${onlineDot}<strong>${enc.name}</strong>${bannedBadge}</td>
+            <td>${onlineDot}<strong>${displayLabel}</strong>${bannedBadge}</td>
             <td>${accessBadge}</td>
-            <td><span class="status-badge" style="${tierStyle}">${tier}</span></td>
+            <td><span class="status-badge" style="${tierStyle}">${escapeHtml(tier)}</span></td>
             <td>
               <span class="status-badge ${enc.enabled ? 'status-active' : 'status-inactive'}">
                 ${enc.enabled ? 'Enabled' : 'Disabled'}
@@ -606,20 +610,33 @@
             </td>
             <td>${infoCol}</td>
             <td style="display: flex; gap: 6px; flex-wrap: wrap;">
-              <button type="button" class="btn btn-small" onclick="editEncoder('${enc.name}')">Edit</button>
+              <button type="button" class="btn btn-small" data-action="edit" data-name="${nameAttr}">Edit</button>
               ${enc.enabled
-                ? `<button type="button" class="btn btn-small btn-danger" onclick="toggleEncoder('${enc.name}', false)">Disable</button>`
-                : `<button type="button" class="btn btn-small btn-success" onclick="toggleEncoder('${enc.name}', true)">Enable</button>`
+                ? `<button type="button" class="btn btn-small btn-danger" data-action="toggle" data-name="${nameAttr}" data-enabled="false">Disable</button>`
+                : `<button type="button" class="btn btn-small btn-success" data-action="toggle" data-name="${nameAttr}" data-enabled="true">Enable</button>`
               }
               ${isCommunity
                 ? (enc.banned
-                  ? `<button type="button" class="btn btn-small btn-success" onclick="toggleBan('${enc.name}', false)">Unban</button>`
-                  : `<button type="button" class="btn btn-small btn-danger" onclick="toggleBan('${enc.name}', true)">Ban</button>`)
-                : `<button type="button" class="btn btn-small btn-danger" onclick="deleteEncoder('${enc.name}')">Remove</button>`
+                  ? `<button type="button" class="btn btn-small btn-success" data-action="ban" data-name="${nameAttr}" data-banned="false">Unban</button>`
+                  : `<button type="button" class="btn btn-small btn-danger" data-action="ban" data-name="${nameAttr}" data-banned="true">Ban</button>`)
+                : `<button type="button" class="btn btn-small btn-danger" data-action="delete" data-name="${nameAttr}">Remove</button>`
               }
             </td>
           </tr>
         `}).join('');
+
+        // Attach event listeners via delegation instead of inline onclick
+        tbody.querySelectorAll('button[data-action]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const name = decodeURIComponent(btn.dataset.name);
+            switch (btn.dataset.action) {
+              case 'edit': editEncoder(name); break;
+              case 'toggle': toggleEncoder(name, btn.dataset.enabled === 'true'); break;
+              case 'ban': toggleBan(name, btn.dataset.banned === 'true'); break;
+              case 'delete': deleteEncoder(name); break;
+            }
+          });
+        });
       } catch (error) {
         showError('Failed to load encoders: ' + error.message);
       }

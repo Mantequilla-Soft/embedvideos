@@ -334,11 +334,20 @@ app.get('/health', (req: Request, res: Response) => {
 // Webhook endpoint for encoder callbacks
 app.post('/webhook', async (req: Request, res: Response) => {
   try {
-    // Verify webhook API key
-    const apiKey = req.headers['x-api-key'];
+    // Verify webhook API key — accept global key (managed) or per-job token (community)
+    const apiKey = req.headers['x-api-key'] as string | undefined;
     if (apiKey !== config.webhookApiKey) {
-      console.warn('Webhook received with invalid API key');
-      return res.status(401).json({ error: 'Unauthorized' });
+      // Check per-job callback token
+      const { owner: o, permlink: p } = req.body;
+      if (!o || !p || !apiKey) {
+        console.warn('Webhook received with invalid API key');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+      const job = await database.getJob(o, p);
+      if (!job || !job.callbackToken || job.callbackToken !== apiKey) {
+        console.warn('Webhook received with invalid callback token');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
     }
 
     const {
@@ -426,12 +435,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
 // Webhook endpoint for encoder progress pings
 app.post('/webhook/progress', async (req: Request, res: Response) => {
   try {
-    const apiKey = req.headers['x-api-key'];
-    if (apiKey !== config.webhookApiKey) {
-      console.warn('Progress webhook received with invalid API key');
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
+    const apiKey = req.headers['x-api-key'] as string | undefined;
     const { owner, permlink, progress, stage } = req.body;
 
     if (!owner || !permlink || typeof progress !== 'number') {
@@ -441,6 +445,14 @@ app.post('/webhook/progress', async (req: Request, res: Response) => {
     const job = await database.getJob(owner, permlink);
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Verify auth — global key (managed) or per-job token (community)
+    if (apiKey !== config.webhookApiKey) {
+      if (!apiKey || !job.callbackToken || job.callbackToken !== apiKey) {
+        console.warn('Progress webhook received with invalid API key');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
     }
 
     await database.updateJobStatus(owner, permlink, 'encoding', {
@@ -541,7 +553,7 @@ app.post('/api/v0/gateway/myJob', async (req: Request, res: Response) => {
         short: video.short,
         premium: false,
         webhook_url: config.webhookUrl,
-        api_key: config.webhookApiKey,
+        api_key: job.callbackToken,
         frontend_app: video.frontend_app,
         originalFilename: video.originalFilename,
       },
