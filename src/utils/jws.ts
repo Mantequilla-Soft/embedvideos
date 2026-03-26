@@ -13,6 +13,9 @@ export class JWSAuthError extends Error {
 export async function unwrapJWS(jws: any): Promise<{ payload: any; did: string }> {
   try {
     const data = await did.verifyJWS(jws);
+    if (!data.kid || typeof data.kid !== 'string') {
+      throw new JWSAuthError('Missing kid in JWS');
+    }
     const encoderDid = data.kid.split('#')[0];
     return { payload: data.payload, did: encoderDid };
   } catch (error) {
