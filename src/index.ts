@@ -13,6 +13,7 @@ import { createAdminAuthMiddleware } from './middleware/adminAuth';
 import { loadConfig } from './config/config';
 import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
+import { unwrapJWS } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
 import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 
@@ -473,7 +474,6 @@ app.post('/webhook/progress', async (req: Request, res: Response) => {
 });
 
 // Community encoder endpoints (JWS-authenticated)
-import { unwrapJWS } from './utils/jws';
 
 // Registration
 app.post('/api/v0/gateway/updateNode', async (req: Request, res: Response) => {
