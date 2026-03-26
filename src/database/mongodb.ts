@@ -76,6 +76,14 @@ export interface Encoder {
   access?: EncoderAccess;
   tier?: EncoderTier;
   maxFileSize?: number | null;
+  // Community encoder fields
+  did?: string;
+  displayName?: string;
+  hiveAccount?: string;
+  peerId?: string;
+  commitHash?: string;
+  lastSeenAt?: Date;
+  banned?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -94,6 +102,11 @@ export interface EncodingJob {
   encodingProgress: number | null;
   encodingStage: string | null;
   webhookReceivedAt: Date | null;
+  callbackToken?: string | null;
+  // Denormalized for community job claiming
+  premium?: boolean;
+  short?: boolean;
+  fileSize?: number | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -115,7 +128,12 @@ export class Database {
     // Create indexes
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await encodersCollection.createIndex({ name: 1 }, { unique: true });
-    
+    await encodersCollection.createIndex({ did: 1 }, { unique: true, sparse: true });
+
+    // Index for community job claiming (findOneAndUpdate filter)
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    await jobsCollection.createIndex({ status: 1, premium: 1, short: 1, createdAt: 1 });
+
     console.log('Connected to MongoDB');
   }
 
@@ -527,6 +545,110 @@ export class Database {
     }
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await encodersCollection.deleteOne({ name });
+  }
+
+  // Community encoder methods
+
+  async getEncoderByDid(did: string): Promise<Encoder | null> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    return encodersCollection.findOne({ did });
+  }
+
+  async upsertCommunityEncoder(did: string, data: {
+    name?: string;
+    hiveAccount?: string;
+    peerId?: string;
+    commitHash?: string;
+  }): Promise<Encoder> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    const now = new Date();
+    // Name is always derived from DID — stable, unique, not user-controlled
+    const stableName = `community-${did.slice(-12)}`;
+
+    const result = await encodersCollection.findOneAndUpdate(
+      { did },
+      {
+        $set: {
+          ...(data.name !== undefined && { displayName: data.name }),
+          ...(data.hiveAccount !== undefined && { hiveAccount: data.hiveAccount }),
+          ...(data.peerId !== undefined && { peerId: data.peerId }),
+          ...(data.commitHash !== undefined && { commitHash: data.commitHash }),
+          lastSeenAt: now,
+          updatedAt: now,
+        },
+        $setOnInsert: {
+          name: stableName,
+          did,
+          url: '',
+          apiKey: '',
+          enabled: true,
+          access: 'community' as EncoderAccess,
+          tier: 'lite' as EncoderTier,
+          banned: false,
+          maxFileSize: null,
+          createdAt: now,
+        },
+      },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    return result!;
+  }
+
+  async updateEncoderLastSeen(did: string): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const encodersCollection = this.db.collection<Encoder>('embed-encoders');
+    await encodersCollection.updateOne(
+      { did },
+      { $set: { lastSeenAt: new Date() } }
+    );
+  }
+
+  async claimNextCommunityJob(encoderName: string, maxFileSize: number | null): Promise<EncodingJob | null> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    const now = new Date();
+
+    // Require explicit premium: false and short: false — reject legacy jobs
+    // that lack these fields to prevent leaking premium/short work
+    const filter: any = {
+      status: 'pending',
+      premium: false,
+      short: false,
+    };
+
+    // Capped encoders only claim jobs with known size within bounds
+    // Uncapped encoders accept any size (including unknown)
+    if (maxFileSize != null) {
+      filter.fileSize = { $gt: 0, $lte: maxFileSize };
+    }
+
+    const callbackToken = require('crypto').randomBytes(32).toString('hex');
+    const result = await jobsCollection.findOneAndUpdate(
+      filter,
+      {
+        $set: {
+          status: 'encoding' as JobStatus,
+          assignedWorker: encoderName,
+          assignedAt: now,
+          updatedAt: now,
+          callbackToken,
+        },
+      },
+      { sort: { createdAt: 1 }, returnDocument: 'after' }
+    );
+
+    return result;
   }
 
   // Upload Token single-use tracking

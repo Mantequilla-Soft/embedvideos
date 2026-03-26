@@ -13,6 +13,7 @@ import { createAdminAuthMiddleware } from './middleware/adminAuth';
 import { loadConfig } from './config/config';
 import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
+import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
 import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 
@@ -279,7 +280,8 @@ const tusServer = new Server({
           console.warn(`Failed to update user stats: ${statsError}`);
         }
         
-        // Create encoding job
+        // Create encoding job (denormalize premium/short/fileSize for community job claiming)
+        const premium = await database.isUserPremium(owner);
         await database.createJob({
           owner,
           permlink,
@@ -292,6 +294,9 @@ const tusServer = new Server({
           encodingProgress: null,
           encodingStage: null,
           webhookReceivedAt: null,
+          premium,
+          short,
+          fileSize: upload.size || null,
           createdAt: new Date(),
           updatedAt: new Date(),
         });
@@ -330,11 +335,20 @@ app.get('/health', (req: Request, res: Response) => {
 // Webhook endpoint for encoder callbacks
 app.post('/webhook', async (req: Request, res: Response) => {
   try {
-    // Verify webhook API key
-    const apiKey = req.headers['x-api-key'];
+    // Verify webhook API key — accept global key (managed) or per-job token (community)
+    const apiKey = req.headers['x-api-key'] as string | undefined;
     if (apiKey !== config.webhookApiKey) {
-      console.warn('Webhook received with invalid API key');
-      return res.status(401).json({ error: 'Unauthorized' });
+      // Check per-job callback token
+      const { owner: o, permlink: p } = req.body;
+      if (!o || !p || !apiKey) {
+        console.warn('Webhook received with invalid API key');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+      const job = await database.getJob(o, p);
+      if (!job || !job.callbackToken || job.callbackToken !== apiKey) {
+        console.warn('Webhook received with invalid callback token');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
     }
 
     const {
@@ -422,12 +436,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
 // Webhook endpoint for encoder progress pings
 app.post('/webhook/progress', async (req: Request, res: Response) => {
   try {
-    const apiKey = req.headers['x-api-key'];
-    if (apiKey !== config.webhookApiKey) {
-      console.warn('Progress webhook received with invalid API key');
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
+    const apiKey = req.headers['x-api-key'] as string | undefined;
     const { owner, permlink, progress, stage } = req.body;
 
     if (!owner || !permlink || typeof progress !== 'number') {
@@ -437,6 +446,14 @@ app.post('/webhook/progress', async (req: Request, res: Response) => {
     const job = await database.getJob(owner, permlink);
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Verify auth — global key (managed) or per-job token (community)
+    if (apiKey !== config.webhookApiKey) {
+      if (!apiKey || !job.callbackToken || job.callbackToken !== apiKey) {
+        console.warn('Progress webhook received with invalid API key');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
     }
 
     await database.updateJobStatus(owner, permlink, 'encoding', {
@@ -452,6 +469,121 @@ app.post('/webhook/progress', async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Progress webhook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Community encoder endpoints (JWS-authenticated)
+
+// Registration
+app.post('/api/v0/gateway/updateNode', async (req: Request, res: Response) => {
+  try {
+    const { payload, did } = await unwrapJWS(req.body.jws);
+
+    // Accept both node_info wrapper and flat payload
+    const nodeInfo = payload.node_info || payload;
+    const name = nodeInfo.name;
+    const hiveAccount = nodeInfo.cryptoAccounts?.hive || nodeInfo.hive_account;
+    const peerId = nodeInfo.peer_id;
+    const commitHash = nodeInfo.commit_hash;
+
+    const encoder = await database.upsertCommunityEncoder(did, {
+      name,
+      hiveAccount,
+      peerId,
+      commitHash,
+    });
+
+    console.log(`Community encoder registered: ${encoder.name} (${did})${hiveAccount ? ` [hive: ${hiveAccount}]` : ''}`);
+    res.json({
+      success: true,
+      encoder: {
+        name: encoder.name,
+        did: encoder.did,
+        tier: encoder.tier,
+        access: encoder.access,
+        enabled: encoder.enabled,
+      },
+    });
+  } catch (error) {
+    console.error('Community registration error:', error);
+    if (error instanceof JWSAuthError) {
+      return res.status(401).json({ error: 'Invalid JWS signature' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Job polling
+app.post('/api/v0/gateway/myJob', async (req: Request, res: Response) => {
+  try {
+    const { did } = await unwrapJWS(req.body.jws);
+
+    const encoder = await database.getEncoderByDid(did);
+    if (!encoder) {
+      return res.status(404).json({ error: 'Encoder not registered' });
+    }
+    if (!encoder.enabled || encoder.banned) {
+      return res.status(403).json({ error: 'Encoder is disabled or banned' });
+    }
+
+    await database.updateEncoderLastSeen(did);
+
+    const job = await database.claimNextCommunityJob(encoder.name, encoder.maxFileSize ?? null);
+    if (!job) {
+      return res.json({ success: true, job: null });
+    }
+
+    // Fetch video metadata for the job payload
+    const video = await database.getVideo(job.permlink);
+    if (!video || !video.input_cid) {
+      // Job was claimed but video is missing — reset it
+      await database.resetJob(job.owner, job.permlink);
+      return res.json({ success: true, job: null });
+    }
+
+    const ipfsGateway = 'https://ipfs.3speak.tv/ipfs';
+    console.log(`Community encoder [${encoder.name}] claimed job: ${job.owner}/${job.permlink}`);
+    res.json({
+      success: true,
+      job: {
+        owner: job.owner,
+        permlink: job.permlink,
+        input_cid: `${ipfsGateway}/${video.input_cid}`,
+        short: video.short,
+        premium: false,
+        webhook_url: config.webhookUrl,
+        api_key: job.callbackToken,
+        frontend_app: video.frontend_app,
+        originalFilename: video.originalFilename,
+      },
+    });
+  } catch (error) {
+    console.error('Community job poll error:', error);
+    if (error instanceof JWSAuthError) {
+      return res.status(401).json({ error: 'Invalid JWS signature' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Heartbeat
+app.post('/api/v0/gateway/heartbeat', async (req: Request, res: Response) => {
+  try {
+    const { did } = await unwrapJWS(req.body.jws);
+
+    const encoder = await database.getEncoderByDid(did);
+    if (!encoder) {
+      return res.status(404).json({ error: 'Encoder not registered' });
+    }
+
+    await database.updateEncoderLastSeen(did);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Community heartbeat error:', error);
+    if (error instanceof JWSAuthError) {
+      return res.status(401).json({ error: 'Invalid JWS signature' });
+    }
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -832,7 +964,7 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
 app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { name } = req.params;
-    const { url, apiKey, enabled, access, tier, maxFileSize } = req.body;
+    const { url, apiKey, enabled, access, tier, maxFileSize, banned } = req.body;
 
     const encoder = await database.getEncoder(name);
     if (!encoder) {
@@ -876,6 +1008,13 @@ app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: R
         return res.status(400).json({ error: 'maxFileSize must be a positive number or null' });
       }
       updates.maxFileSize = maxFileSize;
+    }
+
+    if (banned !== undefined) {
+      if (typeof banned !== 'boolean') {
+        return res.status(400).json({ error: 'banned must be a boolean' });
+      }
+      updates.banned = banned;
     }
 
     if (Object.keys(updates).length === 0) {

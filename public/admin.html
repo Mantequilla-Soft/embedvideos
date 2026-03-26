@@ -285,10 +285,10 @@
         <thead>
           <tr>
             <th>Name</th>
-            <th>URL</th>
+            <th>Type</th>
             <th>Tier</th>
             <th>Status</th>
-            <th>Added</th>
+            <th>Info</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -576,30 +576,67 @@
         }
 
         const tierColors = { performance: 'background: #fff3cd; color: #856404;', standard: 'background: #cce5ff; color: #004085;', lite: 'background: #e2e3e5; color: #383d41;' };
+        const now = Date.now();
         tbody.innerHTML = currentEncoders.map(enc => {
           const tier = enc.tier || 'standard';
           const tierStyle = tierColors[tier] || tierColors.standard;
+          const access = enc.access || 'managed';
+          const isCommunity = access === 'community';
+          const isOnline = isCommunity && enc.lastSeenAt && (now - new Date(enc.lastSeenAt).getTime()) < 120000;
+          const onlineDot = isCommunity
+            ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${isOnline ? '#27ae60' : '#e74c3c'};margin-right:6px;" title="${isOnline ? 'Online' : 'Offline'}"></span>`
+            : '';
+          const accessBadge = isCommunity
+            ? '<span style="background:#9b59b6;color:white;padding:2px 6px;border-radius:10px;font-size:10px;">community</span>'
+            : '<span style="background:#2c3e50;color:white;padding:2px 6px;border-radius:10px;font-size:10px;">managed</span>';
+          const safeName = escapeHtml(enc.name);
+          const displayLabel = enc.displayName ? escapeHtml(enc.displayName) : safeName;
+          const infoCol = isCommunity
+            ? `<span style="font-size:11px;color:#666;">${enc.did ? 'did:...' + escapeHtml(enc.did.slice(-8)) : ''}</span>${enc.hiveAccount ? `<br><span style="font-size:11px;">@${escapeHtml(enc.hiveAccount)}</span>` : ''}`
+            : `<span style="font-family:monospace;font-size:11px;">${escapeHtml(enc.url)}</span>`;
+          const bannedBadge = enc.banned ? ' <span style="background:#e74c3c;color:white;padding:2px 6px;border-radius:10px;font-size:10px;">banned</span>' : '';
+          // Use data attributes for encoder name to avoid inline JS injection
+          const nameAttr = encodeURIComponent(enc.name);
+
           return `
           <tr>
-            <td><strong>${enc.name}</strong></td>
-            <td><span style="font-family: monospace; font-size: 12px;">${enc.url}</span></td>
-            <td><span class="status-badge" style="${tierStyle}">${tier}</span></td>
+            <td>${onlineDot}<strong>${displayLabel}</strong>${bannedBadge}</td>
+            <td>${accessBadge}</td>
+            <td><span class="status-badge" style="${tierStyle}">${escapeHtml(tier)}</span></td>
             <td>
               <span class="status-badge ${enc.enabled ? 'status-active' : 'status-inactive'}">
                 ${enc.enabled ? 'Enabled' : 'Disabled'}
               </span>
             </td>
-            <td>${new Date(enc.createdAt).toLocaleDateString()}</td>
+            <td>${infoCol}</td>
             <td style="display: flex; gap: 6px; flex-wrap: wrap;">
-              <button class="btn btn-small" onclick="editEncoder('${enc.name}')">Edit</button>
+              <button type="button" class="btn btn-small" data-action="edit" data-name="${nameAttr}">Edit</button>
               ${enc.enabled
-                ? `<button class="btn btn-small btn-danger" onclick="toggleEncoder('${enc.name}', false)">Disable</button>`
-                : `<button class="btn btn-small btn-success" onclick="toggleEncoder('${enc.name}', true)">Enable</button>`
+                ? `<button type="button" class="btn btn-small btn-danger" data-action="toggle" data-name="${nameAttr}" data-enabled="false">Disable</button>`
+                : `<button type="button" class="btn btn-small btn-success" data-action="toggle" data-name="${nameAttr}" data-enabled="true">Enable</button>`
               }
-              <button class="btn btn-small btn-danger" onclick="deleteEncoder('${enc.name}')">Remove</button>
+              ${isCommunity
+                ? (enc.banned
+                  ? `<button type="button" class="btn btn-small btn-success" data-action="ban" data-name="${nameAttr}" data-banned="false">Unban</button>`
+                  : `<button type="button" class="btn btn-small btn-danger" data-action="ban" data-name="${nameAttr}" data-banned="true">Ban</button>`)
+                : `<button type="button" class="btn btn-small btn-danger" data-action="delete" data-name="${nameAttr}">Remove</button>`
+              }
             </td>
           </tr>
         `}).join('');
+
+        // Attach event listeners via delegation instead of inline onclick
+        tbody.querySelectorAll('button[data-action]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const name = decodeURIComponent(btn.dataset.name);
+            switch (btn.dataset.action) {
+              case 'edit': editEncoder(name); break;
+              case 'toggle': toggleEncoder(name, btn.dataset.enabled === 'true'); break;
+              case 'ban': toggleBan(name, btn.dataset.banned === 'true'); break;
+              case 'delete': deleteEncoder(name); break;
+            }
+          });
+        });
       } catch (error) {
         showError('Failed to load encoders: ' + error.message);
       }
@@ -692,6 +729,26 @@
 
         if (data.success) {
           showSuccess(`Encoder '${name}' ${enabled ? 'enabled' : 'disabled'}`);
+          loadEncoders();
+        } else {
+          showError(data.error || 'Failed to update encoder');
+        }
+      } catch (error) {
+        showError('Network error: ' + error.message);
+      }
+    }
+
+    async function toggleBan(name, banned) {
+      try {
+        const response = await fetch(`/admin/encoders/${encodeURIComponent(name)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPassword },
+          body: JSON.stringify({ banned })
+        });
+        const data = await response.json();
+
+        if (data.success) {
+          showSuccess(`Encoder '${name}' ${banned ? 'banned' : 'unbanned'}`);
           loadEncoders();
         } else {
           showError(data.error || 'Failed to update encoder');

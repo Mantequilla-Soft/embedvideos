@@ -51,8 +51,9 @@ export class JobDispatcher {
       throw new Error('No suitable managed encoders available for premium job');
     }
 
-    // Free user: try standard first, then lite. Never performance.
-    const allEnabled = allEncoders.filter(e => e.enabled);
+    // Free user: try managed standard first, then managed lite. Never performance.
+    // Community encoders get jobs through polling, not push dispatch.
+    const allEnabled = allEncoders.filter(e => e.enabled && (e.access ?? 'managed') === 'managed');
 
     const stdEncoders = this.filterByTierAndSize(allEnabled, 'standard', fileSize);
     if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, 'free-standard');
