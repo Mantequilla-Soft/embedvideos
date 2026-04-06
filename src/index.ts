@@ -37,6 +37,12 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Increase timeout for TUS upload routes (default Node.js timeout is ~2min, videos need more)
+app.use('/uploads', (req, res, next) => {
+  res.setTimeout(30 * 60 * 1000); // 30 minutes
+  next();
+});
+
 // Ensure X-Embed-URL is exposed via CORS on TUS upload routes
 // (The @tus/server sets its own Access-Control-Expose-Headers, overriding Express cors middleware)
 app.use('/uploads', (req, res, next) => {
