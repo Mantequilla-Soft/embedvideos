@@ -37,6 +37,12 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Increase timeout for TUS upload routes (default Node.js timeout is ~2min, videos need more)
+app.use('/uploads', (req, res, next) => {
+  res.setTimeout(30 * 60 * 1000); // 30 minutes
+  next();
+});
+
 // Ensure X-Embed-URL is exposed via CORS on TUS upload routes
 // (The @tus/server sets its own Access-Control-Expose-Headers, overriding Express cors middleware)
 app.use('/uploads', (req, res, next) => {
@@ -1277,10 +1283,14 @@ async function start() {
       console.log('Cleanup service disabled');
     }
     
-    app.listen(config.port, () => {
+    const server = app.listen(config.port, () => {
       console.log(`Server running on port ${config.port}`);
       console.log(`TUS endpoint: http://localhost:${config.port}/uploads`);
     });
+
+    // Node.js 20.x requestTimeout defaults to 300s (5 min). Slow chunk uploads
+    // hit 408 if the total PATCH request exceeds this. Must set alongside res.setTimeout().
+    server.requestTimeout = 30 * 60 * 1000;
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);
