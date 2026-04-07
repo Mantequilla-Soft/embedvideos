@@ -1283,10 +1283,14 @@ async function start() {
       console.log('Cleanup service disabled');
     }
     
-    app.listen(config.port, () => {
+    const server = app.listen(config.port, () => {
       console.log(`Server running on port ${config.port}`);
       console.log(`TUS endpoint: http://localhost:${config.port}/uploads`);
     });
+
+    // Node.js 20.x requestTimeout defaults to 300s (5 min). Slow chunk uploads
+    // hit 408 if the total PATCH request exceeds this. Must set alongside res.setTimeout().
+    server.requestTimeout = 30 * 60 * 1000;
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);
