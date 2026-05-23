@@ -17,18 +17,18 @@ No test suite exists. Validation is done by running `dev` and exercising endpoin
 
 ### Single-file server (`src/index.ts`)
 
-All route handlers, TUS setup, admin endpoints, webhook receivers, and startup logic live in `src/index.ts`. It is intentionally a monolith. Supporting modules in `src/` are utilities and services only — they contain no route logic.
+All route handlers, tusd proxy, hook endpoint, admin endpoints, webhook receivers, and startup logic live in `src/index.ts`. It is intentionally a monolith. Supporting modules in `src/` are utilities and services only — they contain no route logic.
 
 ### Upload flow (the critical path)
 
-TUS server is mounted at `/uploads` via `@tus/server` + `@tus/file-store`. All upload logic runs through two hooks:
+The `tusd` Go binary (v2.9.2) runs as a child process on `127.0.0.1:1080`, spawned after Express starts. Express proxies all `/uploads/*` traffic to tusd. All upload logic runs through the `POST /tusd-hooks` HTTP endpoint:
 
-- **`onUploadCreate`** — auth (API key or upload token), user ban check, video document creation, returns embed URL in `X-Embed-URL` header
-- **`onUploadFinish`** — pins file to IPFS (blocking), creates encoding job, deletes local TUS file
+- **`pre-create` event** — auth (API key or upload token), user ban check, video document creation (non-partial uploads only), injects `X-Embed-URL` into tusd's 201 response via hook response headers. Partial uploads (parallel chunk pieces) are auth-validated but not DB-recorded — token is consumed only on the final concatenated upload.
+- **`post-finish` event** — tusd fires this *after* the 204 has already been sent to the client. The hook responds immediately, then runs IPFS pinning, DHT announcement, job creation, and temp file cleanup asynchronously via `setImmediate`.
 
-IPFS pinning in `onUploadFinish` is **synchronous and blocking** — the client waits for the full pin before receiving the success response. This is the primary upload latency issue.
+IPFS pinning is **asynchronous** — clients receive their success response the moment the file lands on disk. tusd's Concatenation extension (enabled by default) allows `tus-js-client` `parallelUploads: 3` so three 10MB chunks upload simultaneously.
 
-After `onUploadFinish`, the `JobDispatcher` (polling every 30s) picks up the `pending` job and dispatches it to an encoder.
+After IPFS pinning completes, the `JobDispatcher` (polling every 30s) picks up the `pending` job and dispatches it to an encoder.
 
 ### Two encoder dispatch models
 
@@ -71,4 +71,4 @@ On startup, `ENCODERS` env (JSON array) is seeded into `embed-encoders` only if 
 - All frontend-facing protected routes use `requireApiKey` middleware
 - Mutations return `{ success: true, ... }`
 - `isUserPremium(owner)` is the single lookup point for premium status
-- `X-Embed-URL` header is set both in `onUploadCreate` (for early capture) and `onUploadFinish` (for tus-js-client `onAfterResponse`)
+- `X-Embed-URL` header is injected in the `pre-create` hook response (captured by tus-js-client `onAfterResponse` on the 201 Created)
