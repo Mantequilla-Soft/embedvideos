@@ -1,8 +1,9 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { Server } from '@tus/server';
-import { FileStore } from '@tus/file-store';
+import { createProxyMiddleware } from 'http-proxy-middleware';
+import { startTusd } from './utils/tusd';
+import { validateUploadAuth } from './utils/uploadAuth';
 import path from 'path';
 import { unlinkSync } from 'fs';
 import { Database, Encoder } from './database/mongodb';
@@ -15,7 +16,7 @@ import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
 import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
-import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
+import { signUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 
 dotenv.config();
 
@@ -43,291 +44,265 @@ app.use('/uploads', (req, res, next) => {
   next();
 });
 
-// Ensure X-Embed-URL is exposed via CORS on TUS upload routes
-// (The @tus/server sets its own Access-Control-Expose-Headers, overriding Express cors middleware)
-app.use('/uploads', (req, res, next) => {
-  const origSetHeader = res.setHeader.bind(res);
-  res.setHeader = function(name: string, value: any) {
-    if (name.toLowerCase() === 'access-control-expose-headers' && typeof value === 'string') {
-      if (!value.includes('X-Embed-URL')) {
-        value = value + ', X-Embed-URL';
-      }
-    }
-    return origSetHeader(name, value);
-  } as any;
-  next();
-});
 app.use(express.static('public'));
 
 // Create auth middleware
 const requireApiKey = createApiKeyMiddleware(database);
 const requireAdminAuth = createAdminAuthMiddleware(config);
 
-// Create uploads directory if it doesn't exist
-const uploadPath = path.resolve(config.uploadDir);
+// Proxy /uploads to tusd — tusd handles TUS protocol, Concatenation extension, and parallel chunks.
+// Use app.all (not app.use) so Express does NOT strip the /uploads prefix before forwarding.
+// tusd v2 ignores HTTPResponse.Headers from hook responses entirely.
+// We inject X-Embed-URL ourselves in proxyRes using two stores:
+//   pending201EmbedUrls — FIFO queue: pushed in pre-create, consumed by the next 201
+//   pending204EmbedUrls — Map by upload ID: set in pre-finish, consumed by the 204
+const pending201EmbedUrls: string[] = [];
+const pending204EmbedUrls = new Map<string, string>();
 
-// TUS server setup
-const tusServer = new Server({
-  path: '/uploads',
-  datastore: new FileStore({ directory: uploadPath }),
-  respectForwardedHeaders: true,
-  async onUploadCreate(req, res, upload) {
-    try {
-      // Auth: support both X-API-Key (server-to-server) and Bearer upload tokens (client-side)
-      const xApiKey = req.headers['x-api-key'] as string | undefined;
-      const bearerToken = req.headers['authorization']?.replace('Bearer ', '');
-      let tokenClaims: UploadTokenClaims | null = null;
-
-      if (xApiKey) {
-        // Traditional API key auth
-        const keyData = await database.getApiKey(xApiKey);
-        if (!keyData || !keyData.active) {
-          res.statusCode = 401;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ error: 'Invalid or inactive API key' }));
-          return res;
-        }
-        database.updateApiKeyLastUsed(xApiKey).catch(console.error);
-      } else if (bearerToken && config.uploadTokenSecret) {
-        // Upload token auth (client-side flow)
-        tokenClaims = verifyUploadToken(bearerToken, config.uploadTokenSecret);
-        if (!tokenClaims) {
-          res.statusCode = 401;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ error: 'Invalid or expired upload token' }));
-          return res;
-        }
-
-        // Enforce allowedOrigins if specified in the token
-        if (tokenClaims.allowedOrigins && tokenClaims.allowedOrigins.length > 0) {
-          const origin = req.headers.origin as string | undefined;
-          if (!origin || !tokenClaims.allowedOrigins.includes(origin)) {
-            res.statusCode = 403;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ error: 'Origin not allowed for this upload token' }));
-            return res;
-          }
-        }
-
-        // Single-use enforcement: consume token BEFORE file-size checks.
-        // This is intentional — prevents probing file size limits with the same token.
-        const consumed = await database.consumeUploadToken(
-          tokenClaims.jti,
-          new Date(tokenClaims.exp * 1000)
-        );
-        if (!consumed) {
-          res.statusCode = 403;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ error: 'Upload token has already been used' }));
-          return res;
-        }
-
-        // Enforce max file size from token — require explicit Upload-Length
-        if (tokenClaims.maxFileSize) {
-          if (!upload.size) {
-            res.statusCode = 400;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ error: 'Upload-Length header is required for token-based uploads' }));
-            return res;
-          }
-          if (upload.size > tokenClaims.maxFileSize) {
-            res.statusCode = 413;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ error: 'File size exceeds token limit' }));
-            return res;
-          }
-        }
-      } else {
-        res.statusCode = 401;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'API key or upload token required' }));
-        return res;
+// app.use strips the mount path from req.url; app.all preserves it — tusd needs the full path.
+const tusProxy = createProxyMiddleware({
+  target: `http://127.0.0.1:${config.tusdPort}`,
+  changeOrigin: false,
+  xfwd: true,
+  proxyTimeout: 30 * 60 * 1000,
+  on: {
+    proxyReq: (proxyReq, req) => {
+      // xfwd appends ",http" to nginx's X-Forwarded-Proto. Fix: forward only the first value.
+      const proto = req.headers['x-forwarded-proto'];
+      if (proto) {
+        const first = (Array.isArray(proto) ? proto[0] : proto).split(',')[0].trim();
+        proxyReq.setHeader('X-Forwarded-Proto', first);
       }
-
-      // Extract metadata — token claims override client metadata when present
-      const owner = tokenClaims?.owner || upload.metadata?.owner || upload.metadata?.username || 'unknown';
-      const permlink = upload.metadata?.permlink || generateVideoId();
-      const frontend_app = tokenClaims?.app || upload.metadata?.frontend_app || 'unknown';
-      const short = tokenClaims ? tokenClaims.short : upload.metadata?.short === 'true';
-      const size = upload.size || null;
-      const originalFilename = upload.metadata?.filename || null;
-      const duration = upload.metadata?.duration ? parseFloat(upload.metadata.duration) : null;
-      
-      console.log(`Upload metadata - short flag: "${upload.metadata?.short}" -> parsed as: ${short}`);
-      
-      // Check/create user and verify not banned
-      let user = await database.getUser(owner);
-      if (!user) {
-        // Create new user entry
-        await database.createUser({
-          username: owner,
-          banned: false,
-          banReason: null,
-          bannedAt: null,
-          bannedBy: null,
-          uploadRestricted: false,
-          maxDailyUploads: null,
-          maxFileSize: null,
-          stats: {
-            totalUploads: 0,
-            totalStorageUsed: 0,
-            successfulUploads: 0,
-            failedUploads: 0,
-            lastUpload: null,
-          },
-          premium: false,
-          trustLevel: 'new',
-          adminNotes: '',
-          firstSeen: new Date(),
-          lastActivity: new Date(),
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        });
-        console.log(`New user created: ${owner}`);
-      } else if (user.banned) {
-        // User is banned, reject upload
-        res.statusCode = 403;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'User is banned from uploading' }));
-        return res;
+    },
+    proxyRes: (proxyRes, req) => {
+      // Inject X-Embed-URL into the 201 (upload creation) for browser tus-js-client
+      if (proxyRes.statusCode === 201 && pending201EmbedUrls.length > 0) {
+        proxyRes.headers['x-embed-url'] = pending201EmbedUrls.shift()!;
       }
-      
-      // Store permlink in upload metadata for later use
-      upload.metadata = upload.metadata || {};
-      upload.metadata.permlink = permlink;
-      upload.metadata.owner = owner;
-
-      // Create initial database entry
-      await database.createVideoEntry({
-        owner,
-        permlink,
-        frontend_app,
-        status: 'uploading',
-        input_cid: null,
-        ipfs_pin_endpoint: null,
-        manifest_cid: null,
-        thumbnail_url: null,
-        short,
-        duration,
-        size,
-        encodingProgress: 0,
-        originalFilename,
-        hive_author: null,
-        hive_permlink: null,
-        hive_title: null,
-        hive_body: null,
-        hive_tags: null,
-        embed_url: null,
-        embed_title: null,
-        listed_on_3speak: frontend_app === '3speak-tv',
-        processed: false,
-        processedAt: null,
-        views: 0,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
-
-      const permSource = upload.metadata?.permlink ? 'client' : 'generated';
-      console.log(`Upload created: ${owner}/${permlink} [${frontend_app}] (${short ? 'short' : 'long'}, ${size} bytes, permlink: ${permSource}, duration: ${duration ?? 'unknown'})`);
-      
-      // Return the embed URL immediately
-      const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
-      res.setHeader('X-Embed-URL', embedUrl);
-      
-      return res;
-    } catch (error) {
-      console.error('Upload creation error:', error);
-      res.statusCode = 500;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: 'Upload creation failed' }));
-      return res;
-    }
-  },
-  async onUploadFinish(req, res, upload) {
-    const permlink = upload.metadata?.permlink;
-    const owner = upload.metadata?.owner;
-    const frontend_app = upload.metadata?.frontend_app;
-    const short = upload.metadata?.short === 'true';
-    const originalFilename = upload.metadata?.originalFilename;
-
-    // Set embed URL on finish response too (so tus-js-client can capture it)
-    if (permlink && owner) {
-      const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
-      res.setHeader('X-Embed-URL', embedUrl);
-    }
-
-    if (permlink && owner && upload.storage) {
-      try {
-        // Pin file to IPFS
-        const filePath = (upload.storage as any).path;
-        console.log(`Pinning file to IPFS: ${filePath}`);
-        const { cid: input_cid, endpoint: ipfs_pin_endpoint } = await pinFile(filePath);
-        console.log(`File pinned successfully: ${input_cid} at ${ipfs_pin_endpoint}`);
-        
-        // Announce to DHT for better discoverability
-        try {
-          await announceDHT(input_cid);
-        } catch (dhtError) {
-          console.warn(`DHT announcement failed (non-critical): ${dhtError}`);
+      // Inject X-Embed-URL into the 204 (upload complete) for mobile SDKs
+      if (proxyRes.statusCode === 204) {
+        const uploadId = (req.url || '').split('/').filter(Boolean).pop() || '';
+        const embedUrl = pending204EmbedUrls.get(uploadId);
+        if (embedUrl) {
+          proxyRes.headers['x-embed-url'] = embedUrl;
+          pending204EmbedUrls.delete(uploadId);
         }
-        
-        // Update video with input_cid and pin location
-        await database.updateVideoStatus(permlink, 'processing', {
-          size: upload.size || null,
-          input_cid,
-          ipfs_pin_endpoint,
-          encodingProgress: 0,
-        });
-        
-        // Update user stats for successful upload
-        try {
-          await database.incrementUserUpload(owner, upload.size || 0);
-        } catch (statsError) {
-          console.warn(`Failed to update user stats: ${statsError}`);
-        }
-        
-        // Create encoding job (denormalize premium/short/fileSize for community job claiming)
-        const premium = await database.isUserPremium(owner);
-        await database.createJob({
-          owner,
-          permlink,
-          status: 'pending',
-          assignedWorker: null,
-          encoderJobId: null,
-          assignedAt: null,
-          attemptCount: 0,
-          lastError: null,
-          encodingProgress: null,
-          encodingStage: null,
-          webhookReceivedAt: null,
-          premium,
-          short,
-          fileSize: upload.size || null,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        });
-        
-        console.log(`Upload completed: ${owner}/${permlink} - Pinned: ${input_cid} - Job created`);
-        
-        // Clean up TUS file
-        try {
-          unlinkSync(filePath);
-          console.log(`TUS file cleaned up: ${filePath}`);
-        } catch (cleanupError) {
-          console.warn(`Failed to cleanup TUS file: ${cleanupError}`);
-        }
-      } catch (error) {
-        console.error(`Upload finish error for ${owner}/${permlink}:`, error);
-        await database.updateVideoStatus(permlink, 'failed', {
-          encodingProgress: 0,
-        });
       }
-    }
-    
-    return res;
+      const existing = (proxyRes.headers['access-control-expose-headers'] as string) || '';
+      if (!existing.toLowerCase().includes('x-embed-url')) {
+        proxyRes.headers['access-control-expose-headers'] =
+          existing ? `${existing}, X-Embed-URL` : 'X-Embed-URL';
+      }
+    },
   },
 });
+app.all('/uploads', tusProxy);
+app.all('/uploads/*', tusProxy);
 
+// Hook endpoint called by tusd for pre-create and post-finish events.
+// Bound to 127.0.0.1 in tusd config — but guard here as defence-in-depth.
+app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res: Response) => {
+  const remoteAddr = req.socket.remoteAddress;
+  if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1' && remoteAddr !== '::ffff:127.0.0.1') {
+    return res.status(403).json({});
+  }
+
+  const { Type, Event } = req.body;
+  const { Upload, HTTPRequest } = Event || {};
+
+  if (Type === 'pre-create') {
+    const isPartial = !!Upload?.IsPartial;
+    const authResult = await validateUploadAuth(
+      HTTPRequest?.Header || {},
+      Upload?.MetaData || {},
+      Upload?.Size || null,
+      database,
+      config,
+      isPartial
+    );
+
+    if (!authResult.ok) {
+      return res.json({
+        RejectUpload: true,
+        HTTPResponse: {
+          StatusCode: authResult.status,
+          Body: JSON.stringify({ error: authResult.error }),
+          Headers: { 'Content-Type': 'application/json' },
+        },
+      });
+    }
+
+    // Partial uploads are just chunk pieces — allow through without a DB record or embed URL.
+    if (isPartial) {
+      return res.json({});
+    }
+
+    const { owner, permlink, frontend_app, short, originalFilename, duration, size } = authResult;
+
+    console.log(`Upload metadata - short flag: "${Upload?.MetaData?.short}" -> parsed as: ${short}`);
+
+    await database.createVideoEntry({
+      owner,
+      permlink,
+      frontend_app,
+      status: 'uploading',
+      input_cid: null,
+      ipfs_pin_endpoint: null,
+      manifest_cid: null,
+      thumbnail_url: null,
+      short,
+      duration,
+      size,
+      encodingProgress: 0,
+      originalFilename,
+      hive_author: null,
+      hive_permlink: null,
+      hive_title: null,
+      hive_body: null,
+      hive_tags: null,
+      embed_url: null,
+      embed_title: null,
+      listed_on_3speak: frontend_app === '3speak-tv',
+      processed: false,
+      processedAt: null,
+      views: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
+    console.log(`Upload created: ${owner}/${permlink} [${frontend_app}] (${short ? 'short' : 'long'}, ${size} bytes)`);
+
+    // Queue the embed URL so proxyRes can inject it into the 201 response.
+    pending201EmbedUrls.push(embedUrl);
+    setTimeout(() => {
+      const idx = pending201EmbedUrls.indexOf(embedUrl);
+      if (idx !== -1) pending201EmbedUrls.splice(idx, 1);
+    }, 60_000);
+
+    return res.json({
+      ChangeFileInfo: {
+        MetaData: {
+          permlink,
+          owner,
+          frontend_app,
+          short: String(short),
+          originalFilename: originalFilename || '',
+        },
+      },
+    });
+  }
+
+  if (Type === 'pre-finish') {
+    // Store embed URL so proxyRes can inject it into the 204 response.
+    if (!Upload?.IsPartial) {
+      const { permlink, owner } = Upload?.MetaData || {};
+      if (permlink && owner && Upload?.ID) {
+        const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
+        pending204EmbedUrls.set(Upload.ID, embedUrl);
+        setTimeout(() => pending204EmbedUrls.delete(Upload.ID), 60_000);
+      }
+    }
+    return res.json({});
+  }
+
+  if (Type === 'post-finish') {
+    // Respond immediately — tusd already sent 204 to client. IPFS + job creation happen async.
+    res.json({});
+
+    if (!Upload?.IsPartial) {
+      const filePath = Upload?.Storage?.Path;
+      const meta = Upload?.MetaData || {};
+      setImmediate(() => {
+        processUploadAsync(filePath, meta, Upload?.Size || null, database, config)
+          .catch((err: Error) => console.error('post-finish async error:', err));
+      });
+    }
+    return;
+  }
+
+  return res.json({});
+});
+
+// Process completed upload: pin to IPFS, create encoding job, clean up temp file.
+// Called asynchronously after tusd sends 204 to client — client does NOT wait for this.
+async function processUploadAsync(
+  filePath: string,
+  meta: Record<string, string>,
+  uploadSize: number | null,
+  db: Database,
+  cfg: typeof config
+): Promise<void> {
+  const permlink = meta.permlink;
+  const owner = meta.owner;
+  const short = meta.short === 'true';
+  const originalFilename = meta.originalFilename || null;
+
+  if (!permlink || !owner || !filePath) {
+    console.error('post-finish: missing permlink, owner, or filePath', { permlink, owner, filePath });
+    return;
+  }
+
+  try {
+    console.log(`Pinning file to IPFS: ${filePath}`);
+    const { cid: input_cid, endpoint: ipfs_pin_endpoint } = await pinFile(filePath);
+    console.log(`File pinned successfully: ${input_cid} at ${ipfs_pin_endpoint}`);
+
+    try {
+      await announceDHT(input_cid);
+    } catch (dhtError) {
+      console.warn(`DHT announcement failed (non-critical): ${dhtError}`);
+    }
+
+    await db.updateVideoStatus(permlink, 'processing', {
+      size: uploadSize,
+      input_cid,
+      ipfs_pin_endpoint,
+      encodingProgress: 0,
+    });
+
+    try {
+      await db.incrementUserUpload(owner, uploadSize || 0);
+    } catch (statsError) {
+      console.warn(`Failed to update user stats: ${statsError}`);
+    }
+
+    const premium = await db.isUserPremium(owner);
+    await db.createJob({
+      owner,
+      permlink,
+      status: 'pending',
+      assignedWorker: null,
+      encoderJobId: null,
+      assignedAt: null,
+      attemptCount: 0,
+      lastError: null,
+      encodingProgress: null,
+      encodingStage: null,
+      webhookReceivedAt: null,
+      premium,
+      short,
+      fileSize: uploadSize,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    console.log(`Upload processed: ${owner}/${permlink} - Pinned: ${input_cid} - Job created`);
+
+    try {
+      unlinkSync(filePath);
+      console.log(`Temp file cleaned up: ${filePath}`);
+    } catch (cleanupError) {
+      console.warn(`Failed to cleanup temp file: ${cleanupError}`);
+    }
+  } catch (error) {
+    console.error(`processUploadAsync error for ${owner}/${permlink}:`, error);
+    await db.updateVideoStatus(permlink, 'failed', { encodingProgress: 0 });
+  }
+}
+
+// Create uploads directory if it doesn't exist
+const uploadPath = path.resolve(config.uploadDir);
 // Demo page endpoint
 app.get('/', (req: Request, res: Response) => {
   res.redirect('/demo.html');
@@ -1211,12 +1186,9 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
   }
 });
 
-// Mount TUS server - handle all HTTP methods
-app.all('/uploads', tusServer.handle.bind(tusServer));
-app.all('/uploads/*', tusServer.handle.bind(tusServer));
-
 // Start server
 let dispatcher: JobDispatcher;
+let tusdProcess: ReturnType<typeof startTusd> | null = null;
 
 async function start() {
   try {
@@ -1275,21 +1247,21 @@ async function start() {
     // Start job dispatcher
     dispatcher = new JobDispatcher(database, config);
     dispatcher.start(30); // Poll every 30 seconds
-    
+
     // Start cleanup service
     if (config.cleanupEnabled) {
       cleanupService.start(config.cleanupIntervalHours);
     } else {
       console.log('Cleanup service disabled');
     }
-    
+
     const server = app.listen(config.port, () => {
       console.log(`Server running on port ${config.port}`);
       console.log(`TUS endpoint: http://localhost:${config.port}/uploads`);
+      // Start tusd after Express is listening so the hook endpoint is ready
+      tusdProcess = startTusd(config, config.port);
     });
 
-    // Node.js 20.x requestTimeout defaults to 300s (5 min). Slow chunk uploads
-    // hit 408 if the total PATCH request exceeds this. Must set alongside res.setTimeout().
     server.requestTimeout = 30 * 60 * 1000;
   } catch (error) {
     console.error('Failed to start server:', error);
@@ -1300,9 +1272,8 @@ async function start() {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
-  if (dispatcher) {
-    dispatcher.stop();
-  }
+  if (tusdProcess) tusdProcess.kill('SIGTERM');
+  if (dispatcher) dispatcher.stop();
   cleanupService.stop();
   await database.close();
   process.exit(0);
@@ -1310,6 +1281,7 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   console.log('SIGINT received, shutting down gracefully...');
+  if (tusdProcess) tusdProcess.kill('SIGTERM');
   if (dispatcher) {
     dispatcher.stop();
   }
