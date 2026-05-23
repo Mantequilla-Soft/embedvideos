@@ -84,7 +84,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
 
   // Temporary debug — remove after confirming header forwarding works
   if (Type === 'pre-create') {
-    console.log('[tusd-hook] pre-create headers:', JSON.stringify(HTTPRequest?.Header || {}));
+    console.log('[tusd-hook] full body:', JSON.stringify(req.body));
   }
 
   if (Type === 'pre-create') {
