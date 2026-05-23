@@ -161,7 +161,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
 
     return res.json({
       HTTPResponse: {
-        StatusCode: 0,
+        StatusCode: 201,
         Headers: { 'X-Embed-URL': embedUrl },
         Body: '',
       },
@@ -186,7 +186,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
         const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
         return res.json({
           HTTPResponse: {
-            StatusCode: 0,
+            StatusCode: 204,
             Headers: { 'X-Embed-URL': embedUrl },
             Body: '',
           },
