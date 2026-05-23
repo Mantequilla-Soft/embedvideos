@@ -52,8 +52,14 @@ const requireAdminAuth = createAdminAuthMiddleware(config);
 
 // Proxy /uploads to tusd — tusd handles TUS protocol, Concatenation extension, and parallel chunks.
 // Use app.all (not app.use) so Express does NOT strip the /uploads prefix before forwarding.
+// tusd v2 ignores HTTPResponse.Headers from hook responses entirely.
+// We inject X-Embed-URL ourselves in proxyRes using two stores:
+//   pending201EmbedUrls — FIFO queue: pushed in pre-create, consumed by the next 201
+//   pending204EmbedUrls — Map by upload ID: set in pre-finish, consumed by the 204
+const pending201EmbedUrls: string[] = [];
+const pending204EmbedUrls = new Map<string, string>();
+
 // app.use strips the mount path from req.url; app.all preserves it — tusd needs the full path.
-// X-Embed-URL is injected into the 201 response by the pre-create hook and must survive CORS.
 const tusProxy = createProxyMiddleware({
   target: `http://127.0.0.1:${config.tusdPort}`,
   changeOrigin: false,
@@ -61,18 +67,26 @@ const tusProxy = createProxyMiddleware({
   proxyTimeout: 30 * 60 * 1000,
   on: {
     proxyReq: (proxyReq, req) => {
-      // xfwd appends ",http" to any existing X-Forwarded-Proto set by nginx.
-      // tusd uses X-Forwarded-Proto to build the Location URL in 201 responses.
-      // Fix: pass only the first (client-facing) proto so tusd generates https:// URLs.
+      // xfwd appends ",http" to nginx's X-Forwarded-Proto. Fix: forward only the first value.
       const proto = req.headers['x-forwarded-proto'];
       if (proto) {
         const first = (Array.isArray(proto) ? proto[0] : proto).split(',')[0].trim();
         proxyReq.setHeader('X-Forwarded-Proto', first);
       }
     },
-    proxyRes: (proxyRes) => {
-      if (proxyRes.statusCode === 201 || proxyRes.statusCode === 204) {
-        console.log(`[proxy] ${proxyRes.statusCode} headers from tusd:`, JSON.stringify(proxyRes.headers));
+    proxyRes: (proxyRes, req) => {
+      // Inject X-Embed-URL into the 201 (upload creation) for browser tus-js-client
+      if (proxyRes.statusCode === 201 && pending201EmbedUrls.length > 0) {
+        proxyRes.headers['x-embed-url'] = pending201EmbedUrls.shift()!;
+      }
+      // Inject X-Embed-URL into the 204 (upload complete) for mobile SDKs
+      if (proxyRes.statusCode === 204) {
+        const uploadId = (req.url || '').split('/').filter(Boolean).pop() || '';
+        const embedUrl = pending204EmbedUrls.get(uploadId);
+        if (embedUrl) {
+          proxyRes.headers['x-embed-url'] = embedUrl;
+          pending204EmbedUrls.delete(uploadId);
+        }
       }
       const existing = (proxyRes.headers['access-control-expose-headers'] as string) || '';
       if (!existing.toLowerCase().includes('x-embed-url')) {
@@ -159,12 +173,14 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
     const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
     console.log(`Upload created: ${owner}/${permlink} [${frontend_app}] (${short ? 'short' : 'long'}, ${size} bytes)`);
 
+    // Queue the embed URL so proxyRes can inject it into the 201 response.
+    pending201EmbedUrls.push(embedUrl);
+    setTimeout(() => {
+      const idx = pending201EmbedUrls.indexOf(embedUrl);
+      if (idx !== -1) pending201EmbedUrls.splice(idx, 1);
+    }, 60_000);
+
     return res.json({
-      HTTPResponse: {
-        StatusCode: 201,
-        Headers: { 'X-Embed-URL': embedUrl },
-        Body: '',
-      },
       ChangeFileInfo: {
         MetaData: {
           permlink,
@@ -178,19 +194,13 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
   }
 
   if (Type === 'pre-finish') {
-    // Fires before the final response is sent to the client (after all bytes received).
-    // Inject X-Embed-URL here so mobile SDKs that read it from the final PATCH response get it.
+    // Store embed URL so proxyRes can inject it into the 204 response.
     if (!Upload?.IsPartial) {
       const { permlink, owner } = Upload?.MetaData || {};
-      if (permlink && owner) {
+      if (permlink && owner && Upload?.ID) {
         const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
-        return res.json({
-          HTTPResponse: {
-            StatusCode: 204,
-            Headers: { 'X-Embed-URL': embedUrl },
-            Body: '',
-          },
-        });
+        pending204EmbedUrls.set(Upload.ID, embedUrl);
+        setTimeout(() => pending204EmbedUrls.delete(Upload.ID), 60_000);
       }
     }
     return res.json({});
