@@ -71,6 +71,9 @@ const tusProxy = createProxyMiddleware({
       }
     },
     proxyRes: (proxyRes) => {
+      if (proxyRes.statusCode === 201 || proxyRes.statusCode === 204) {
+        console.log(`[proxy] ${proxyRes.statusCode} headers from tusd:`, JSON.stringify(proxyRes.headers));
+      }
       const existing = (proxyRes.headers['access-control-expose-headers'] as string) || '';
       if (!existing.toLowerCase().includes('x-embed-url')) {
         proxyRes.headers['access-control-expose-headers'] =
