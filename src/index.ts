@@ -60,6 +60,16 @@ const tusProxy = createProxyMiddleware({
   xfwd: true,
   proxyTimeout: 30 * 60 * 1000,
   on: {
+    proxyReq: (proxyReq, req) => {
+      // xfwd appends ",http" to any existing X-Forwarded-Proto set by nginx.
+      // tusd uses X-Forwarded-Proto to build the Location URL in 201 responses.
+      // Fix: pass only the first (client-facing) proto so tusd generates https:// URLs.
+      const proto = req.headers['x-forwarded-proto'];
+      if (proto) {
+        const first = (Array.isArray(proto) ? proto[0] : proto).split(',')[0].trim();
+        proxyReq.setHeader('X-Forwarded-Proto', first);
+      }
+    },
     proxyRes: (proxyRes) => {
       const existing = (proxyRes.headers['access-control-expose-headers'] as string) || '';
       if (!existing.toLowerCase().includes('x-embed-url')) {
