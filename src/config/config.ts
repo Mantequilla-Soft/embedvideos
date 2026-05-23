@@ -7,6 +7,8 @@ export interface EncoderConfig {
 
 export interface Config {
   port: number;
+  tusdPort: number;
+  tusdBinaryPath: string;
   mongoUri: string;
   mongoDbName: string;
   mongoCollectionVideos: string;
@@ -62,6 +64,8 @@ function parseEncoders(): EncoderConfig[] {
 export function loadConfig(): Config {
   return {
     port: parseInt(process.env.PORT || '3000', 10),
+    tusdPort: parseInt(process.env.TUSD_PORT || '1080', 10),
+    tusdBinaryPath: process.env.TUSD_BINARY_PATH || './bin/tusd',
     mongoUri: process.env.MONGODB_URI || '',
     mongoDbName: process.env.MONGODB_DATABASE || 'threespeak',
     mongoCollectionVideos: process.env.MONGODB_COLLECTION_VIDEOS || 'embed-video',

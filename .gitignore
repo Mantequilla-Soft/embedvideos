@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 uploads/
+bin/
 *.log
 .DS_Store
 internal-docs/
