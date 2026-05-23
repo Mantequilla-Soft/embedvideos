@@ -174,6 +174,25 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
     });
   }
 
+  if (Type === 'pre-finish') {
+    // Fires before the final response is sent to the client (after all bytes received).
+    // Inject X-Embed-URL here so mobile SDKs that read it from the final PATCH response get it.
+    if (!Upload?.IsPartial) {
+      const { permlink, owner } = Upload?.MetaData || {};
+      if (permlink && owner) {
+        const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
+        return res.json({
+          HTTPResponse: {
+            StatusCode: 0,
+            Headers: { 'X-Embed-URL': embedUrl },
+            Body: '',
+          },
+        });
+      }
+    }
+    return res.json({});
+  }
+
   if (Type === 'post-finish') {
     // Respond immediately — tusd already sent 204 to client. IPFS + job creation happen async.
     res.json({});
