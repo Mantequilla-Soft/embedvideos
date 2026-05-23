@@ -148,7 +148,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
 
     return res.json({
       HTTPResponse: {
-        StatusCode: 200,
+        StatusCode: 0,
         Headers: { 'X-Embed-URL': embedUrl },
         Body: '',
       },
