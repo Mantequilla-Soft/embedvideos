@@ -80,12 +80,8 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
     return res.status(403).json({});
   }
 
-  const { Type, Upload, HTTPRequest } = req.body;
-
-  // Temporary debug — remove after confirming header forwarding works
-  if (Type === 'pre-create') {
-    console.log('[tusd-hook] full body:', JSON.stringify(req.body));
-  }
+  const { Type, Event } = req.body;
+  const { Upload, HTTPRequest } = Event || {};
 
   if (Type === 'pre-create') {
     const isPartial = !!Upload?.IsPartial;

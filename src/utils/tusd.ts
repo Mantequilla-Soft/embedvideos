@@ -14,7 +14,6 @@ export function startTusd(config: Config, appPort: number): ChildProcess {
     '--upload-dir', uploadDir,
     '--hooks-http', `http://127.0.0.1:${appPort}/tusd-hooks`,
     '--hooks-enabled-events', 'pre-create,post-finish',
-    '--hooks-http-forward-headers', 'X-API-Key,Authorization,Origin',
     '--cors-allow-origin', '.*',
     '--cors-expose-headers', 'X-Embed-URL,Upload-Offset,Location,Upload-Length,Tus-Version,Tus-Resumable,Tus-Max-Size,Tus-Extension,Upload-Metadata,Upload-Defer-Length,Upload-Concat',
     '--max-size', '0',
