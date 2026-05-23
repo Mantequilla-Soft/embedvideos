@@ -51,8 +51,10 @@ const requireApiKey = createApiKeyMiddleware(database);
 const requireAdminAuth = createAdminAuthMiddleware(config);
 
 // Proxy /uploads to tusd — tusd handles TUS protocol, Concatenation extension, and parallel chunks.
+// Use app.all (not app.use) so Express does NOT strip the /uploads prefix before forwarding.
+// app.use strips the mount path from req.url; app.all preserves it — tusd needs the full path.
 // X-Embed-URL is injected into the 201 response by the pre-create hook and must survive CORS.
-app.use('/uploads', createProxyMiddleware({
+const tusProxy = createProxyMiddleware({
   target: `http://127.0.0.1:${config.tusdPort}`,
   changeOrigin: false,
   xfwd: true,
@@ -66,7 +68,9 @@ app.use('/uploads', createProxyMiddleware({
       }
     },
   },
-}));
+});
+app.all('/uploads', tusProxy);
+app.all('/uploads/*', tusProxy);
 
 // Hook endpoint called by tusd for pre-create and post-finish events.
 // Bound to 127.0.0.1 in tusd config — but guard here as defence-in-depth.
