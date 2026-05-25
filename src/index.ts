@@ -144,6 +144,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     console.log(`Upload token issued: ${owner} via ${claims.app} (ttl=${tokenTtl}s, jti=${claims.jti.slice(0, 8)}...)`);
 
     res.status(201).json({
+      success: true,
       token,
       upload_url: `${req.protocol}://${req.get('host')}/uploads`,
       expires_at: expiresAt,
