@@ -96,6 +96,64 @@ const tusProxy = createProxyMiddleware({
     },
   },
 });
+// /uploads/token must be registered before the tusd proxy wildcard.
+// app.all('/uploads/*') would otherwise swallow POST /uploads/token and
+// forward it to tusd, which returns 412 (TUS Precondition Failed).
+app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) => {
+  try {
+    if (!config.uploadTokenSecret) {
+      return res.status(503).json({
+        error: 'Upload tokens are not configured',
+        message: 'Set UPLOAD_TOKEN_SECRET to enable upload tokens',
+      });
+    }
+
+    const { owner, frontend_app, short = false, allowed_origins = [], max_file_size, ttl } = req.body;
+
+    if (!owner || typeof owner !== 'string') {
+      return res.status(422).json({ error: 'owner (string) is required' });
+    }
+
+    const tokenTtl = Math.min(
+      typeof ttl === 'number' && ttl > 0 ? ttl : config.uploadTokenDefaultTtl,
+      config.uploadTokenMaxTtl
+    );
+
+    const maxFileSize = typeof max_file_size === 'number' && max_file_size > 0
+      ? Math.min(max_file_size, config.uploadTokenMaxFileSize)
+      : config.uploadTokenMaxFileSize;
+
+    const now = Math.floor(Date.now() / 1000);
+    const apiKeyData = (req as any).apiKey;
+
+    const claims: UploadTokenClaims = {
+      jti: generateTokenId(),
+      owner,
+      app: frontend_app || apiKeyData?.app_name || 'unknown',
+      issuedByKey: apiKeyData?.app_name || 'unknown',
+      short: !!short,
+      maxFileSize,
+      allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
+      iat: now,
+      exp: now + tokenTtl,
+    };
+
+    const token = signUploadToken(claims, config.uploadTokenSecret);
+    const expiresAt = new Date(claims.exp * 1000).toISOString();
+
+    console.log(`Upload token issued: ${owner} via ${claims.app} (ttl=${tokenTtl}s, jti=${claims.jti.slice(0, 8)}...)`);
+
+    res.status(201).json({
+      token,
+      upload_url: `${req.protocol}://${req.get('host')}/uploads`,
+      expires_at: expiresAt,
+    });
+  } catch (error) {
+    console.error('Error creating upload token:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.all('/uploads', tusProxy);
 app.all('/uploads/*', tusProxy);
 
@@ -1122,66 +1180,6 @@ app.get('/admin/encoder-stats', requireAdminAuth, async (req: Request, res: Resp
     });
   } catch (error) {
     console.error('Error fetching encoder stats:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Upload Token endpoint — server-to-server only (requires API key)
-// Frontends call their own backend, which calls this endpoint to get a short-lived
-// upload token. The frontend then uses the token to upload directly via TUS.
-app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) => {
-  try {
-    if (!config.uploadTokenSecret) {
-      return res.status(503).json({
-        error: 'Upload tokens are not configured',
-        message: 'Set UPLOAD_TOKEN_SECRET to enable upload tokens',
-      });
-    }
-
-    const { owner, frontend_app, short = false, allowed_origins = [], max_file_size, ttl } = req.body;
-
-    if (!owner || typeof owner !== 'string') {
-      return res.status(422).json({ error: 'owner (string) is required' });
-    }
-
-    // Resolve TTL: request → default → 3600
-    const tokenTtl = Math.min(
-      typeof ttl === 'number' && ttl > 0 ? ttl : config.uploadTokenDefaultTtl,
-      config.uploadTokenMaxTtl
-    );
-
-    // Resolve max file size: request → default → 1GB
-    const maxFileSize = typeof max_file_size === 'number' && max_file_size > 0
-      ? Math.min(max_file_size, config.uploadTokenMaxFileSize)
-      : config.uploadTokenMaxFileSize;
-
-    const now = Math.floor(Date.now() / 1000);
-    const apiKeyData = (req as any).apiKey;
-
-    const claims: UploadTokenClaims = {
-      jti: generateTokenId(),
-      owner,
-      app: frontend_app || apiKeyData?.app_name || 'unknown',
-      issuedByKey: apiKeyData?.app_name || 'unknown',
-      short: !!short,
-      maxFileSize,
-      allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
-      iat: now,
-      exp: now + tokenTtl,
-    };
-
-    const token = signUploadToken(claims, config.uploadTokenSecret);
-    const expiresAt = new Date(claims.exp * 1000).toISOString();
-
-    console.log(`Upload token issued: ${owner} via ${claims.app} (ttl=${tokenTtl}s, jti=${claims.jti.slice(0, 8)}...)`);
-
-    res.status(201).json({
-      token,
-      upload_url: `${req.protocol}://${req.get('host')}/uploads`,
-      expires_at: expiresAt,
-    });
-  } catch (error) {
-    console.error('Error creating upload token:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
