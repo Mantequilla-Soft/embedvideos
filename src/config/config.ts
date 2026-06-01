@@ -31,6 +31,11 @@ export interface Config {
   uploadTokenDefaultTtl: number;
   uploadTokenMaxTtl: number;
   uploadTokenMaxFileSize: number;
+  // When false, the JobDispatcher poll loop is not started. Set on secondary
+  // deployments that share a Mongo embed-jobs collection with a primary so only
+  // one instance dispatches encoder jobs (the dispatch path is not atomic across
+  // instances, so two pollers can double-dispatch the same job).
+  dispatcherEnabled: boolean;
 }
 
 function parseEncoders(): EncoderConfig[] {
@@ -88,5 +93,6 @@ export function loadConfig(): Config {
     uploadTokenDefaultTtl: parseInt(process.env.UPLOAD_TOKEN_DEFAULT_TTL || '600', 10),
     uploadTokenMaxTtl: parseInt(process.env.UPLOAD_TOKEN_MAX_TTL || '1800', 10),
     uploadTokenMaxFileSize: parseInt(process.env.UPLOAD_TOKEN_MAX_FILE_SIZE || String(1024 * 1024 * 1024), 10),
+    dispatcherEnabled: process.env.DISPATCHER_ENABLED !== 'false',
   };
 }

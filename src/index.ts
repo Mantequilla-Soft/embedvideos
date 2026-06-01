@@ -1243,9 +1243,14 @@ async function start() {
       console.warn('⚠️  No enabled encoders in DB! Jobs will fail to dispatch.');
     }
     
-    // Start job dispatcher
-    dispatcher = new JobDispatcher(database, config);
-    dispatcher.start(30); // Poll every 30 seconds
+    // Start job dispatcher (skip on secondary deployments — the dispatch path
+    // isn't atomic across replicas, so two pollers can double-dispatch the same job).
+    if (config.dispatcherEnabled) {
+      dispatcher = new JobDispatcher(database, config);
+      dispatcher.start(30); // Poll every 30 seconds
+    } else {
+      console.log('Job dispatcher disabled (DISPATCHER_ENABLED=false)');
+    }
 
     // Start cleanup service
     if (config.cleanupEnabled) {
