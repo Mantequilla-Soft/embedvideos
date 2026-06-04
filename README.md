@@ -140,6 +140,33 @@ GET /health
 
 Returns the service status.
 
+### Community Encoder Status
+
+```http
+GET /api/v0/encoders/community
+```
+
+Public endpoint (no auth required). Returns all registered community encoders and their liveness status. An encoder is considered **alive** if it has polled within the last 5 minutes.
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "encoders": [
+    {
+      "name": "community-abc123def456",
+      "enabled": true,
+      "banned": false,
+      "lastSeenAt": "2026-06-04T12:34:56.000Z",
+      "alive": true
+    }
+  ]
+}
+```
+
+Use this endpoint in monitoring dashboards to track which community encoders are actively polling for work.
+
 ### Get Video Metadata
 
 ```http

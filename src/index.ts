@@ -628,6 +628,30 @@ app.post('/api/v0/gateway/heartbeat', async (req: Request, res: Response) => {
   }
 });
 
+// Public community encoder status — for monitoring dashboards
+app.get('/api/v0/encoders/community', async (req: Request, res: Response) => {
+  try {
+    const allEncoders = await database.getAllEncoders();
+    const now = Date.now();
+    const ALIVE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+    const community = allEncoders
+      .filter(e => (e.access ?? 'managed') === 'community')
+      .map(e => ({
+        name: e.name,
+        enabled: e.enabled,
+        banned: e.banned ?? false,
+        lastSeenAt: e.lastSeenAt ?? null,
+        alive: e.lastSeenAt ? (now - new Date(e.lastSeenAt).getTime()) < ALIVE_THRESHOLD_MS : false,
+      }));
+
+    res.json({ success: true, encoders: community });
+  } catch (error) {
+    console.error('Community encoder status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get video metadata endpoint
 app.get('/video/:permlink', async (req: Request, res: Response) => {
   try {
