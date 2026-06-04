@@ -31,6 +31,9 @@ export interface Config {
   uploadTokenDefaultTtl: number;
   uploadTokenMaxTtl: number;
   uploadTokenMaxFileSize: number;
+  // Hard cap on a single video upload's total size, enforced in the pre-create
+  // hook for every upload regardless of auth method (API key or token). Default 5 GiB.
+  maxUploadSize: number;
   // When false, the JobDispatcher poll loop is not started. Set on secondary
   // deployments that share a Mongo embed-jobs collection with a primary so only
   // one instance dispatches encoder jobs (the dispatch path is not atomic across
@@ -93,6 +96,7 @@ export function loadConfig(): Config {
     uploadTokenDefaultTtl: parseInt(process.env.UPLOAD_TOKEN_DEFAULT_TTL || '600', 10),
     uploadTokenMaxTtl: parseInt(process.env.UPLOAD_TOKEN_MAX_TTL || '1800', 10),
     uploadTokenMaxFileSize: parseInt(process.env.UPLOAD_TOKEN_MAX_FILE_SIZE || String(1024 * 1024 * 1024), 10),
+    maxUploadSize: parseInt(process.env.MAX_UPLOAD_SIZE || String(5 * 1024 * 1024 * 1024), 10),
     dispatcherEnabled: process.env.DISPATCHER_ENABLED !== 'false',
   };
 }
