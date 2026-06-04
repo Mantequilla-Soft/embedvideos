@@ -198,6 +198,23 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
 
     const { owner, permlink, frontend_app, short, originalFilename, duration, size } = authResult;
 
+    // Hard size cap, enforced for every upload regardless of auth method.
+    // For parallel/Concatenation uploads this fires on the final concat, whose
+    // Size is the sum of the already-uploaded parts.
+    if (size != null && size > config.maxUploadSize) {
+      console.warn(`Upload rejected: ${owner}/${permlink} size ${size} bytes exceeds cap ${config.maxUploadSize}`);
+      return res.json({
+        RejectUpload: true,
+        HTTPResponse: {
+          StatusCode: 413,
+          Body: JSON.stringify({
+            error: `Video exceeds the maximum allowed size of ${Math.round(config.maxUploadSize / (1024 * 1024 * 1024))}GB`,
+          }),
+          Headers: { 'Content-Type': 'application/json' },
+        },
+      });
+    }
+
     console.log(`Upload metadata - short flag: "${Upload?.MetaData?.short}" -> parsed as: ${short}`);
 
     await database.createVideoEntry({
