@@ -458,28 +458,46 @@ app.post('/webhook', async (req: Request, res: Response) => {
       console.log(`Video encoding completed: ${owner}/${permlink} - Manifest: ${manifest_cid}`);
       res.json({ success: true, message: 'Webhook processed successfully' });
     } else if (status === 'failed') {
-      // Update video as failed
-      await database.updateVideoStatus(permlink, 'failed', {
-        encodingProgress: 0,
-      });
+      // Retry budget: requeue up to 2 times before giving up permanently.
+      // attemptCount tracks all prior encode attempts (dispatch failures + webhook failures).
+      const MAX_ENCODE_ATTEMPTS = 2;
+      const job = await database.getJob(owner, permlink);
 
-      // Update job as failed
-      await database.updateJobStatus(owner, permlink, 'failed', {
-        webhookReceivedAt: new Date(),
-        lastError: encoderError || 'Encoding failed',
-      });
-      
-      // Update user stats for failed encoding
-      try {
-        await database.incrementUserFailure(owner);
-      } catch (statsError) {
-        console.warn(`Failed to update user failure stats: ${statsError}`);
+      if (job && job.attemptCount < MAX_ENCODE_ATTEMPTS) {
+        // Still within retry budget — requeue for the dispatcher to pick up.
+        const nextAttempt = job.attemptCount + 1;
+        await database.updateJobStatus(owner, permlink, 'pending', {
+          webhookReceivedAt: new Date(),
+          lastError: `${encoderError || 'Encoding failed'} (attempt ${nextAttempt}/${MAX_ENCODE_ATTEMPTS + 1}, requeueing)`,
+          assignedWorker: null,
+          encoderJobId: null,
+          assignedAt: null,
+          encodingProgress: null,
+          encodingStage: null,
+        });
+        await database.incrementJobAttempt(owner, permlink);
+        await database.updateVideoStatus(permlink, 'processing', { encodingProgress: 0 });
+        console.warn(`Encoding failed for ${owner}/${permlink} (attempt ${nextAttempt}/${MAX_ENCODE_ATTEMPTS + 1}): ${encoderError} — requeueing`);
+        res.json({ success: true, message: 'Webhook processed (failure recorded, job requeued)' });
+      } else {
+        // Retry budget exhausted — permanent failure.
+        await database.updateVideoStatus(permlink, 'failed', { encodingProgress: 0 });
+        await database.updateJobStatus(owner, permlink, 'failed', {
+          webhookReceivedAt: new Date(),
+          lastError: encoderError || 'Encoding failed',
+        });
+
+        try {
+          await database.incrementUserFailure(owner);
+        } catch (statsError) {
+          console.warn(`Failed to update user failure stats: ${statsError}`);
+        }
+
+        // DO NOT unpin on failure - keep the file for potential retry or debugging
+
+        console.error(`Video encoding permanently failed for ${owner}/${permlink} after ${(job?.attemptCount ?? 0) + 1} attempt(s): ${encoderError}`);
+        res.json({ success: true, message: 'Webhook processed (failure recorded)' });
       }
-
-      // DO NOT unpin on failure - keep the file for potential retry or debugging
-
-      console.error(`Video encoding failed: ${owner}/${permlink} - Error: ${encoderError}`);
-      res.json({ success: true, message: 'Webhook processed (failure recorded)' });
     } else {
       console.warn(`Unknown webhook status: ${status}`);
       res.status(400).json({ error: 'Unknown status' });

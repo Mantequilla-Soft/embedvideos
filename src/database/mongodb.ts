@@ -126,6 +126,8 @@ export class Database {
     this.collection = this.db.collection<VideoMetadata>(collectionName);
     
     // Create indexes
+    await this.collection.createIndex({ permlink: 1 }, { unique: true });
+
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await encodersCollection.createIndex({ name: 1 }, { unique: true });
     await encodersCollection.createIndex({ did: 1 }, { unique: true, sparse: true });
@@ -315,6 +317,27 @@ export class Database {
       .sort({ createdAt: 1 })
       .limit(limit)
       .toArray();
+  }
+
+  /**
+   * Atomically claim the next pending managed job (premium or free, non-short or short).
+   * Uses findOneAndUpdate so two concurrent dispatchers cannot claim the same job.
+   * Returns null if no pending job matches.
+   */
+  async claimNextManagedJob(filter: { premium?: boolean; short?: boolean }): Promise<EncodingJob | null> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    const query: any = { status: 'pending' };
+    if (filter.premium !== undefined) query.premium = filter.premium;
+    if (filter.short !== undefined) query.short = filter.short;
+
+    return jobsCollection.findOneAndUpdate(
+      query,
+      { $set: { status: 'encoding' as JobStatus, updatedAt: new Date() } },
+      { sort: { createdAt: 1 }, returnDocument: 'after' }
+    );
   }
 
   async updateJobStatus(

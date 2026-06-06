@@ -1,4 +1,4 @@
-import { Database, Encoder, EncoderTier } from '../database/mongodb';
+import { Database, Encoder, EncoderTier, EncodingJob } from '../database/mongodb';
 import { Config } from '../config/config';
 
 export class JobDispatcher {
@@ -160,33 +160,33 @@ export class JobDispatcher {
   }
 
   /**
-   * Process pending jobs
+   * Process pending jobs.
+   * Each job is claimed atomically (findOneAndUpdate) before dispatch so two
+   * concurrent dispatcher instances cannot double-dispatch the same job.
    */
   private async processJobs(): Promise<void> {
     try {
       await this.checkStalledJobs();
 
-      const pendingJobs = await this.database.getPendingJobs(5);
+      // Claim and dispatch up to 5 jobs per cycle. We claim one at a time so
+      // the atomic findOneAndUpdate prevents a second dispatcher replica from
+      // seeing the same job between our read and our status update.
+      let dispatched = 0;
+      for (let i = 0; i < 5; i++) {
+        const job = await this.database.claimNextManagedJob({});
+        if (!job) break;
 
-      if (pendingJobs.length === 0) {
-        return; // No jobs to process
-      }
-
-      console.log(`Found ${pendingJobs.length} pending job(s)`);
-
-      for (const job of pendingJobs) {
+        dispatched++;
         try {
-          await this.dispatchJob(job.owner, job.permlink);
+          await this.dispatchJob(job.owner, job.permlink, job);
         } catch (error) {
           console.error(`Failed to dispatch job ${job.owner}/${job.permlink}:`, error);
 
-          // Increment attempt count and set error
           await this.database.incrementJobAttempt(job.owner, job.permlink);
           await this.database.updateJobStatus(job.owner, job.permlink, 'pending', {
             lastError: error instanceof Error ? error.message : String(error),
           });
 
-          // If too many attempts, mark as failed
           if (job.attemptCount >= 3) {
             await this.database.updateJobStatus(job.owner, job.permlink, 'failed', {
               lastError: `Max attempts exceeded: ${error instanceof Error ? error.message : String(error)}`,
@@ -196,16 +196,21 @@ export class JobDispatcher {
           }
         }
       }
+
+      if (dispatched > 0) {
+        console.log(`Dispatched ${dispatched} job(s) this cycle`);
+      }
     } catch (error) {
       console.error('Error processing jobs:', error);
     }
   }
 
   /**
-   * Dispatch a single job to the encoder
+   * Dispatch a single job to the encoder.
+   * The job has already been atomically claimed (status = 'encoding') by the caller.
+   * If dispatch fails the caller resets it back to 'pending'.
    */
-  private async dispatchJob(owner: string, permlink: string): Promise<void> {
-    // Get video metadata
+  private async dispatchJob(owner: string, permlink: string, job: EncodingJob): Promise<void> {
     const video = await this.database.getVideo(permlink);
     if (!video) {
       throw new Error(`Video not found: ${permlink}`);
@@ -215,11 +220,9 @@ export class JobDispatcher {
       throw new Error(`Video has no input_cid: ${permlink}`);
     }
 
-    // Look up premium status for this user
-    const premium = await this.database.isUserPremium(owner);
-    const fileSize = video.size ?? null;
+    const premium = job.premium ?? await this.database.isUserPremium(owner);
+    const fileSize = video.size ?? job.fileSize ?? null;
 
-    // Prepare encoder request with full IPFS gateway URL
     const ipfsGateway = 'https://ipfs.3speak.tv/ipfs';
     const encoderRequest = {
       owner,
@@ -233,14 +236,12 @@ export class JobDispatcher {
       originalFilename: video.originalFilename,
     };
 
-    // Select encoder using tier-aware routing
     const encoder = await this.getNextEncoder(premium, fileSize, video.short);
     const encoderTier = encoder.tier ?? 'standard';
     const encoderAccess = encoder.access ?? 'managed';
     console.log(`Dispatching job to [${encoder.name}] (${encoderAccess}/${encoderTier}): ${owner}/${permlink} [premium=${premium}, size=${fileSize}]`);
     console.log(`Encoder request payload:`, JSON.stringify(encoderRequest, null, 2));
 
-    // Call encoder API
     const response = await fetch(`${encoder.url}/encode`, {
       method: 'POST',
       headers: {
@@ -258,12 +259,12 @@ export class JobDispatcher {
     const result = await response.json() as { job_id: string; encoder_id?: string };
     console.log(`Job dispatched successfully to [${encoder.name}]: ${result.job_id}`);
 
-    // Update job status to encoding
+    // Job is already 'encoding' from the atomic claim; just fill in the encoder details.
     await this.database.updateJobStatus(owner, permlink, 'encoding', {
       encoderJobId: result.job_id,
       assignedWorker: encoder.name,
       assignedAt: new Date(),
-      lastError: null, // clear stale error if any
+      lastError: null,
     });
   }
 }
