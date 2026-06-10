@@ -673,6 +673,25 @@ app.post('/api/v0/gateway/heartbeat', async (req: Request, res: Response) => {
   }
 });
 
+// Public encoder status for all encoders — for external monitoring systems
+app.get('/api/v0/encoders/status', async (req: Request, res: Response) => {
+  try {
+    const allEncoders = await database.getAllEncoders();
+
+    const encoders = allEncoders.map(e => ({
+      name: e.name,
+      access: e.access ?? 'managed',
+      operator: e.hiveAccount ?? null,
+      lastSeenAt: e.lastSeenAt ?? null,
+    }));
+
+    res.json({ success: true, encoders });
+  } catch (error) {
+    console.error('Encoder status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Public community encoder status — for monitoring dashboards
 app.get('/api/v0/encoders/community', async (req: Request, res: Response) => {
   try {
