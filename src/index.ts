@@ -126,6 +126,12 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     const now = Math.floor(Date.now() / 1000);
     const apiKeyData = (req as any).apiKey;
 
+    // Assign the permlink here, at token issuance, and bind it to the token.
+    // The client receives it in the response (permlink/embed_url below) and can
+    // build the canonical embed URL without scraping a TUS response header —
+    // which is what makes parallel/Concatenation uploads reliable.
+    const permlink = generateVideoId();
+
     const claims: UploadTokenClaims = {
       jti: generateTokenId(),
       owner,
@@ -134,19 +140,23 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       short: !!short,
       maxFileSize,
       allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
+      permlink,
       iat: now,
       exp: now + tokenTtl,
     };
 
     const token = signUploadToken(claims, config.uploadTokenSecret);
     const expiresAt = new Date(claims.exp * 1000).toISOString();
+    const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
 
-    console.log(`Upload token issued: ${owner} via ${claims.app} (ttl=${tokenTtl}s, jti=${claims.jti.slice(0, 8)}...)`);
+    console.log(`Upload token issued: ${owner}/${permlink} via ${claims.app} (ttl=${tokenTtl}s, jti=${claims.jti.slice(0, 8)}...)`);
 
     res.status(201).json({
       success: true,
       token,
       upload_url: `${req.protocol}://${req.get('host')}/uploads`,
+      permlink,
+      embed_url: embedUrl,
       expires_at: expiresAt,
     });
   } catch (error) {

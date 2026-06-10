@@ -115,9 +115,17 @@ curl -X POST https://embed.3speak.tv/uploads/token \
 {
   "token": "eyJ...",
   "upload_url": "https://embed.3speak.tv/uploads",
+  "permlink": "yn77aj9g",
+  "embed_url": "https://play.3speak.tv/embed?v=username/yn77aj9g",
   "expires_at": "2026-03-17T12:10:00.000Z"
 }
 ```
+
+The `permlink` and `embed_url` are assigned at issuance and bound to the token, so
+the client knows the canonical embed URL **before** uploading. This is the
+recommended way to obtain the embed URL: it is reliable for parallel
+(Concatenation) uploads, where the per-response `X-Embed-URL` header can be
+missed. The `X-Embed-URL` header is still emitted for backward compatibility.
 
 **Token parameters:**
 
@@ -278,8 +286,9 @@ const response = await fetch('https://embed.3speak.tv/uploads/token', {
   })
 });
 
-const { token, upload_url, expires_at } = await response.json();
-// Send `token` and `upload_url` to your frontend
+const { token, upload_url, permlink, embed_url, expires_at } = await response.json();
+// Send `token`, `upload_url`, and `embed_url` to your frontend.
+// `embed_url` is already final — no need to read it back from a response header.
 ```
 
 **Step 2 — Your frontend uploads with the token:**
@@ -294,7 +303,7 @@ const upload = new tus.Upload(file, {
   metadata: {
     filename: file.name,
     filetype: file.type,
-    // owner, frontend_app, short are already in the token — no need to set them
+    // owner, frontend_app, short are already in the token - no need to set them
   },
   onError: (error) => {
     console.error('Upload failed:', error);
@@ -304,20 +313,24 @@ const upload = new tus.Upload(file, {
     console.log(`Uploaded ${percentage}%`);
   },
   onSuccess: () => {
-    console.log('Upload completed!');
-  },
-  onAfterResponse: (req, res) => {
-    const embedUrl = res.getHeader('X-Embed-URL');
-    console.log('Embed URL:', embedUrl);
+    // `embed_url` was returned by the token request (Step 1) and passed to the
+    // frontend. It is already the canonical URL - no header scraping needed,
+    // which is what makes this reliable for parallel uploads.
+    console.log('Upload completed! Embed URL:', embed_url);
   }
 });
 
 upload.start();
 ```
 
+> For parallel uploads (`parallelUploads: 3` via the TUS Concatenation
+> extension), always use the token's `embed_url`. The `X-Embed-URL` response
+> header is injected per-response and can be missed on the final concatenation
+> request, so relying on it can make a completed upload look like a failure.
+
 ## Tracking Progress
 
-After starting an upload, you can track the video's status and encoding progress by polling the public `GET /video/:permlink` endpoint. Extract the `permlink` from the embed URL returned in the `X-Embed-URL` header.
+After starting an upload, you can track the video's status and encoding progress by polling the public `GET /video/:permlink` endpoint. Use the `permlink` returned by the token request (or extract it from the embed URL).
 
 **Key fields to monitor:**
 

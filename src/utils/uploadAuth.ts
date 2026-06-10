@@ -84,7 +84,11 @@ export async function validateUploadAuth(
   }
 
   const owner = tokenClaims?.owner || metadata?.owner || metadata?.username || 'unknown';
-  const permlink = metadata?.permlink || generateVideoId();
+  // Prefer the permlink bound to the upload token so the video row matches the
+  // embed URL the client was handed at token issuance. Falls back to a
+  // client-supplied metadata permlink, then a freshly generated id (API-key /
+  // legacy-token callers that predate token-bound permlinks).
+  const permlink = tokenClaims?.permlink || metadata?.permlink || generateVideoId();
   const frontend_app = tokenClaims?.app || metadata?.frontend_app || 'unknown';
   const short = tokenClaims ? tokenClaims.short : metadata?.short === 'true';
   const originalFilename = metadata?.filename || null;

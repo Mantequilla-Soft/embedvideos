@@ -15,6 +15,14 @@ export interface UploadTokenClaims {
   maxFileSize: number;
   /** Allowed CORS origins */
   allowedOrigins: string[];
+  /**
+   * Video permlink assigned at token issuance. Binding the permlink to the
+   * token lets the client know the embed URL before uploading a single byte,
+   * so success no longer depends on reading the X-Embed-URL response header
+   * (which is unreliable for parallel/Concatenation uploads). Optional for
+   * backward compatibility with tokens minted before this field existed.
+   */
+  permlink?: string;
   /** Issued at (unix seconds) */
   iat: number;
   /** Expires at (unix seconds) */
