@@ -5,7 +5,7 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
 import { startTusd } from './utils/tusd';
 import { validateUploadAuth } from './utils/uploadAuth';
 import path from 'path';
-import { unlinkSync } from 'fs';
+import { unlinkSync, statfsSync } from 'fs';
 import { Database, Encoder } from './database/mongodb';
 import { generateVideoId } from './utils/videoId';
 import { generateApiKey } from './utils/keyGenerator';
@@ -165,8 +165,24 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
   }
 });
 
-app.all('/uploads', tusProxy);
-app.all('/uploads/*', tusProxy);
+// Live count of in-flight upload byte-requests (TUS create/chunk POST+PATCH),
+// exposed via /health so the frontend can pick the least-busy server. Parallel
+// chunks mean one upload can contribute several — that's fine as a relative load
+// signal across homogeneous servers. (POST /uploads/token is handled above, so
+// it never reaches here.)
+let activeUploads = 0;
+const countUpload = (req: Request, res: Response, next: () => void) => {
+  if (req.method === 'POST' || req.method === 'PATCH') {
+    activeUploads++;
+    let done = false;
+    const finish = () => { if (done) return; done = true; activeUploads = Math.max(0, activeUploads - 1); };
+    res.once('finish', finish);
+    res.once('close', finish);
+  }
+  next();
+};
+app.all('/uploads', countUpload, tusProxy);
+app.all('/uploads/*', countUpload, tusProxy);
 
 // Hook endpoint called by tusd for pre-create and post-finish events.
 // Bound to 127.0.0.1 in tusd config — but guard here as defence-in-depth.
@@ -396,7 +412,19 @@ app.get('/', (req: Request, res: Response) => {
 
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
-  res.json({ status: 'ok', service: '3speak-video-upload' });
+  // Load signals for the frontend's least-busy endpoint selection.
+  let freeDiskPct: number | null = null;
+  try {
+    const st = statfsSync(config.uploadDir);
+    const blocks = Number(st.blocks);
+    if (blocks > 0) freeDiskPct = Math.round((Number(st.bavail) / blocks) * 100);
+  } catch { /* statfs unsupported — leave null */ }
+  res.json({
+    status: 'ok',
+    service: '3speak-video-upload',
+    activeUploads,
+    freeDiskPct,
+  });
 });
 
 // Webhook endpoint for encoder callbacks
@@ -1310,15 +1338,26 @@ async function start() {
     if (encodersToSeed.length > 0) {
       console.log(`Seeding ${encodersToSeed.length} new encoder(s) from env into DB...`);
       for (const e of encodersToSeed) {
-        await database.createEncoder({
-          name: e.name,
-          url: e.url,
-          apiKey: e.apiKey,
-          enabled: e.enabled,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        });
-        console.log(`  Seeded encoder: ${e.name}`);
+        try {
+          await database.createEncoder({
+            name: e.name,
+            url: e.url,
+            apiKey: e.apiKey,
+            enabled: e.enabled,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          });
+          console.log(`  Seeded encoder: ${e.name}`);
+        } catch (seedErr: any) {
+          // The embed-encoders `name` index is case-insensitive (collation), so an
+          // encoder can already exist under a different-cased name. Don't let a
+          // duplicate abort startup — it just means it's already registered.
+          if (seedErr?.code === 11000) {
+            console.warn(`  Encoder "${e.name}" already exists — skipping`);
+          } else {
+            throw seedErr;
+          }
+        }
       }
     }
 

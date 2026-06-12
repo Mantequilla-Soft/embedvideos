@@ -120,21 +120,38 @@ export class Database {
     this.client = new MongoClient(connectionString);
   }
 
+  // Create an index but tolerate one that already exists with different options
+  // (this DB is shared, and e.g. the embed-encoders `name` index already exists
+  // with a collation). IndexOptionsConflict (85) / IndexKeySpecsConflict (86)
+  // mean the constraint is already in place — log and continue instead of
+  // crashing startup.
+  private async ensureIndex(collection: Collection<any>, keys: any, options?: any): Promise<void> {
+    try {
+      await collection.createIndex(keys, options);
+    } catch (err: any) {
+      if (err?.code === 85 || err?.code === 86) {
+        console.warn(`[mongodb] index ${JSON.stringify(keys)} already exists with different options — keeping existing`);
+        return;
+      }
+      throw err;
+    }
+  }
+
   async connect(dbName: string, collectionName: string): Promise<void> {
     await this.client.connect();
     this.db = this.client.db(dbName);
     this.collection = this.db.collection<VideoMetadata>(collectionName);
-    
-    // Create indexes
-    await this.collection.createIndex({ permlink: 1 }, { unique: true });
+
+    // Create indexes (tolerant of pre-existing conflicting definitions)
+    await this.ensureIndex(this.collection, { permlink: 1 }, { unique: true });
 
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
-    await encodersCollection.createIndex({ name: 1 }, { unique: true });
-    await encodersCollection.createIndex({ did: 1 }, { unique: true, sparse: true });
+    await this.ensureIndex(encodersCollection, { name: 1 }, { unique: true });
+    await this.ensureIndex(encodersCollection, { did: 1 }, { unique: true, sparse: true });
 
     // Index for community job claiming (findOneAndUpdate filter)
     const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
-    await jobsCollection.createIndex({ status: 1, premium: 1, short: 1, createdAt: 1 });
+    await this.ensureIndex(jobsCollection, { status: 1, premium: 1, short: 1, createdAt: 1 });
 
     console.log('Connected to MongoDB');
   }
