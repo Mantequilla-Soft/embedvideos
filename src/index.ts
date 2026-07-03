@@ -6,7 +6,7 @@ import { startTusd } from './utils/tusd';
 import { validateUploadAuth } from './utils/uploadAuth';
 import path from 'path';
 import { unlinkSync, statfsSync } from 'fs';
-import { Database, Encoder } from './database/mongodb';
+import { Database, Encoder, JobStatus } from './database/mongodb';
 import { generateVideoId } from './utils/videoId';
 import { generateApiKey } from './utils/keyGenerator';
 import { createApiKeyMiddleware } from './middleware/auth';
@@ -869,6 +869,24 @@ app.post('/admin/jobs/:owner/:permlink/redispatch', requireAdminAuth, async (req
     });
   } catch (error) {
     console.error('Error re-dispatching job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: List jobs by status, enriched with video info (for the videofixer repair tool)
+app.get('/admin/jobs', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const status = (req.query.status as string) || 'failed';
+    const validStatuses = ['pending', 'encoding', 'completed', 'failed'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100);
+    const jobs = await database.getJobsForVideofixer(status as JobStatus, limit);
+    res.json({ jobs, count: jobs.length });
+  } catch (error) {
+    console.error('Error listing jobs for videofixer:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -90,6 +90,23 @@ export interface Encoder {
 
 export type JobStatus = 'pending' | 'encoding' | 'completed' | 'failed';
 
+export interface VideofixerJobView {
+  owner: string;
+  permlink: string;
+  status: JobStatus;
+  lastError: string | null;
+  attemptCount: number;
+  assignedWorker: string | null;
+  premium?: boolean;
+  short?: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+  webhookReceivedAt: Date | null;
+  input_cid: string | null;
+  originalFilename: string | null;
+  videoStatus: string | null;
+}
+
 export interface EncodingJob {
   owner: string;
   permlink: string;
@@ -470,6 +487,29 @@ export class Database {
       status: { $in: ['completed', 'failed'] },
       updatedAt: { $gte: since }
     }).toArray();
+  }
+
+  /**
+   * Enriched job listing for the videofixer repair tool — joins each job
+   * with its video doc so a caller can triage without extra round trips.
+   */
+  async getJobsForVideofixer(status: JobStatus, limit = 20): Promise<VideofixerJobView[]> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
+    return jobsCollection.aggregate<VideofixerJobView>([
+      { $match: { status } },
+      { $sort: { updatedAt: -1 } },
+      { $limit: limit },
+      { $lookup: { from: 'embed-video', localField: 'permlink', foreignField: 'permlink', as: 'video' } },
+      { $unwind: { path: '$video', preserveNullAndEmptyArrays: true } },
+      { $project: {
+          _id: 0, owner: 1, permlink: 1, status: 1, lastError: 1, attemptCount: 1,
+          assignedWorker: 1, premium: 1, short: 1, createdAt: 1, updatedAt: 1, webhookReceivedAt: 1,
+          input_cid: '$video.input_cid', originalFilename: '$video.originalFilename', videoStatus: '$video.status',
+        } },
+    ]).toArray();
   }
 
   // User management methods
