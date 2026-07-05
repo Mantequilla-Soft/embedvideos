@@ -18,6 +18,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "busboy": "^1.6.0",
     "cors": "^2.8.5",
     "dids": "^5.0.3",
     "dotenv": "^16.3.1",
@@ -30,6 +31,7 @@
     "nanoid": "^3.3.7"
   },
   "devDependencies": {
+    "@types/busboy": "^1.5.4",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^20.10.5",

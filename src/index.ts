@@ -4,8 +4,10 @@ import dotenv from 'dotenv';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import { startTusd } from './utils/tusd';
 import { validateUploadAuth } from './utils/uploadAuth';
+import busboy from 'busboy';
 import path from 'path';
-import { unlinkSync, statfsSync } from 'fs';
+import { unlinkSync, statfsSync, createWriteStream, promises as fsp } from 'fs';
+import { randomBytes } from 'crypto';
 import { Database, Encoder, JobStatus } from './database/mongodb';
 import { generateVideoId } from './utils/videoId';
 import { generateApiKey } from './utils/keyGenerator';
@@ -163,6 +165,375 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     console.error('Error creating upload token:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ---- Simple (non-resumable) single-request upload ---------------------------
+// Fallback for clients where the TUS PATCH flow is blocked (some mobile carriers
+// / WebViews). ONE multipart POST, whole file in the body, NO resume.
+//
+// Auth: an upload token passed as a FORM FIELD (keeps the request a plain
+// multipart POST with no custom headers -> no CORS preflight), OR an X-API-Key
+// header for server-to-server callers.
+//
+// FormData contract — the client MUST append the token/metadata fields BEFORE
+// the file part so we can authenticate as early as possible:
+//   token     upload token from POST /uploads/token   (or send X-API-Key header)
+//   filename  original filename (optional; falls back to the multipart filename)
+//   duration  seconds (optional)
+//   file      the video file — LAST part
+app.post('/upload/simple', (req: Request, res: Response) => {
+  let bb: ReturnType<typeof busboy>;
+  try {
+    bb = busboy({
+      headers: req.headers,
+      limits: { files: 1, fields: 15, fileSize: config.maxUploadSize },
+    });
+  } catch {
+    return res.status(400).json({ error: 'Expected multipart/form-data' });
+  }
+
+  const fields: Record<string, string> = {};
+  let tempPath: string | null = null;
+  let receivedSize = 0;
+  let tooBig = false;
+  let responded = false;
+  let filePromise: Promise<void> = Promise.resolve();
+
+  const cleanup = () => { if (tempPath) { try { unlinkSync(tempPath); } catch {} } };
+  const fail = (status: number, error: string) => {
+    if (responded) return;
+    responded = true;
+    cleanup();
+    res.status(status).json({ error });
+  };
+
+  bb.on('field', (name, val) => { fields[name] = val; });
+
+  bb.on('file', (_name, stream, info) => {
+    tempPath = path.join(path.resolve(config.uploadDir), `simple-${generateVideoId()}`);
+    const ws = createWriteStream(tempPath);
+    if (!fields.filename && info.filename) fields.filename = info.filename;
+    filePromise = new Promise<void>((resolve, reject) => {
+      stream.on('data', (c: Buffer) => { receivedSize += c.length; });
+      stream.on('limit', () => { tooBig = true; });   // busboy truncates at fileSize
+      stream.on('error', reject);
+      ws.on('error', reject);
+      ws.on('finish', () => resolve());
+      stream.pipe(ws);
+    });
+  });
+
+  bb.on('error', (err: unknown) =>
+    fail(400, `Upload parse error: ${err instanceof Error ? err.message : String(err)}`));
+
+  bb.on('close', async () => {
+    if (responded) return;
+    try { await filePromise; } catch { return fail(400, 'File write failed'); }
+
+    if (tooBig || receivedSize > config.maxUploadSize) {
+      return fail(413, `Video exceeds the maximum allowed size of ` +
+        `${Math.round(config.maxUploadSize / (1024 * 1024 * 1024))}GB`);
+    }
+    if (!tempPath || receivedSize === 0) return fail(400, 'No file part in request');
+
+    // Build tusd-style headers so validateUploadAuth is reused UNCHANGED.
+    const synthHeaders: Record<string, string[]> = {};
+    if (req.headers['x-api-key']) synthHeaders['x-api-key'] = [String(req.headers['x-api-key'])];
+    if (fields.token) synthHeaders['authorization'] = [`Bearer ${fields.token}`];
+    if (req.headers.origin) synthHeaders['origin'] = [String(req.headers.origin)];
+
+    const metadata: Record<string, string> = { filename: fields.filename || '' };
+    // token claims override owner/short/permlink; these are only fallbacks.
+    for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration'] as const) {
+      if (fields[k]) metadata[k] = fields[k];
+    }
+
+    const auth = await validateUploadAuth(synthHeaders, metadata, receivedSize, database, config, false);
+    if (!auth.ok) return fail(auth.status, auth.error);
+
+    const { owner, permlink, frontend_app, short, originalFilename, duration } = auth;
+
+    await database.createVideoEntry({
+      owner, permlink, frontend_app,
+      status: 'uploading',
+      input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
+      short, duration, size: receivedSize,
+      encodingProgress: 0,
+      originalFilename,
+      hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
+      embed_url: null, embed_title: null,
+      listed_on_3speak: frontend_app === '3speak-tv',
+      processed: false, processedAt: null, views: 0,
+      createdAt: new Date(), updatedAt: new Date(),
+    });
+
+    const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
+    console.log(`Simple upload received: ${owner}/${permlink} [${frontend_app}] ` +
+      `(${receivedSize} bytes) -> ${tempPath}`);
+
+    // Same async pipeline as the TUS post-finish hook: pin -> announce -> job -> cleanup.
+    const meta = { permlink, owner, short: String(short), originalFilename: originalFilename || '' };
+    const finalPath = tempPath;
+    setImmediate(() => {
+      processUploadAsync(finalPath, meta, receivedSize, database, config)
+        .catch((err: Error) => console.error('simple-upload async error:', err));
+    });
+
+    responded = true;
+    res.status(201).json({ success: true, embed_url: embedUrl, permlink, owner });
+  });
+
+  req.on('aborted', () => fail(499, 'client aborted'));
+  req.pipe(bb);
+});
+
+// ---- Chunked (resumable, parallel, no-PATCH) upload -------------------------
+// Resumable fallback for clients where the TUS PATCH flow is blocked but the
+// upload still needs to survive drops (unlike /upload/simple, which restarts
+// from 0). Every request is a plain multipart POST — no PATCH, and with no
+// custom request headers it stays CORS-preflight-free:
+//   POST /upload/chunk/create  {token, filename, duration, size, chunkSize}
+//        -> {sessionId, chunkSize, totalChunks, received:[], embed_url, permlink}
+//   POST /upload/chunk         {sessionId, index, chunk}   -> {index, receivedBytes, size, complete}
+//   POST /upload/chunk/status  {sessionId}                 -> {chunkSize, totalChunks, receivedBytes, size, received:[], finished}
+//   POST /upload/chunk/finish  {sessionId}                 -> {success, embed_url, permlink}
+//
+// Chunks are INDEX-addressed, so they can arrive out of order and in PARALLEL:
+// the server pre-sizes the temp file at create and does a positioned write for
+// each chunk, tracking a received-index set. The single-use token is consumed
+// once at create; later requests are authed by the server-minted sessionId.
+// Resume: re-query /status, re-send the indices not in `received`. Sessions live
+// in memory on this host (the fallback is pinned to one host) and survive network
+// drops; they're reaped after CHUNK_SESSION_TTL_MS.
+interface ChunkSession {
+  owner: string;
+  permlink: string;
+  short: boolean;
+  originalFilename: string | null;
+  totalSize: number;
+  chunkSize: number;
+  totalChunks: number;
+  received: Set<number>;
+  receivedBytes: number;
+  tempPath: string;
+  finished: boolean;
+  updatedAt: number;
+}
+const chunkSessions = new Map<string, ChunkSession>();
+const CHUNK_PART_MAX = 64 * 1024 * 1024;            // hard ceiling for one chunk request body
+const CHUNK_MIN_SIZE = 256 * 1024;                  // smallest agreed chunkSize
+const CHUNK_MAX_COUNT = 100_000;                    // sanity cap on totalChunks
+const CHUNK_SESSION_TTL_MS = 2 * 60 * 60 * 1000;    // idle-session lifetime before reap
+
+const chunkReaper = setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of chunkSessions) {
+    if (now - s.updatedAt > CHUNK_SESSION_TTL_MS) {
+      chunkSessions.delete(id);
+      try { unlinkSync(s.tempPath); } catch { /* already gone */ }
+      if (!s.finished) database.updateVideoStatus(s.permlink, 'failed', { encodingProgress: 0 }).catch(() => {});
+      console.warn(`Chunked session reaped (idle): ${s.owner}/${s.permlink} at ${s.receivedBytes}/${s.totalSize}`);
+    }
+  }
+}, 10 * 60 * 1000);
+if (typeof chunkReaper.unref === 'function') chunkReaper.unref();
+
+// Parse a small multipart request: all fields, plus (optionally) ONE file part
+// buffered in memory (bounded by CHUNK_PART_MAX). Chunk bodies are small by design.
+function parseChunkRequest(
+  req: Request,
+  withFile: boolean
+): Promise<{ fields: Record<string, string>; fileBuf: Buffer | null }> {
+  return new Promise((resolve, reject) => {
+    let bb: ReturnType<typeof busboy>;
+    try {
+      bb = busboy({ headers: req.headers, limits: { files: withFile ? 1 : 0, fields: 15, fileSize: CHUNK_PART_MAX } });
+    } catch {
+      return reject(Object.assign(new Error('Expected multipart/form-data'), { status: 400 }));
+    }
+    const fields: Record<string, string> = {};
+    const parts: Buffer[] = [];
+    let tooBig = false;
+    bb.on('field', (name: string, val: string) => { fields[name] = val; });
+    bb.on('file', (_name: string, stream: NodeJS.ReadableStream) => {
+      stream.on('data', (c: Buffer) => parts.push(c));
+      stream.on('limit', () => { tooBig = true; });
+      stream.on('error', (e: Error) => reject(Object.assign(e, { status: 400 })));
+    });
+    bb.on('error', (e: unknown) =>
+      reject(Object.assign(new Error(e instanceof Error ? e.message : String(e)), { status: 400 })));
+    bb.on('close', () => {
+      if (tooBig) return reject(Object.assign(new Error(`Chunk exceeds ${CHUNK_PART_MAX} bytes`), { status: 413 }));
+      resolve({ fields, fileBuf: parts.length ? Buffer.concat(parts) : null });
+    });
+    req.on('aborted', () => reject(Object.assign(new Error('client aborted'), { status: 499 })));
+    req.pipe(bb);
+  });
+}
+
+app.post('/upload/chunk/create', async (req: Request, res: Response) => {
+  let fields: Record<string, string>;
+  try { ({ fields } = await parseChunkRequest(req, false)); }
+  catch (e) { return res.status((e as any)?.status || 400).json({ error: (e as any)?.message || 'Bad request' }); }
+
+  const totalSize = parseInt(fields.size || '0', 10);
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    return res.status(400).json({ error: 'size (total bytes) is required' });
+  }
+  if (totalSize > config.maxUploadSize) {
+    return res.status(413).json({ error: `Video exceeds the maximum allowed size of ${Math.round(config.maxUploadSize / (1024 * 1024 * 1024))}GB` });
+  }
+  const chunkSize = parseInt(fields.chunkSize || '0', 10);
+  if (!Number.isFinite(chunkSize) || chunkSize < CHUNK_MIN_SIZE || chunkSize > CHUNK_PART_MAX) {
+    return res.status(400).json({ error: `chunkSize must be between ${CHUNK_MIN_SIZE} and ${CHUNK_PART_MAX} bytes` });
+  }
+  const totalChunks = Math.ceil(totalSize / chunkSize);
+  if (totalChunks > CHUNK_MAX_COUNT) {
+    return res.status(400).json({ error: 'chunkSize too small for this file (too many chunks)' });
+  }
+
+  const synthHeaders: Record<string, string[]> = {};
+  if (req.headers['x-api-key']) synthHeaders['x-api-key'] = [String(req.headers['x-api-key'])];
+  if (fields.token) synthHeaders['authorization'] = [`Bearer ${fields.token}`];
+  if (req.headers.origin) synthHeaders['origin'] = [String(req.headers.origin)];
+
+  const metadata: Record<string, string> = { filename: fields.filename || '' };
+  for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration'] as const) {
+    if (fields[k]) metadata[k] = fields[k];
+  }
+
+  const auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
+  if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+  const { owner, permlink, frontend_app, short, originalFilename, duration } = auth;
+
+  await database.createVideoEntry({
+    owner, permlink, frontend_app,
+    status: 'uploading',
+    input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
+    short, duration, size: totalSize,
+    encodingProgress: 0,
+    originalFilename,
+    hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
+    embed_url: null, embed_title: null,
+    listed_on_3speak: frontend_app === '3speak-tv',
+    processed: false, processedAt: null, views: 0,
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+
+  const tempPath = path.join(path.resolve(config.uploadDir), `chunked-${generateVideoId()}`);
+  // Pre-size the file (sparse) so out-of-order positioned writes always land in range.
+  try {
+    const fd = await fsp.open(tempPath, 'w');
+    try { await fd.truncate(totalSize); } finally { await fd.close(); }
+  } catch (err) {
+    console.error(`Failed to allocate chunked temp file for ${owner}/${permlink}:`, err);
+    return res.status(500).json({ error: 'Failed to allocate upload storage' });
+  }
+
+  const sessionId = randomBytes(24).toString('hex');
+  chunkSessions.set(sessionId, {
+    owner, permlink, short, originalFilename,
+    totalSize, chunkSize, totalChunks,
+    received: new Set<number>(), receivedBytes: 0,
+    tempPath, finished: false, updatedAt: Date.now(),
+  });
+
+  const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
+  console.log(`Chunked upload session created: ${owner}/${permlink} [${frontend_app}] (${totalSize} bytes, ${totalChunks}x${chunkSize})`);
+  res.status(201).json({ success: true, sessionId, chunkSize, totalChunks, received: [], permlink, owner, embed_url: embedUrl });
+});
+
+app.post('/upload/chunk/status', async (req: Request, res: Response) => {
+  let fields: Record<string, string>;
+  try { ({ fields } = await parseChunkRequest(req, false)); }
+  catch (e) { return res.status((e as any)?.status || 400).json({ error: (e as any)?.message || 'Bad request' }); }
+  const s = chunkSessions.get(fields.sessionId || '');
+  if (!s) return res.status(404).json({ error: 'Unknown or expired session' });
+  res.json({
+    chunkSize: s.chunkSize, totalChunks: s.totalChunks,
+    receivedBytes: s.receivedBytes, size: s.totalSize,
+    received: Array.from(s.received), finished: s.finished,
+  });
+});
+
+app.post('/upload/chunk', async (req: Request, res: Response) => {
+  let fields: Record<string, string>;
+  let fileBuf: Buffer | null;
+  try { ({ fields, fileBuf } = await parseChunkRequest(req, true)); }
+  catch (e) { return res.status((e as any)?.status || 400).json({ error: (e as any)?.message || 'Bad request' }); }
+
+  const s = chunkSessions.get(fields.sessionId || '');
+  if (!s) return res.status(404).json({ error: 'Unknown or expired session' });
+  if (s.finished) return res.status(409).json({ error: 'Session already finished' });
+  if (!fileBuf || fileBuf.length === 0) return res.status(400).json({ error: 'No chunk data' });
+
+  const index = parseInt(fields.index ?? '-1', 10);
+  if (!Number.isInteger(index) || index < 0 || index >= s.totalChunks) {
+    return res.status(400).json({ error: `index out of range (0..${s.totalChunks - 1})` });
+  }
+  // Last chunk is the remainder; every other chunk must be exactly chunkSize.
+  const expectedLen = index === s.totalChunks - 1
+    ? s.totalSize - s.chunkSize * (s.totalChunks - 1)
+    : s.chunkSize;
+  if (fileBuf.length !== expectedLen) {
+    return res.status(400).json({ error: `chunk ${index} must be ${expectedLen} bytes, got ${fileBuf.length}` });
+  }
+  // Already have it (a retried chunk whose ack was lost) — idempotent success.
+  if (s.received.has(index)) {
+    return res.json({ index, receivedBytes: s.receivedBytes, size: s.totalSize, complete: s.received.size === s.totalChunks });
+  }
+
+  try {
+    // Positioned write into the pre-sized file — disjoint regions, so concurrent
+    // chunk writes never collide. Own fd per request to avoid shared-fd races.
+    const fd = await fsp.open(s.tempPath, 'r+');
+    try { await fd.write(fileBuf, 0, fileBuf.length, index * s.chunkSize); }
+    finally { await fd.close(); }
+    // Count once even under a same-index double-send: the add() from whichever
+    // handler ran first makes has(index) true for the other before it counts.
+    if (!s.received.has(index)) {
+      s.received.add(index);
+      s.receivedBytes += fileBuf.length;
+    }
+    s.updatedAt = Date.now();
+    res.json({ index, receivedBytes: s.receivedBytes, size: s.totalSize, complete: s.received.size === s.totalChunks });
+  } catch (err) {
+    console.error(`Chunk ${index} write failed for ${s.owner}/${s.permlink}:`, err);
+    res.status(500).json({ error: 'Chunk write failed' });
+  }
+});
+
+app.post('/upload/chunk/finish', async (req: Request, res: Response) => {
+  let fields: Record<string, string>;
+  try { ({ fields } = await parseChunkRequest(req, false)); }
+  catch (e) { return res.status((e as any)?.status || 400).json({ error: (e as any)?.message || 'Bad request' }); }
+
+  const s = chunkSessions.get(fields.sessionId || '');
+  if (!s) return res.status(404).json({ error: 'Unknown or expired session' });
+
+  const embedUrl = `${config.baseUrl}?v=${s.owner}/${s.permlink}`;
+  if (s.finished) return res.json({ success: true, embed_url: embedUrl, permlink: s.permlink, owner: s.owner });
+  if (s.received.size !== s.totalChunks || s.receivedBytes !== s.totalSize) {
+    return res.status(400).json({
+      error: `Upload incomplete: ${s.received.size}/${s.totalChunks} chunks (${s.receivedBytes}/${s.totalSize} bytes)`,
+      received: Array.from(s.received),
+    });
+  }
+
+  s.finished = true;
+  chunkSessions.delete(fields.sessionId || '');
+  console.log(`Chunked upload finished: ${s.owner}/${s.permlink} (${s.totalSize} bytes) -> ${s.tempPath}`);
+
+  // Same async pipeline as the TUS post-finish hook: pin -> announce -> job -> cleanup.
+  const meta = { permlink: s.permlink, owner: s.owner, short: String(s.short), originalFilename: s.originalFilename || '' };
+  const finalPath = s.tempPath;
+  const size = s.totalSize;
+  setImmediate(() => {
+    processUploadAsync(finalPath, meta, size, database, config)
+      .catch((err: Error) => console.error('chunked-upload async error:', err));
+  });
+
+  res.status(201).json({ success: true, embed_url: embedUrl, permlink: s.permlink, owner: s.owner });
 });
 
 // Live count of in-flight upload byte-requests (TUS create/chunk POST+PATCH),
