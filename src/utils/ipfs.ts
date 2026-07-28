@@ -160,7 +160,10 @@ async function unpinFromIpfs(apiUrl: string, cid: string): Promise<void> {
 
 async function provideDHT(apiUrl: string, cid: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const url = new URL(`${apiUrl}/api/v0/dht/provide?arg=${cid}`);
+    // Kubo removed /api/v0/dht/provide; the replacement is /api/v0/routing/provide
+    // ("ipfs routing provide"). Old endpoint now 500s with "removed, use 'ipfs
+    // routing' instead", which broke DHT announce for every upload.
+    const url = new URL(`${apiUrl}/api/v0/routing/provide?arg=${cid}`);
     const isHttps = url.protocol === 'https:';
     const client = isHttps ? https : http;
     

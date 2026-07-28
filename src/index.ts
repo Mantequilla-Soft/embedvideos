@@ -864,6 +864,15 @@ app.post('/webhook', async (req: Request, res: Response) => {
         // Continue despite unpin failure
       }
 
+      // If this upload exists only to replace another video's media, hand its
+      // freshly-encoded manifest over to the original row now. Best-effort: the
+      // encode itself succeeded, so a failure here must not fail the webhook.
+      try {
+        await applyPendingReplacement(permlink);
+      } catch (replErr) {
+        console.error(`Failed to apply pending replacement for ${permlink}:`, replErr);
+      }
+
       console.log(`Video encoding completed: ${owner}/${permlink} - Manifest: ${manifest_cid}`);
       res.json({ success: true, message: 'Webhook processed successfully' });
     } else if (status === 'failed') {
@@ -1173,6 +1182,135 @@ app.post('/video/:permlink/thumbnail', requireApiKey, async (req: Request, res: 
     res.json({ success: true, thumbnail_url });
   } catch (error) {
     console.error('Error updating thumbnail:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Copy a finished replacement's media onto the video it was uploaded to replace.
+ *
+ * Runs when the NEW asset finishes encoding. The original row keeps everything
+ * that identifies it (permlink, owner, createdAt, views, hive_* association) and
+ * only its media pointer moves, so the video keeps its place in every feed and
+ * the Hive post never has to change.
+ *
+ * The old manifest is preserved in `previousManifestCid` rather than discarded:
+ * it makes the swap reversible and leaves the superseded media identifiable for
+ * later unpinning. Safe to call twice — `replacementApplied` makes it a no-op.
+ */
+async function applyPendingReplacement(newPermlink: string): Promise<void> {
+  const incoming = await database.getVideo(newPermlink);
+  if (!incoming?.replacesPermlink || incoming.replacementApplied) return;
+  if (!incoming.manifest_cid) return; // not encoded yet — nothing to copy
+
+  const target = await database.getVideo(incoming.replacesPermlink);
+  if (!target) {
+    console.warn(`Replacement ${newPermlink}: original ${incoming.replacesPermlink} is gone — skipping`);
+    return;
+  }
+
+  await database.updateVideoStatus(target.permlink, 'published', {
+    manifest_cid: incoming.manifest_cid,
+    previousManifestCid: target.manifest_cid ?? null,
+    mediaUpdatedAt: new Date(),
+    encodingProgress: 100,
+    // Carry across the properties that describe the FILE. Everything else —
+    // title, tags, hive_*, createdAt, views — belongs to the original and must
+    // not be touched.
+    duration: incoming.duration ?? target.duration,
+    size: incoming.size ?? target.size,
+    originalFilename: incoming.originalFilename ?? target.originalFilename,
+  } as any);
+
+  await database.updateVideoStatus(newPermlink, incoming.status, {
+    replacementApplied: true,
+    replaced: true,
+    replacedAt: new Date(),
+    replacedBy: target.permlink,
+  } as any);
+
+  console.log(
+    `Media replaced for ${target.owner}/${target.permlink}: ` +
+    `${target.manifest_cid ?? 'none'} -> ${incoming.manifest_cid} (via ${newPermlink})`
+  );
+}
+
+// Apply any replacement that finished encoding but never got swapped in.
+//
+// The completion webhook is delivered to WEBHOOK_URL (embed.3speak.tv), which is
+// a SEPARATE deployment from whichever host accepted the upload — so the handler
+// that applies the swap may never run on the host that registered it. This
+// sweeper closes that gap: it works off the shared database, so it does not care
+// which host published the asset, and it also recovers a webhook that was lost.
+const REPLACEMENT_SWEEP_MS = 30_000;
+setInterval(async () => {
+  try {
+    const pending = await database.getPendingReplacements();
+    for (const v of pending) {
+      try {
+        await applyPendingReplacement(v.permlink);
+      } catch (err) {
+        console.error(`Replacement sweep: failed to apply ${v.permlink}:`, err);
+      }
+    }
+  } catch (err) {
+    // Never let a sweep failure take the process down.
+    console.error('Replacement sweep failed:', err);
+  }
+}, REPLACEMENT_SWEEP_MS).unref?.();
+
+// Register a freshly-uploaded asset as the replacement for an existing video.
+//
+// Called right after the new file is uploaded, with `:permlink` = the NEW asset
+// and `replaces` = the ORIGINAL. Nothing swaps yet: the new asset still has to
+// encode. When its webhook reports `complete`, the completion handler copies its
+// manifest onto the original row (see applyPendingReplacement).
+//
+// Doing it this way — rather than repointing the Hive post at a new asset —
+// keeps the original row's permlink, createdAt, views and Hive association, so
+// the video holds its place in every feed and no on-chain edit is needed.
+app.post('/video/:permlink/replaces', requireApiKey, async (req: Request, res: Response) => {
+  try {
+    const { permlink } = req.params;          // the NEW asset
+    const { replaces } = req.body ?? {};      // the ORIGINAL permlink
+
+    if (!replaces || typeof replaces !== 'string') {
+      return res.status(400).json({ error: 'replaces (original permlink) is required' });
+    }
+    if (replaces === permlink) {
+      return res.status(400).json({ error: 'A video cannot replace itself' });
+    }
+
+    const [incoming, target] = await Promise.all([
+      database.getVideo(permlink),
+      database.getVideo(replaces),
+    ]);
+    if (!incoming) return res.status(404).json({ error: 'Replacement video not found' });
+    if (!target) return res.status(404).json({ error: 'Original video not found' });
+    // Only the same account may swap its own media.
+    if (incoming.owner !== target.owner) {
+      return res.status(403).json({ error: 'Both videos must belong to the same owner' });
+    }
+
+    await database.updateVideoStatus(permlink, incoming.status, {
+      replacesPermlink: replaces,
+      replacementApplied: false,
+      // The replacement is a carrier for media, not a video in its own right —
+      // keep it out of listings so it never shows up as a duplicate upload.
+      listed_on_3speak: false,
+    } as any);
+
+    // Already encoded (e.g. a re-registration after the fact)? Swap immediately
+    // rather than waiting for a webhook that has already been and gone.
+    if (incoming.status === 'published' && incoming.manifest_cid) {
+      await applyPendingReplacement(permlink);
+      return res.json({ success: true, permlink, replaces, applied: true });
+    }
+
+    console.log(`Replacement registered: ${permlink} will replace ${target.owner}/${replaces} once encoded`);
+    res.json({ success: true, permlink, replaces, applied: false });
+  } catch (error) {
+    console.error('Error registering replacement:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

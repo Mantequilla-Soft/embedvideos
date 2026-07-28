@@ -29,6 +29,42 @@ export interface VideoMetadata {
   views: number;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * Set when an author replaced the video file on the Hive post that used to
+   * point at this asset. There is no in-place media swap (this collection is
+   * insert-only and embed-jobs has a unique {owner,permlink} index), so a
+   * replacement is always a NEW row and this one is left orphaned.
+   *
+   * Deliberately NOT a `status` value: the media here is still valid and
+   * playable, so any embed already pointing at this URL keeps working. This
+   * only records that nothing on-chain references it any more.
+   */
+  replaced?: boolean;
+  replacedAt?: Date;
+  /** Permlink of the asset that superseded this one, when known. */
+  replacedBy?: string | null;
+
+  // --- In-place media replacement -------------------------------------------
+  // Swapping a video's FILE without touching its Hive post or its position in
+  // any feed. A replacement is uploaded as a normal new asset (it has to be:
+  // this collection is insert-only and embed-jobs has a unique {owner,permlink}
+  // index, so re-uploading onto an existing permlink cannot work). Once that new
+  // asset finishes ENCODING, its manifest is copied onto the original row.
+  //
+  // The original row is what every consumer already points at, so its permlink,
+  // createdAt, views, hive_author/hive_permlink and feed position all survive —
+  // which is the whole point. Nothing on-chain changes.
+
+  /** On the NEW asset: the ORIGINAL permlink whose media it will replace. */
+  replacesPermlink?: string | null;
+  /** On the NEW asset: set once its manifest has been copied across. */
+  replacementApplied?: boolean;
+  /** On the ORIGINAL row: the manifest it served before the swap (kept so the
+   *  old media stays identifiable for unpinning, and the swap is reversible). */
+  previousManifestCid?: string | null;
+  /** On the ORIGINAL row: when its media was last swapped. Also a cache-busting
+   *  signal for anything holding a resolved URL for this permlink. */
+  mediaUpdatedAt?: Date;
 }
 
 export interface User {
@@ -192,6 +228,29 @@ export class Database {
       { permlink },
       { $set: { status, updatedAt: new Date(), ...additionalData } }
     );
+  }
+
+  /**
+   * Replacements that have finished encoding but whose media has not yet been
+   * copied onto the video they replace.
+   *
+   * Needed because encode-completion webhooks are delivered to WEBHOOK_URL
+   * (embed.3speak.tv), which is a different deployment from the host that
+   * accepted the upload — so the completion handler that would apply the swap
+   * may never run here. A sweeper picks these up regardless of which host
+   * published them, and also covers a webhook that was simply lost.
+   */
+  async getPendingReplacements(limit = 25): Promise<VideoMetadata[]> {
+    if (!this.collection) throw new Error('Database not connected');
+    return this.collection
+      .find({
+        replacesPermlink: { $exists: true, $ne: null },
+        replacementApplied: { $ne: true },
+        status: 'published',
+        manifest_cid: { $exists: true, $ne: null },
+      } as any)
+      .limit(limit)
+      .toArray();
   }
 
   async getVideo(permlink: string): Promise<VideoMetadata | null> {
