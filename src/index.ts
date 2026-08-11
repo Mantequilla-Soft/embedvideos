@@ -1330,6 +1330,38 @@ app.post('/video/:permlink/hive', requireApiKey, async (req: Request, res: Respo
       return res.status(404).json({ error: 'Video not found' });
     }
 
+    // An asset belongs to exactly ONE Hive post, so only bind while the slot is
+    // still empty. Pasting the same play.3speak.tv/embed URL into a SECOND post
+    // (e.g. an Ecency wave re-sharing a video already published to a community)
+    // used to repoint the asset at whichever post called last. That rebind is
+    // destructive and, worse, partial: hive_permlink/embed_url/hive_tags are
+    // overwritten while hive_title survives (waves carry an empty on-chain
+    // title, so the `hive_title ?` guard below skips it) and `category` survives
+    // because it is owned by the checker's embedCategorySync, which resolves it
+    // from hive_permlink and then never revisits a doc that already has one.
+    // The result was a doc pointing at a Town Square wave while still labelled
+    // with the original community, so the watch page and the community feeds
+    // disagreed about where the video lives.
+    //
+    // Re-linking to the SAME post still falls through, so client retries stay
+    // idempotent. A conflicting claim is a no-op, not an error: this endpoint is
+    // called after the post is already broadcast, so failing it would report a
+    // problem for a post that actually succeeded.
+    if (video.hive_permlink && video.hive_permlink !== hive_permlink) {
+      console.warn(
+        `Hive link SKIPPED for ${video.owner}/${permlink}: already linked to ` +
+        `@${video.hive_author}/${video.hive_permlink}, refused rebind to ` +
+        `@${hive_author}/${hive_permlink}`
+      );
+      return res.json({
+        success: true,
+        permlink,
+        relinked: false,
+        hive_author: video.hive_author,
+        hive_permlink: video.hive_permlink,
+      });
+    }
+
     await database.updateVideoStatus(permlink, video.status, {
       hive_author,
       hive_permlink,
