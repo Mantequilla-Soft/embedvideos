@@ -9,6 +9,8 @@ export interface AuthSuccess {
   permlink: string;
   frontend_app: string;
   short: boolean;
+  /** 🔐 Gated (paid) content. Only ever true via a signed upload token claim. */
+  gated: boolean;
   originalFilename: string | null;
   duration: number | null;
   size: number | null;
@@ -91,6 +93,12 @@ export async function validateUploadAuth(
   const permlink = tokenClaims?.permlink || metadata?.permlink || generateVideoId();
   const frontend_app = tokenClaims?.app || metadata?.frontend_app || 'unknown';
   const short = tokenClaims ? tokenClaims.short : metadata?.short === 'true';
+  // 🔐 Read from the signed claim ONLY. Unlike `short`, there is no metadata
+  // fallback: the embed API key ships inside browser bundles, so an API-key
+  // caller is not a trusted party and must not be able to declare its own
+  // upload paid. Gated uploads therefore require a token minted by
+  // POST /uploads/token, which checks 3Speak Pro status first.
+  const gated = tokenClaims?.gated === true;
   const originalFilename = metadata?.filename || null;
   const duration = metadata?.duration ? parseFloat(metadata.duration) : null;
   const size = uploadSize || null;
@@ -128,5 +136,5 @@ export async function validateUploadAuth(
     }
   }
 
-  return { ok: true, owner, permlink, frontend_app, short, originalFilename, duration, size };
+  return { ok: true, owner, permlink, frontend_app, short, gated, originalFilename, duration, size };
 }

@@ -16,6 +16,14 @@ export interface VideoMetadata {
   size: number | null;
   encodingProgress: number;
   originalFilename: string | null;
+  /**
+   * Gated (paid) content: renditions are AES-128 encrypted at encode time and
+   * only 3speak-gate can hand a viewer the key. Dispatch is restricted to
+   * trusted encoders.
+   */
+  gated?: boolean;
+  /** Video id the gate knows this asset by. Defaults to the permlink. */
+  gate_video_id?: string | null;
   hive_author: string | null;
   hive_permlink: string | null;
   hive_title: string | null;
@@ -112,6 +120,19 @@ export interface Encoder {
   access?: EncoderAccess;
   tier?: EncoderTier;
   maxFileSize?: number | null;
+  /**
+   * Cleared for gated (paid) content. Absent or false means this encoder never
+   * receives a gated job.
+   *
+   * This is not about key handling. An encoder cannot transcode what it cannot
+   * read, so it necessarily holds the plaintext source of every video it
+   * touches. Trust here means "we operate this machine", nothing weaker.
+   *
+   * Only settable through the admin API. `upsertCommunityEncoder` writes a
+   * fixed field whitelist, so a self-registering community node cannot grant
+   * itself this flag.
+   */
+  trusted?: boolean;
   // Community encoder fields
   did?: string;
   displayName?: string;
@@ -160,6 +181,10 @@ export interface EncodingJob {
   premium?: boolean;
   short?: boolean;
   fileSize?: number | null;
+  /** Gated (paid) content. Restricts dispatch to trusted encoders. */
+  gated?: boolean;
+  /** Video id the gate knows this asset by; passed through to the encoder. */
+  gateVideoId?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -764,6 +789,14 @@ export class Database {
       status: 'pending',
       premium: false,
       short: false,
+      // Gated (paid) work never reaches a community node. Note this uses
+      // $ne rather than an explicit `false` like the two above: `gated` is a
+      // new field, so every pre-existing pending job lacks it, and demanding
+      // `gated: false` would strand all of them. Absence means "not gated",
+      // which is the safe reading for a field that did not exist before.
+      // The myJob handler re-checks the video after claiming, so a job that
+      // somehow missed this denormalisation still cannot leak.
+      gated: { $ne: true },
     };
 
     // Capped encoders only claim jobs with known size within bounds
