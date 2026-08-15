@@ -11,6 +11,25 @@ export interface UploadTokenClaims {
   issuedByKey: string;
   /** Short-form video flag */
   short: boolean;
+  /**
+   * 🔐 Gated (paid) content flag.
+   *
+   * Only ever set here, in a signed claim, and only after the issuer has
+   * confirmed the owner is a 3Speak Pro user. It is deliberately NOT readable
+   * from TUS metadata: that is client-supplied, and the embed API key travels
+   * in browser bundles, so metadata cannot be trusted to decide whether content
+   * is paid.
+   */
+  gated?: boolean;
+  /**
+   * Named accounts that may watch this gated video without 3Speak Pro.
+   *
+   * Carried in the signed claim for the same reason as `gated`: it is an
+   * authorisation input, and the embed API key ships in browser bundles, so an
+   * API-key caller cannot be trusted to name its own guests. Never written to
+   * the Hive post, so the recipient list is not published on-chain.
+   */
+  allowlist?: string[];
   /** Max upload size in bytes */
   maxFileSize: number;
   /** Allowed CORS origins */

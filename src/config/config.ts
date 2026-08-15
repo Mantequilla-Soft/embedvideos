@@ -39,6 +39,15 @@ export interface Config {
   // one instance dispatches encoder jobs (the dispatch path is not atomic across
   // instances, so two pollers can double-dispatch the same job).
   dispatcherEnabled: boolean;
+  // 🔐 3speak-gate: entitlement and content-key service for gated (paid)
+  // content. When gateUrl is empty, gated uploads are refused at token
+  // issuance, because a gated video nobody can register is a video nobody can
+  // ever play.
+  gateUrl: string;
+  gateInternalApiKey: string;
+  // CDN base the gate fetches encrypted manifests from. Must be a host in the
+  // gate's own GATE_UPSTREAM_HOSTS allowlist or registration is rejected.
+  gateCdnBase: string;
 }
 
 function parseEncoders(): EncoderConfig[] {
@@ -98,5 +107,8 @@ export function loadConfig(): Config {
     uploadTokenMaxFileSize: parseInt(process.env.UPLOAD_TOKEN_MAX_FILE_SIZE || String(1024 * 1024 * 1024), 10),
     maxUploadSize: parseInt(process.env.MAX_UPLOAD_SIZE || String(5 * 1024 * 1024 * 1024), 10),
     dispatcherEnabled: process.env.DISPATCHER_ENABLED !== 'false',
+    gateUrl: process.env.GATE_URL || '',
+    gateInternalApiKey: process.env.GATE_INTERNAL_API_KEY || '',
+    gateCdnBase: process.env.GATE_CDN_BASE || 'https://ipfs.3speak.tv/ipfs',
   };
 }

@@ -19,6 +19,7 @@ import { JobDispatcher } from './dispatcher/jobDispatcher';
 import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
 import { signUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
+import { registerGatedVideo, isGateConfigured } from './utils/gate';
 
 dotenv.config();
 
@@ -110,10 +111,53 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       });
     }
 
-    const { owner, frontend_app, short = false, allowed_origins = [], max_file_size, ttl } = req.body;
+    const { owner, frontend_app, short = false, gated = false, allowlist, allowed_origins = [], max_file_size, ttl } = req.body;
 
     if (!owner || typeof owner !== 'string') {
       return res.status(422).json({ error: 'owner (string) is required' });
+    }
+
+    // 🔐 Gated (paid) uploads are a 3Speak Pro capability. This is the ONLY
+    // place the gated flag can be granted, because it is the only place with a
+    // verified owner and a signing key. Everything downstream reads it from the
+    // signed claim rather than from client-supplied metadata.
+    if (gated) {
+      if (typeof gated !== 'boolean') {
+        return res.status(422).json({ error: 'gated must be a boolean' });
+      }
+      // Refuse up front rather than accepting an upload that can never be
+      // played: without a gate, the finished video has nowhere to register and
+      // no viewer, creator included, can ever obtain a key for it.
+      if (!isGateConfigured(config)) {
+        console.error('Gated upload requested but GATE_URL / GATE_INTERNAL_API_KEY are not set');
+        return res.status(503).json({
+          error: 'Gated uploads are not available on this instance',
+          code: 'gate_not_configured',
+        });
+      }
+      // Guest list: named accounts that watch without Pro. Validated here, the
+      // one place with a verified owner and a signing key. Never written to the
+      // Hive post, so the recipient list is not published on-chain.
+      if (allowlist !== undefined) {
+        if (!Array.isArray(allowlist) || allowlist.length > 500) {
+          return res.status(422).json({ error: 'allowlist must be an array of at most 500 usernames' });
+        }
+        const bad = allowlist.find(
+          (u: unknown) => typeof u !== 'string' || !/^[a-z][a-z0-9.-]{2,15}$/.test(String(u).trim().toLowerCase().replace(/^@/, ''))
+        );
+        if (bad !== undefined) {
+          return res.status(422).json({ error: `"${bad}" is not a valid Hive account name` });
+        }
+      }
+
+      const isPro = await database.isUserPremium(owner);
+      if (!isPro) {
+        console.warn(`Gated upload token refused for non-Pro user: ${owner}`);
+        return res.status(403).json({
+          error: 'Gated uploads require 3Speak Pro',
+          code: 'pro_required',
+        });
+      }
     }
 
     const tokenTtl = Math.min(
@@ -140,6 +184,10 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       app: frontend_app || apiKeyData?.app_name || 'unknown',
       issuedByKey: apiKeyData?.app_name || 'unknown',
       short: !!short,
+      gated: !!gated,
+      ...(gated && Array.isArray(allowlist) && allowlist.length
+        ? { allowlist: [...new Set(allowlist.map((u: string) => String(u).trim().toLowerCase().replace(/^@/, '')))] }
+        : {}),
       maxFileSize,
       allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
       permlink,
@@ -160,6 +208,10 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       permlink,
       embed_url: embedUrl,
       expires_at: expiresAt,
+      // Echoed back so a client can confirm the flag was honoured. An instance
+      // running older code simply omits this, which lets the frontend refuse to
+      // upload rather than silently publishing a "paid" video in the clear.
+      gated: !!gated,
     });
   } catch (error) {
     console.error('Error creating upload token:', error);
@@ -251,13 +303,13 @@ app.post('/upload/simple', (req: Request, res: Response) => {
     const auth = await validateUploadAuth(synthHeaders, metadata, receivedSize, database, config, false);
     if (!auth.ok) return fail(auth.status, auth.error);
 
-    const { owner, permlink, frontend_app, short, originalFilename, duration } = auth;
+    const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration } = auth;
 
     await database.createVideoEntry({
       owner, permlink, frontend_app,
       status: 'uploading',
       input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-      short, duration, size: receivedSize,
+      short, gated, gate_video_id: gated ? permlink : null, allowlist, duration, size: receivedSize,
       encodingProgress: 0,
       originalFilename,
       hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -404,13 +456,13 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
 
   const auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
   if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
-  const { owner, permlink, frontend_app, short, originalFilename, duration } = auth;
+  const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration } = auth;
 
   await database.createVideoEntry({
     owner, permlink, frontend_app,
     status: 'uploading',
     input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-    short, duration, size: totalSize,
+    short, gated, gate_video_id: gated ? permlink : null, allowlist, duration, size: totalSize,
     encodingProgress: 0,
     originalFilename,
     hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -593,7 +645,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       return res.json({});
     }
 
-    const { owner, permlink, frontend_app, short, originalFilename, duration, size } = authResult;
+    const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration, size } = authResult;
 
     // Hard size cap, enforced for every upload regardless of auth method.
     // For parallel/Concatenation uploads this fires on the final concat, whose
@@ -624,6 +676,10 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       manifest_cid: null,
       thumbnail_url: null,
       short,
+      // 🔐 Gated content. The gate knows this asset by its permlink.
+      gated,
+      gate_video_id: gated ? permlink : null,
+      allowlist,
       duration,
       size,
       encodingProgress: 0,
@@ -741,6 +797,17 @@ async function processUploadAsync(
     }
 
     const premium = await db.isUserPremium(owner);
+
+    // 🔐 Denormalise the gated flag onto the job so community claiming can
+    // filter on it atomically. Read from the video document, which is the
+    // source of truth: the TUS metadata is client-supplied and must never be
+    // trusted to decide whether content is paid.
+    const videoDoc = await db.getVideo(permlink);
+    const gated = videoDoc?.gated === true;
+    if (gated) {
+      console.log(`🔐 Gated job created for ${owner}/${permlink} — trusted encoders only`);
+    }
+
     await db.createJob({
       owner,
       permlink,
@@ -756,6 +823,8 @@ async function processUploadAsync(
       premium,
       short,
       fileSize: uploadSize,
+      gated,
+      gateVideoId: videoDoc?.gate_video_id ?? permlink,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -850,6 +919,35 @@ app.post('/webhook', async (req: Request, res: Response) => {
         await database.incrementUserSuccess(owner);
       } catch (statsError) {
         console.warn(`Failed to update user success stats: ${statsError}`);
+      }
+
+      // 🔐 Register a gated video with the gate now that its manifest CID
+      // exists. Until this succeeds the gate 404s the video and nobody can play
+      // it, including the creator, so the failure is logged loudly and the
+      // video is parked in a state an operator can find rather than being
+      // published as if it worked.
+      try {
+        const gatedVideo = await database.getVideo(permlink);
+        if (gatedVideo?.gated && manifest_cid) {
+          if (!isGateConfigured(config)) {
+            throw new Error('gate not configured on this instance');
+          }
+          await registerGatedVideo(config, {
+            videoId: gatedVideo.gate_video_id || permlink,
+            creator: owner,
+            manifestCid: manifest_cid,
+            allowlist: gatedVideo.allowlist,
+          });
+          console.log(`🔐 Gated video registered with gate: ${owner}/${permlink}`);
+        }
+      } catch (gateError) {
+        console.error(
+          `🚨 GATE REGISTRATION FAILED for gated video ${owner}/${permlink}:`,
+          gateError instanceof Error ? gateError.message : gateError
+        );
+        await database.updateVideoStatus(permlink, 'failed', {
+          encodingProgress: 100,
+        }).catch(() => {});
       }
 
       // Unpin the input_cid now that encoding is complete
@@ -1032,6 +1130,20 @@ app.post('/api/v0/gateway/myJob', async (req: Request, res: Response) => {
     if (!video || !video.input_cid) {
       // Job was claimed but video is missing — reset it
       await database.resetJob(job.owner, job.permlink);
+      return res.json({ success: true, job: null });
+    }
+
+    // 🔐 Second gate on paid content, checked against the video rather than the
+    // job. claimNextCommunityJob already filters on the denormalised flag; this
+    // catches the case where that denormalisation was missed, because handing a
+    // community operator the plaintext source of a paid video is not a failure
+    // we can undo afterwards.
+    if (video.gated) {
+      await database.resetJob(job.owner, job.permlink);
+      console.error(
+        `🔐 BLOCKED: community encoder [${encoder.name}] claimed gated job ${job.owner}/${job.permlink}. ` +
+        `Job reset to pending. The job record was missing gated:true — check job creation.`
+      );
       return res.json({ success: true, job: null });
     }
 
@@ -1620,7 +1732,7 @@ app.get('/admin/encoders', requireAdminAuth, async (req: Request, res: Response)
 // Admin: Add encoder (protected)
 app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response) => {
   try {
-    const { name, url, apiKey, enabled = true, access = 'managed', tier = 'standard', maxFileSize } = req.body;
+    const { name, url, apiKey, enabled = true, access = 'managed', tier = 'standard', maxFileSize, trusted = false } = req.body;
 
     if (!name || !url || !apiKey) {
       return res.status(400).json({ error: 'name, url, and apiKey are required' });
@@ -1649,6 +1761,16 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
         (typeof maxFileSize !== 'number' || !Number.isFinite(maxFileSize) || maxFileSize <= 0)) {
       return res.status(400).json({ error: 'maxFileSize must be a positive number or null' });
     }
+    // 🔐 Defaults to false. Only an encoder we operate may receive gated jobs,
+    // because the encoder holds the plaintext source of whatever it transcodes.
+    if (typeof trusted !== 'boolean') {
+      return res.status(400).json({ error: 'trusted must be a boolean' });
+    }
+    if (trusted && access === 'community') {
+      return res.status(400).json({
+        error: 'A community encoder cannot be trusted for gated content. Gated jobs expose the plaintext source.',
+      });
+    }
 
     const existing = await database.getEncoder(name);
     if (existing) {
@@ -1662,13 +1784,14 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
       enabled,
       access,
       tier,
+      trusted,
       ...(maxFileSize !== undefined && { maxFileSize }),
       createdAt: new Date(),
       updatedAt: new Date(),
     });
 
-    console.log(`Encoder added: ${name} (${url}) [${access}/${tier}]`);
-    res.json({ success: true, name, url, enabled, access, tier });
+    console.log(`Encoder added: ${name} (${url}) [${access}/${tier}${trusted ? '/trusted' : ''}]`);
+    res.json({ success: true, name, url, enabled, access, tier, trusted });
   } catch (error) {
     console.error('Error adding encoder:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -1679,7 +1802,7 @@ app.post('/admin/encoders', requireAdminAuth, async (req: Request, res: Response
 app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { name } = req.params;
-    const { url, apiKey, enabled, access, tier, maxFileSize, banned } = req.body;
+    const { url, apiKey, enabled, access, tier, maxFileSize, banned, trusted } = req.body;
 
     const encoder = await database.getEncoder(name);
     if (!encoder) {
@@ -1716,6 +1839,23 @@ app.patch('/admin/encoders/:name', requireAdminAuth, async (req: Request, res: R
         return res.status(400).json({ error: `tier must be one of: ${validTiers.join(', ')}` });
       }
       updates.tier = tier;
+    }
+    // 🔐 Trust for gated (paid) content. Only ever set this on an encoder you
+    // operate: it will receive the plaintext source of paid videos.
+    if (trusted !== undefined) {
+      if (typeof trusted !== 'boolean') {
+        return res.status(400).json({ error: 'trusted must be a boolean' });
+      }
+      // A community node self-registers through the JWS gateway and is never
+      // operated by us, so it must not be trustable even by an admin mistake.
+      const effectiveAccess = access ?? encoder.access ?? 'managed';
+      if (trusted && effectiveAccess === 'community') {
+        return res.status(400).json({
+          error: 'A community encoder cannot be trusted for gated content. Gated jobs expose the plaintext source.',
+        });
+      }
+      updates.trusted = trusted;
+      console.log(`🔐 Encoder [${name}] trusted flag set to ${trusted}`);
     }
     if (maxFileSize !== undefined) {
       if (maxFileSize !== null &&

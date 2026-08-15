@@ -21,47 +21,76 @@ export class JobDispatcher {
    *   Premium jobs → managed performance, fallback to managed standard. Never lite, never community.
    *   Free jobs    → standard or lite (any access). Never performance.
    *   Short videos → any managed encoder (any tier), filtered by maxFileSize. Fast turnaround, but 480p doesn't need performance tier.
+   *   Gated jobs   → TRUSTED managed encoders only, at any tier. No fallback.
    *
    * File size is checked against encoder.maxFileSize when set.
+   *
+   * 🔐 The gated rule is narrowing only: it shrinks the candidate pool before
+   * the ordinary rules run, and never widens it. Every fallback below therefore
+   * stays inside the trusted set, which is what makes "a gated job cannot reach
+   * an untrusted encoder" true by construction rather than by inspection of
+   * each branch.
    */
-  private async getNextEncoder(premium: boolean, fileSize: number | null, isShort: boolean) {
+  private async getNextEncoder(premium: boolean, fileSize: number | null, isShort: boolean, gated: boolean) {
     const allEncoders = await this.database.getAllEncoders();
-    const enabledManaged = allEncoders.filter(e =>
+
+    let candidates = allEncoders.filter(e =>
       e.enabled && (e.access ?? 'managed') === 'managed'
     );
 
+    if (gated) {
+      candidates = candidates.filter(e => e.trusted === true);
+      if (candidates.length === 0) {
+        // Deliberately fatal. The job goes back to pending and retries rather
+        // than falling back to an untrusted node, because the encoder holds the
+        // plaintext source and that disclosure cannot be undone.
+        throw new Error(
+          'No trusted encoders available for gated job. Refusing to dispatch to an untrusted encoder. ' +
+          'Mark a first-party encoder trusted via PATCH /admin/encoders/:name {"trusted":true}.'
+        );
+      }
+    }
+
+    const tierKeyPrefix = gated ? 'gated-' : '';
+
     if (isShort) {
       // Short videos — managed only (fast turnaround), any tier (480p doesn't need GPU)
-      const eligibleShort = enabledManaged.filter(
+      const eligibleShort = candidates.filter(
         e => e.maxFileSize == null || (fileSize != null && fileSize <= e.maxFileSize)
       );
-      if (eligibleShort.length > 0) return this.roundRobin(eligibleShort, 'short');
+      if (eligibleShort.length > 0) return this.roundRobin(eligibleShort, `${tierKeyPrefix}short`);
       // Fallback: ignore maxFileSize if no encoder qualifies
-      return this.roundRobin(enabledManaged, 'short');
+      return this.roundRobin(candidates, `${tierKeyPrefix}short`);
     }
 
     if (premium) {
       // Premium: try performance first, then standard. Never lite.
-      const perfEncoders = this.filterByTierAndSize(enabledManaged, 'performance', fileSize);
-      if (perfEncoders.length > 0) return this.roundRobin(perfEncoders, 'performance');
+      const perfEncoders = this.filterByTierAndSize(candidates, 'performance', fileSize);
+      if (perfEncoders.length > 0) return this.roundRobin(perfEncoders, `${tierKeyPrefix}performance`);
 
-      const stdEncoders = this.filterByTierAndSize(enabledManaged, 'standard', fileSize);
-      if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, 'standard');
+      const stdEncoders = this.filterByTierAndSize(candidates, 'standard', fileSize);
+      if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, `${tierKeyPrefix}standard`);
 
-      throw new Error('No suitable managed encoders available for premium job');
+      throw new Error(
+        gated
+          ? 'No suitable trusted encoders available for premium gated job'
+          : 'No suitable managed encoders available for premium job'
+      );
     }
 
     // Free user: try managed standard first, then managed lite. Never performance.
     // Community encoders get jobs through polling, not push dispatch.
-    const allEnabled = allEncoders.filter(e => e.enabled && (e.access ?? 'managed') === 'managed');
+    const stdEncoders = this.filterByTierAndSize(candidates, 'standard', fileSize);
+    if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, `${tierKeyPrefix}free-standard`);
 
-    const stdEncoders = this.filterByTierAndSize(allEnabled, 'standard', fileSize);
-    if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, 'free-standard');
+    const liteEncoders = this.filterByTierAndSize(candidates, 'lite', fileSize);
+    if (liteEncoders.length > 0) return this.roundRobin(liteEncoders, `${tierKeyPrefix}free-lite`);
 
-    const liteEncoders = this.filterByTierAndSize(allEnabled, 'lite', fileSize);
-    if (liteEncoders.length > 0) return this.roundRobin(liteEncoders, 'free-lite');
-
-    throw new Error('No suitable encoders available for free job');
+    throw new Error(
+      gated
+        ? 'No suitable trusted encoders available for gated job'
+        : 'No suitable encoders available for free job'
+    );
   }
 
   /**
@@ -223,6 +252,12 @@ export class JobDispatcher {
     const premium = job.premium ?? await this.database.isUserPremium(owner);
     const fileSize = video.size ?? job.fileSize ?? null;
 
+    // 🔐 The video document is the source of truth for gatedness. The job's
+    // denormalised copy exists for atomic community claiming, but if the two
+    // ever disagree we take the stricter answer.
+    const gated = video.gated === true || job.gated === true;
+    const gateVideoId = video.gate_video_id ?? job.gateVideoId ?? permlink;
+
     const ipfsGateway = 'https://ipfs.3speak.tv/ipfs';
     const encoderRequest = {
       owner,
@@ -234,12 +269,23 @@ export class JobDispatcher {
       api_key: this.config.webhookApiKey,
       frontend_app: video.frontend_app,
       originalFilename: video.originalFilename,
+      ...(gated ? { gated: true, gate_video_id: gateVideoId } : {}),
     };
 
-    const encoder = await this.getNextEncoder(premium, fileSize, video.short);
+    const encoder = await this.getNextEncoder(premium, fileSize, video.short, gated);
+
+    // Belt and braces. getNextEncoder already guarantees this, but the check is
+    // one line and the failure it guards against is unrecoverable, so it is
+    // asserted immediately before the request goes out rather than trusted.
+    if (gated && encoder.trusted !== true) {
+      throw new Error(
+        `Refusing to dispatch gated job ${owner}/${permlink} to untrusted encoder [${encoder.name}]`
+      );
+    }
+
     const encoderTier = encoder.tier ?? 'standard';
     const encoderAccess = encoder.access ?? 'managed';
-    console.log(`Dispatching job to [${encoder.name}] (${encoderAccess}/${encoderTier}): ${owner}/${permlink} [premium=${premium}, size=${fileSize}]`);
+    console.log(`Dispatching job to [${encoder.name}] (${encoderAccess}/${encoderTier}${gated ? '/trusted' : ''}): ${owner}/${permlink} [premium=${premium}, gated=${gated}, size=${fileSize}]`);
     console.log(`Encoder request payload:`, JSON.stringify(encoderRequest, null, 2));
 
     const response = await fetch(`${encoder.url}/encode`, {
