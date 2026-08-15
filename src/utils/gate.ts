@@ -66,3 +66,76 @@ export async function registerGatedVideo(
     throw new Error(`Gate registration failed: HTTP ${response.status} ${text}`.trim());
   }
 }
+
+/**
+ * Defense-in-depth: confirms a finished gated video's output is actually
+ * encrypted before it is registered with the gate.
+ *
+ * The encoder is supposed to guarantee this itself (see internal-docs/
+ * gated-passthrough-bypass.md for a case where a passthrough/remux fast path
+ * silently skipped encryption while still reporting job success). Rather than
+ * trust that guarantee, fetch the manifest we are about to hand to the gate
+ * and check for an #EXT-X-KEY tag on every rendition it references. A gated
+ * video with no key tag is plaintext on public IPFS, so treat that as an
+ * encode failure rather than something worth publishing.
+ */
+export async function verifyGatedManifestEncrypted(
+  config: Config,
+  manifestCid: string
+): Promise<{ encrypted: boolean; reason?: string }> {
+  const cdnBase = config.gateCdnBase.replace(/\/+$/, '');
+  const manifestUrl = `${cdnBase}/${manifestCid}/manifest.m3u8`;
+
+  const master = await fetchPlaylist(manifestUrl);
+  if (master === null) {
+    return { encrypted: false, reason: `Could not fetch manifest at ${manifestUrl}` };
+  }
+
+  const variantUris = extractVariantUris(master);
+
+  // Not a master playlist (no #EXT-X-STREAM-INF) — it IS the media playlist.
+  if (variantUris.length === 0) {
+    return hasKeyTag(master)
+      ? { encrypted: true }
+      : { encrypted: false, reason: 'manifest.m3u8 has no #EXT-X-KEY tag' };
+  }
+
+  for (const uri of variantUris) {
+    const variantUrl = new URL(uri, manifestUrl).toString();
+    const variant = await fetchPlaylist(variantUrl);
+    if (variant === null) {
+      return { encrypted: false, reason: `Could not fetch rendition playlist ${variantUrl}` };
+    }
+    if (!hasKeyTag(variant)) {
+      return { encrypted: false, reason: `Rendition ${uri} has no #EXT-X-KEY tag` };
+    }
+  }
+
+  return { encrypted: true };
+}
+
+async function fetchPlaylist(url: string): Promise<string | null> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    if (!response.ok) return null;
+    return await response.text();
+  } catch {
+    return null;
+  }
+}
+
+function extractVariantUris(masterPlaylist: string): string[] {
+  const lines = masterPlaylist.split('\n').map(l => l.trim());
+  const uris: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+      const next = lines[i + 1];
+      if (next && !next.startsWith('#')) uris.push(next);
+    }
+  }
+  return uris;
+}
+
+function hasKeyTag(playlist: string): boolean {
+  return playlist.split('\n').some(l => l.trim().startsWith('#EXT-X-KEY'));
+}

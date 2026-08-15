@@ -19,7 +19,7 @@ import { JobDispatcher } from './dispatcher/jobDispatcher';
 import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
 import { signUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
-import { registerGatedVideo, isGateConfigured } from './utils/gate';
+import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
 
 dotenv.config();
 
@@ -931,6 +931,15 @@ app.post('/webhook', async (req: Request, res: Response) => {
         if (gatedVideo?.gated && manifest_cid) {
           if (!isGateConfigured(config)) {
             throw new Error('gate not configured on this instance');
+          }
+          // 🔐 Defense-in-depth: don't take the encoder's "complete" at face
+          // value. A passthrough/remux fast path has been observed to skip
+          // encryption entirely while still reporting success (see
+          // internal-docs/gated-passthrough-bypass.md). Confirm the manifest
+          // we're about to hand the gate is actually encrypted first.
+          const verification = await verifyGatedManifestEncrypted(config, manifest_cid);
+          if (!verification.encrypted) {
+            throw new Error(`Gated output failed encryption verification: ${verification.reason}`);
           }
           await registerGatedVideo(config, {
             videoId: gatedVideo.gate_video_id || permlink,
