@@ -42,6 +42,21 @@ export interface UploadTokenClaims {
    * backward compatibility with tokens minted before this field existed.
    */
   permlink?: string;
+  /**
+   * Hold the encode until POST /video/:permlink/encode asks for it, instead of
+   * creating the job as soon as the bytes land. Lets the gated decision be made
+   * after the upload has already started. See VideoMetadata.defer_encode.
+   */
+  deferEncode?: boolean;
+  /**
+   * What this token authorises. Absent means `upload`, so every token minted
+   * before this field existed keeps working unchanged.
+   *
+   * `finalize` tokens carry no upload rights: they exist only to commission the
+   * encode for the permlink they are bound to, and they deliberately outlive
+   * the upload token because the user may sit on the details step for a while.
+   */
+  scope?: 'upload' | 'finalize';
   /** Issued at (unix seconds) */
   iat: number;
   /** Expires at (unix seconds) */

@@ -1,6 +1,20 @@
 import { MongoClient, Db, Collection } from 'mongodb';
 
-export type VideoStatus = 'uploading' | 'processing' | 'published' | 'failed' | 'deleted';
+export type VideoStatus =
+  | 'uploading'
+  | 'processing'
+  /**
+   * Bytes are in and pinned, but no encode job exists yet: the client asked to
+   * defer the encode until publish so the gated decision can still be made.
+   *
+   * A video only reaches this state when the upload token carried
+   * `deferEncode`, and it leaves it via POST /video/:permlink/encode. The
+   * sweeper abandons rows that never get there.
+   */
+  | 'awaiting_encode'
+  | 'published'
+  | 'failed'
+  | 'deleted';
 
 export interface VideoMetadata {
   owner: string;
@@ -30,6 +44,20 @@ export interface VideoMetadata {
    * post, so the recipient list is not published on-chain and permanently.
    */
   allowlist?: string[];
+  /**
+   * Hold the encode until the client explicitly asks for it.
+   *
+   * Gating has to be decided before encoding starts, because it is the encoder
+   * that encrypts and the output CID is public the moment it is pinned. But the
+   * upload begins as soon as the user reaches the details step, which is the
+   * same screen the gated toggle lives on — so with eager job creation the file
+   * is already committed before the choice can be made.
+   *
+   * Deferring splits the two: bytes upload immediately (the slow part), and the
+   * encode is commissioned at publish (the decision), by which point `gated` is
+   * known. Set from the signed token claim only.
+   */
+  defer_encode?: boolean;
   hive_author: string | null;
   hive_permlink: string | null;
   hive_title: string | null;
@@ -309,6 +337,22 @@ export class Database {
     const cutoffDate = new Date(Date.now() - hoursOld * 60 * 60 * 1000);
     return this.collection.find({
       status: 'processing',
+      updatedAt: { $lt: cutoffDate }
+    }).toArray();
+  }
+
+  /**
+   * Deferred uploads whose publish never came (the user closed the tab on the
+   * details step). Their input file is still pinned, so they cost storage until
+   * they are swept.
+   */
+  async getAbandonedDeferred(hoursOld: number): Promise<VideoMetadata[]> {
+    if (!this.collection) {
+      throw new Error('Database not connected');
+    }
+    const cutoffDate = new Date(Date.now() - hoursOld * 60 * 60 * 1000);
+    return this.collection.find({
+      status: 'awaiting_encode',
       updatedAt: { $lt: cutoffDate }
     }).toArray();
   }

@@ -18,13 +18,25 @@ import { pinFile, unpinFile, announceDHT } from './utils/ipfs';
 import { JobDispatcher } from './dispatcher/jobDispatcher';
 import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
-import { signUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
+import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
 
 dotenv.config();
 
 const app = express();
 const config = loadConfig();
+
+/**
+ * How long a finalize token stays valid, and therefore how long a deferred
+ * upload can sit unfinished before its encode can no longer be commissioned.
+ * Long enough to survive a slow details step; short enough that an abandoned
+ * upload's pinned input does not linger indefinitely. Paired with
+ * DEFERRED_ENCODE_ABANDON_HOURS below, which does the actual cleanup.
+ */
+const FINALIZE_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+
+/** Deferred uploads that never got a publish are swept after this long. */
+const DEFERRED_ENCODE_ABANDON_HOURS = 12;
 
 // Trust proxy to get correct protocol from X-Forwarded-Proto
 app.set('trust proxy', true);
@@ -111,7 +123,10 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       });
     }
 
-    const { owner, frontend_app, short = false, gated = false, allowlist, allowed_origins = [], max_file_size, ttl } = req.body;
+    const {
+      owner, frontend_app, short = false, gated = false, allowlist,
+      allowed_origins = [], max_file_size, ttl, defer_encode = false,
+    } = req.body;
 
     if (!owner || typeof owner !== 'string') {
       return res.status(422).json({ error: 'owner (string) is required' });
@@ -185,6 +200,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       issuedByKey: apiKeyData?.app_name || 'unknown',
       short: !!short,
       gated: !!gated,
+      ...(defer_encode ? { deferEncode: true } : {}),
       ...(gated && Array.isArray(allowlist) && allowlist.length
         ? { allowlist: [...new Set(allowlist.map((u: string) => String(u).trim().toLowerCase().replace(/^@/, '')))] }
         : {}),
@@ -199,6 +215,29 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     const expiresAt = new Date(claims.exp * 1000).toISOString();
     const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
 
+    // A deferred upload needs a second credential to commission its encode
+    // later. It outlives the upload token deliberately: the upload takes
+    // seconds, but the user may sit on the details step for a long time, and an
+    // expired finalize token would strand a file that is already uploaded.
+    const finalizeToken = defer_encode
+      ? signUploadToken(
+        {
+          ...claims,
+          jti: generateTokenId(),
+          scope: 'finalize',
+          // Carries no upload rights of its own, and validateUploadAuth
+          // rejects it outright, but zero these anyway so a bug that reached
+          // for them cannot find a usable allowance.
+          maxFileSize: 0,
+          gated: false,
+          allowlist: [],
+          iat: now,
+          exp: now + FINALIZE_TOKEN_TTL_SECONDS,
+        },
+        config.uploadTokenSecret,
+      )
+      : undefined;
+
     console.log(`Upload token issued: ${owner}/${permlink} via ${claims.app} (ttl=${tokenTtl}s, jti=${claims.jti.slice(0, 8)}...)`);
 
     res.status(201).json({
@@ -212,6 +251,11 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       // running older code simply omits this, which lets the frontend refuse to
       // upload rather than silently publishing a "paid" video in the clear.
       gated: !!gated,
+      // Echoed for the same reason: an instance without deferred encoding omits
+      // both fields, so a client that needs the gated decision to happen after
+      // the upload can detect it instead of quietly losing the choice.
+      defer_encode: !!defer_encode,
+      ...(finalizeToken ? { finalize_token: finalizeToken } : {}),
     });
   } catch (error) {
     console.error('Error creating upload token:', error);
@@ -303,13 +347,13 @@ app.post('/upload/simple', (req: Request, res: Response) => {
     const auth = await validateUploadAuth(synthHeaders, metadata, receivedSize, database, config, false);
     if (!auth.ok) return fail(auth.status, auth.error);
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration } = auth;
+    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration } = auth;
 
     await database.createVideoEntry({
       owner, permlink, frontend_app,
       status: 'uploading',
       input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-      short, gated, gate_video_id: gated ? permlink : null, allowlist, duration, size: receivedSize,
+      short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: receivedSize,
       encodingProgress: 0,
       originalFilename,
       hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -456,13 +500,13 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
 
   const auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
   if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
-  const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration } = auth;
+  const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration } = auth;
 
   await database.createVideoEntry({
     owner, permlink, frontend_app,
     status: 'uploading',
     input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-    short, gated, gate_video_id: gated ? permlink : null, allowlist, duration, size: totalSize,
+    short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: totalSize,
     encodingProgress: 0,
     originalFilename,
     hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -645,7 +689,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       return res.json({});
     }
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration, size } = authResult;
+    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size } = authResult;
 
     // Hard size cap, enforced for every upload regardless of auth method.
     // For parallel/Concatenation uploads this fires on the final concat, whose
@@ -680,6 +724,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       gated,
       gate_video_id: gated ? permlink : null,
       allowlist,
+      defer_encode: deferEncode,
       duration,
       size,
       encodingProgress: 0,
@@ -755,6 +800,48 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
 
 // Process completed upload: pin to IPFS, create encoding job, clean up temp file.
 // Called asynchronously after tusd sends 204 to client — client does NOT wait for this.
+/**
+ * Queue an encode job.
+ *
+ * Shared by the eager upload path and the deferred POST /video/:permlink/encode
+ * so the two cannot drift: `gated` and `gateVideoId` decide whether the job is
+ * restricted to trusted encoders, and a job created without them is a job that
+ * can be claimed by any community node.
+ */
+async function createEncodeJob(
+  db: Database,
+  fields: {
+    owner: string;
+    permlink: string;
+    premium: boolean;
+    short: boolean;
+    fileSize: number | null;
+    gated: boolean;
+    gateVideoId: string;
+  }
+): Promise<void> {
+  await db.createJob({
+    owner: fields.owner,
+    permlink: fields.permlink,
+    status: 'pending',
+    assignedWorker: null,
+    encoderJobId: null,
+    assignedAt: null,
+    attemptCount: 0,
+    lastError: null,
+    encodingProgress: null,
+    encodingStage: null,
+    webhookReceivedAt: null,
+    premium: fields.premium,
+    short: fields.short,
+    fileSize: fields.fileSize,
+    gated: fields.gated,
+    gateVideoId: fields.gateVideoId,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+}
+
 async function processUploadAsync(
   filePath: string,
   meta: Record<string, string>,
@@ -803,30 +890,37 @@ async function processUploadAsync(
     // source of truth: the TUS metadata is client-supplied and must never be
     // trusted to decide whether content is paid.
     const videoDoc = await db.getVideo(permlink);
+
+    // Deferred: the bytes are in and pinned, but the encode is not commissioned
+    // until POST /video/:permlink/encode says whether this video is gated.
+    //
+    // The decision cannot be made after encoding. It is the encoder that
+    // encrypts, and an unencrypted rendition is public the instant its CID is
+    // pinned — there is no taking it back. Eager job creation forced the choice
+    // before the user could reach the toggle, which is exactly how a video
+    // meant to be gated got published in the clear.
+    if (videoDoc?.defer_encode === true) {
+      await db.updateVideoStatus(permlink, 'awaiting_encode', { encodingProgress: 0 });
+      console.log(
+        `⏸️  Upload parked awaiting encode decision: ${owner}/${permlink} - Pinned: ${input_cid}`
+      );
+      try {
+        unlinkSync(filePath);
+        console.log(`Temp file cleaned up: ${filePath}`);
+      } catch (cleanupError) {
+        console.warn(`Failed to cleanup temp file: ${cleanupError}`);
+      }
+      return;
+    }
+
     const gated = videoDoc?.gated === true;
     if (gated) {
       console.log(`🔐 Gated job created for ${owner}/${permlink} — trusted encoders only`);
     }
 
-    await db.createJob({
-      owner,
-      permlink,
-      status: 'pending',
-      assignedWorker: null,
-      encoderJobId: null,
-      assignedAt: null,
-      attemptCount: 0,
-      lastError: null,
-      encodingProgress: null,
-      encodingStage: null,
-      webhookReceivedAt: null,
-      premium,
-      short,
-      fileSize: uploadSize,
-      gated,
-      gateVideoId: videoDoc?.gate_video_id ?? permlink,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+    await createEncodeJob(db, {
+      owner, permlink, premium, short, fileSize: uploadSize,
+      gated, gateVideoId: videoDoc?.gate_video_id ?? permlink,
     });
 
     console.log(`Upload processed: ${owner}/${permlink} - Pinned: ${input_cid} - Job created`);
@@ -1245,6 +1339,140 @@ app.get('/api/v0/encoders/community', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Commission the encode for a deferred upload, deciding gating at the same time.
+ *
+ * This is the second half of `defer_encode`: the bytes went up when the user
+ * picked the file, and the gated choice arrives here, at publish. Doing it in
+ * one call is deliberate — gating and job creation must be atomic, because a
+ * job created first would be dispatched before the flag landed, and the encoder
+ * would produce a plaintext rendition that no later update could recall.
+ *
+ * Authenticated with the finalize token minted alongside the upload token, not
+ * the API key: granting gated status requires a verified owner, and the API key
+ * ships inside browser bundles.
+ */
+app.post('/video/:permlink/encode', async (req: Request, res: Response) => {
+  try {
+    if (!config.uploadTokenSecret) {
+      return res.status(503).json({ error: 'Upload tokens are not configured' });
+    }
+
+    const authHeader = req.get('authorization');
+    const bearer = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+    if (!bearer) {
+      return res.status(401).json({ error: 'Finalize token required' });
+    }
+
+    const claims = verifyUploadToken(bearer, config.uploadTokenSecret);
+    if (!claims || claims.scope !== 'finalize') {
+      return res.status(401).json({ error: 'Invalid or expired finalize token' });
+    }
+
+    const { permlink } = req.params;
+    // The token is bound to one video. Without this, a finalize token would
+    // commission an encode for somebody else's upload.
+    if (claims.permlink !== permlink) {
+      return res.status(403).json({ error: 'Finalize token is not valid for this video' });
+    }
+
+    const video = await database.getVideo(permlink);
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+    if (video.owner !== claims.owner) {
+      return res.status(403).json({ error: 'Finalize token is not valid for this video' });
+    }
+
+    // Idempotent: a retried publish must not queue the video twice.
+    const existingJob = await database.getJob(video.owner, permlink);
+    if (existingJob) {
+      return res.status(200).json({
+        success: true,
+        already_queued: true,
+        gated: video.gated === true,
+      });
+    }
+
+    if (video.status !== 'awaiting_encode') {
+      return res.status(409).json({
+        error: `Video is not awaiting an encode decision (status: ${video.status})`,
+        code: 'not_awaiting_encode',
+      });
+    }
+    if (!video.input_cid) {
+      return res.status(409).json({ error: 'Upload has no pinned input yet', code: 'not_pinned' });
+    }
+
+    const { gated = false, allowlist } = req.body || {};
+    if (typeof gated !== 'boolean') {
+      return res.status(422).json({ error: 'gated must be a boolean' });
+    }
+
+    let cleanAllowlist: string[] = [];
+    if (gated) {
+      if (!isGateConfigured(config)) {
+        console.error('Gated encode requested but GATE_URL / GATE_INTERNAL_API_KEY are not set');
+        return res.status(503).json({
+          error: 'Gated uploads are not available on this instance',
+          code: 'gate_not_configured',
+        });
+      }
+
+      if (allowlist !== undefined) {
+        if (!Array.isArray(allowlist) || allowlist.length > 500) {
+          return res.status(422).json({ error: 'allowlist must be an array of at most 500 usernames' });
+        }
+        const bad = allowlist.find(
+          (u: unknown) => typeof u !== 'string' || !/^[a-z][a-z0-9.-]{2,15}$/.test(String(u).trim().toLowerCase().replace(/^@/, ''))
+        );
+        if (bad !== undefined) {
+          return res.status(422).json({ error: `"${bad}" is not a valid Hive account name` });
+        }
+        cleanAllowlist = [...new Set(allowlist.map((u: string) => String(u).trim().toLowerCase().replace(/^@/, '')))];
+      }
+
+      // Re-checked here rather than trusted from issuance: Pro can lapse
+      // between picking a file and pressing publish, and this is the moment the
+      // capability is actually granted.
+      const isPro = await database.isUserPremium(video.owner);
+      if (!isPro) {
+        console.warn(`Gated encode refused for non-Pro user: ${video.owner}`);
+        return res.status(403).json({ error: 'Gated uploads require 3Speak Pro', code: 'pro_required' });
+      }
+    }
+
+    // Gating is written before the job exists, so the dispatcher can never see a
+    // job whose video has not yet been marked gated.
+    await database.updateVideoStatus(permlink, 'processing', {
+      gated,
+      gate_video_id: gated ? permlink : null,
+      allowlist: cleanAllowlist,
+    });
+
+    const premium = await database.isUserPremium(video.owner);
+    await createEncodeJob(database, {
+      owner: video.owner,
+      permlink,
+      premium,
+      short: video.short === true,
+      fileSize: video.size ?? null,
+      gated,
+      gateVideoId: permlink,
+    });
+
+    console.log(
+      `${gated ? '🔐 Gated job' : 'Job'} commissioned at publish for ${video.owner}/${permlink}` +
+      `${gated ? ' — trusted encoders only' : ''}`
+    );
+
+    res.status(201).json({ success: true, gated, allowlist: cleanAllowlist });
+  } catch (error) {
+    console.error('Error commissioning encode:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get video metadata endpoint
 app.get('/video/:permlink', async (req: Request, res: Response) => {
   try {
@@ -1379,6 +1607,32 @@ setInterval(async () => {
     console.error('Replacement sweep failed:', err);
   }
 }, REPLACEMENT_SWEEP_MS).unref?.();
+
+// Abandon deferred uploads whose publish never came.
+//
+// A deferred upload holds a pinned input CID and no job, so nothing downstream
+// will ever collect it: the dispatcher only looks at jobs. Left alone these
+// accumulate pinned storage forever. Marking them failed also unpins the input,
+// which matters most for the gated case — that input is the plaintext original.
+const DEFERRED_SWEEP_MS = 15 * 60_000;
+setInterval(async () => {
+  try {
+    const abandoned = await database.getAbandonedDeferred(DEFERRED_ENCODE_ABANDON_HOURS);
+    for (const v of abandoned) {
+      try {
+        if (v.input_cid && v.ipfs_pin_endpoint) {
+          await unpinFile(v.input_cid, v.ipfs_pin_endpoint);
+        }
+        await database.updateVideoStatus(v.permlink, 'failed', { encodingProgress: 0 });
+        console.log(`Deferred sweep: abandoned ${v.owner}/${v.permlink} (never published)`);
+      } catch (err) {
+        console.error(`Deferred sweep: failed to abandon ${v.permlink}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error('Deferred sweep failed:', err);
+  }
+}, DEFERRED_SWEEP_MS).unref?.();
 
 // Register a freshly-uploaded asset as the replacement for an existing video.
 //

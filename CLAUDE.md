@@ -92,3 +92,21 @@ On startup, `ENCODERS` env (JSON array) is seeded into `embed-encoders` only if 
 - Mutations return `{ success: true, ... }`
 - `isUserPremium(owner)` is the single lookup point for premium status
 - `X-Embed-URL` header is injected in the `pre-create` hook response (captured by tus-js-client `onAfterResponse` on the 201 Created)
+
+### Deferred encoding (`defer_encode`)
+
+Gating must be decided **before** the encoder runs: the encoder is what encrypts, and an unencrypted rendition is public the instant its CID is pinned. But the upload starts as soon as the user reaches the details step, which is the same screen the gated toggle lives on — so eager job creation committed the file before the choice could be made.
+
+`defer_encode: true` on `POST /uploads/token` splits the two:
+
+1. The token response also returns a `finalize_token` (12h TTL, `scope: 'finalize'`).
+2. The upload runs normally; `post-finish` pins the input but creates **no job**, parking the video at `status: 'awaiting_encode'`.
+3. `POST /video/:permlink/encode` (Bearer finalize token, body `{ gated, allowlist }`) writes the gating and queues the job atomically — gating first, so the dispatcher can never see a job whose video is not yet marked gated.
+
+Pro status is re-checked at step 3, not trusted from issuance, because it can lapse in between and that is the moment the capability is granted.
+
+A finalize token is rejected by `validateUploadAuth` (before consumption) so it can never be used as upload credentials, and it is bound to one permlink + owner.
+
+Deferred uploads that never reach step 3 are swept after `DEFERRED_ENCODE_ABANDON_HOURS` (12h): the input is unpinned and the row marked failed. This matters most for gated content, since that pinned input is the plaintext original.
+
+Tests: `npx ts-node --transpile-only scripts/test-deferred-encode.ts` (14 checks, no MongoDB required).
