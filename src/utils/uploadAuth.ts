@@ -13,6 +13,8 @@ export interface AuthSuccess {
   gated: boolean;
   /** 🔐 Named accounts that may watch without Pro. Signed-claim only, like `gated`. */
   allowlist: string[];
+  /** Hold the encode until publish commissions it. Signed-claim only. */
+  deferEncode: boolean;
   originalFilename: string | null;
   duration: number | null;
   size: number | null;
@@ -62,6 +64,13 @@ export async function validateUploadAuth(
       return { ok: false, status: 401, error: 'Invalid or expired upload token' };
     }
 
+    // A finalize token commissions an encode; it is not upload credentials.
+    // Checked before the token is consumed so a misdirected one is rejected
+    // outright rather than being burned.
+    if (tokenClaims.scope === 'finalize') {
+      return { ok: false, status: 403, error: 'This token cannot be used to upload' };
+    }
+
     if (tokenClaims.allowedOrigins && tokenClaims.allowedOrigins.length > 0) {
       const origin = h['origin']?.[0];
       if (!origin || !tokenClaims.allowedOrigins.includes(origin)) {
@@ -102,6 +111,10 @@ export async function validateUploadAuth(
   // POST /uploads/token, which checks 3Speak Pro status first.
   const gated = tokenClaims?.gated === true;
   const allowlist = gated && Array.isArray(tokenClaims?.allowlist) ? tokenClaims.allowlist : [];
+  // Signed claim only, for the same reason as `gated`: deferring decides when
+  // the job is created, and an API-key caller must not be able to leave uploads
+  // parked with no encode.
+  const deferEncode = tokenClaims?.deferEncode === true;
   const originalFilename = metadata?.filename || null;
   const duration = metadata?.duration ? parseFloat(metadata.duration) : null;
   const size = uploadSize || null;
@@ -139,5 +152,5 @@ export async function validateUploadAuth(
     }
   }
 
-  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration, size };
+  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size };
 }
