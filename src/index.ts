@@ -208,6 +208,10 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       permlink,
       embed_url: embedUrl,
       expires_at: expiresAt,
+      // Echoed back so a client can confirm the flag was honoured. An instance
+      // running older code simply omits this, which lets the frontend refuse to
+      // upload rather than silently publishing a "paid" video in the clear.
+      gated: !!gated,
     });
   } catch (error) {
     console.error('Error creating upload token:', error);
