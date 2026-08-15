@@ -21,6 +21,15 @@ export interface UploadTokenClaims {
    * is paid.
    */
   gated?: boolean;
+  /**
+   * Named accounts that may watch this gated video without 3Speak Pro.
+   *
+   * Carried in the signed claim for the same reason as `gated`: it is an
+   * authorisation input, and the embed API key ships in browser bundles, so an
+   * API-key caller cannot be trusted to name its own guests. Never written to
+   * the Hive post, so the recipient list is not published on-chain.
+   */
+  allowlist?: string[];
   /** Max upload size in bytes */
   maxFileSize: number;
   /** Allowed CORS origins */

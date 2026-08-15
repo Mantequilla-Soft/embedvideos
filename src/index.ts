@@ -111,7 +111,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       });
     }
 
-    const { owner, frontend_app, short = false, gated = false, allowed_origins = [], max_file_size, ttl } = req.body;
+    const { owner, frontend_app, short = false, gated = false, allowlist, allowed_origins = [], max_file_size, ttl } = req.body;
 
     if (!owner || typeof owner !== 'string') {
       return res.status(422).json({ error: 'owner (string) is required' });
@@ -135,6 +135,21 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
           code: 'gate_not_configured',
         });
       }
+      // Guest list: named accounts that watch without Pro. Validated here, the
+      // one place with a verified owner and a signing key. Never written to the
+      // Hive post, so the recipient list is not published on-chain.
+      if (allowlist !== undefined) {
+        if (!Array.isArray(allowlist) || allowlist.length > 500) {
+          return res.status(422).json({ error: 'allowlist must be an array of at most 500 usernames' });
+        }
+        const bad = allowlist.find(
+          (u: unknown) => typeof u !== 'string' || !/^[a-z][a-z0-9.-]{2,15}$/.test(String(u).trim().toLowerCase().replace(/^@/, ''))
+        );
+        if (bad !== undefined) {
+          return res.status(422).json({ error: `"${bad}" is not a valid Hive account name` });
+        }
+      }
+
       const isPro = await database.isUserPremium(owner);
       if (!isPro) {
         console.warn(`Gated upload token refused for non-Pro user: ${owner}`);
@@ -170,6 +185,9 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       issuedByKey: apiKeyData?.app_name || 'unknown',
       short: !!short,
       gated: !!gated,
+      ...(gated && Array.isArray(allowlist) && allowlist.length
+        ? { allowlist: [...new Set(allowlist.map((u: string) => String(u).trim().toLowerCase().replace(/^@/, '')))] }
+        : {}),
       maxFileSize,
       allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
       permlink,
@@ -281,13 +299,13 @@ app.post('/upload/simple', (req: Request, res: Response) => {
     const auth = await validateUploadAuth(synthHeaders, metadata, receivedSize, database, config, false);
     if (!auth.ok) return fail(auth.status, auth.error);
 
-    const { owner, permlink, frontend_app, short, gated, originalFilename, duration } = auth;
+    const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration } = auth;
 
     await database.createVideoEntry({
       owner, permlink, frontend_app,
       status: 'uploading',
       input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-      short, gated, gate_video_id: gated ? permlink : null, duration, size: receivedSize,
+      short, gated, gate_video_id: gated ? permlink : null, allowlist, duration, size: receivedSize,
       encodingProgress: 0,
       originalFilename,
       hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -434,13 +452,13 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
 
   const auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
   if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
-  const { owner, permlink, frontend_app, short, gated, originalFilename, duration } = auth;
+  const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration } = auth;
 
   await database.createVideoEntry({
     owner, permlink, frontend_app,
     status: 'uploading',
     input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-    short, gated, gate_video_id: gated ? permlink : null, duration, size: totalSize,
+    short, gated, gate_video_id: gated ? permlink : null, allowlist, duration, size: totalSize,
     encodingProgress: 0,
     originalFilename,
     hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -623,7 +641,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       return res.json({});
     }
 
-    const { owner, permlink, frontend_app, short, gated, originalFilename, duration, size } = authResult;
+    const { owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration, size } = authResult;
 
     // Hard size cap, enforced for every upload regardless of auth method.
     // For parallel/Concatenation uploads this fires on the final concat, whose
@@ -657,6 +675,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       // 🔐 Gated content. The gate knows this asset by its permlink.
       gated,
       gate_video_id: gated ? permlink : null,
+      allowlist,
       duration,
       size,
       encodingProgress: 0,
@@ -913,6 +932,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
             videoId: gatedVideo.gate_video_id || permlink,
             creator: owner,
             manifestCid: manifest_cid,
+            allowlist: gatedVideo.allowlist,
           });
           console.log(`🔐 Gated video registered with gate: ${owner}/${permlink}`);
         }

@@ -11,6 +11,8 @@ export interface AuthSuccess {
   short: boolean;
   /** 🔐 Gated (paid) content. Only ever true via a signed upload token claim. */
   gated: boolean;
+  /** 🔐 Named accounts that may watch without Pro. Signed-claim only, like `gated`. */
+  allowlist: string[];
   originalFilename: string | null;
   duration: number | null;
   size: number | null;
@@ -99,6 +101,7 @@ export async function validateUploadAuth(
   // upload paid. Gated uploads therefore require a token minted by
   // POST /uploads/token, which checks 3Speak Pro status first.
   const gated = tokenClaims?.gated === true;
+  const allowlist = gated && Array.isArray(tokenClaims?.allowlist) ? tokenClaims.allowlist : [];
   const originalFilename = metadata?.filename || null;
   const duration = metadata?.duration ? parseFloat(metadata.duration) : null;
   const size = uploadSize || null;
@@ -136,5 +139,5 @@ export async function validateUploadAuth(
     }
   }
 
-  return { ok: true, owner, permlink, frontend_app, short, gated, originalFilename, duration, size };
+  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, originalFilename, duration, size };
 }

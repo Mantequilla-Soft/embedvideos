@@ -24,6 +24,12 @@ export interface VideoMetadata {
   gated?: boolean;
   /** Video id the gate knows this asset by. Defaults to the permlink. */
   gate_video_id?: string | null;
+  /**
+   * Named accounts that may watch this gated video without 3Speak Pro.
+   * Held here and forwarded to the gate; deliberately never written to the Hive
+   * post, so the recipient list is not published on-chain and permanently.
+   */
+  allowlist?: string[];
   hive_author: string | null;
   hive_permlink: string | null;
   hive_title: string | null;

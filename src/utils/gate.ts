@@ -29,6 +29,8 @@ export async function registerGatedVideo(
     creator: string;
     manifestCid: string;
     previewPath?: string;
+    /** Named accounts that may watch without Pro. Omitted when empty. */
+    allowlist?: string[];
   }
 ): Promise<void> {
   if (!isGateConfigured(config)) {
@@ -46,6 +48,7 @@ export async function registerGatedVideo(
     manifestPath: 'manifest.m3u8',
     // The encoder writes an unencrypted trailer beside the encrypted renditions.
     previewUrl: `${upstreamBaseUrl}${params.previewPath ?? 'preview/index.m3u8'}`,
+    ...(params.allowlist?.length ? { allowlist: params.allowlist } : {}),
   };
 
   const response = await fetch(`${config.gateUrl.replace(/\/+$/, '')}/internal/videos`, {
