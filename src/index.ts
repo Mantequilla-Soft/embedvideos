@@ -8,7 +8,7 @@ import busboy from 'busboy';
 import path from 'path';
 import { unlinkSync, statfsSync, createWriteStream, promises as fsp } from 'fs';
 import { randomBytes } from 'crypto';
-import { Database, Encoder, JobStatus } from './database/mongodb';
+import { Database, Encoder, JobStatus, VideoMetadata } from './database/mongodb';
 import { generateVideoId } from './utils/videoId';
 import { generateApiKey } from './utils/keyGenerator';
 import { createApiKeyMiddleware } from './middleware/auth';
@@ -842,6 +842,42 @@ async function createEncodeJob(
   });
 }
 
+/**
+ * Write gating onto the video and create its job, atomically-ordered (gating
+ * first, so the dispatcher can never see a job for a video not yet marked
+ * gated). Shared by the finalize route and the deferred-heal sweep so a
+ * commissioned job always goes through the exact same sequence regardless of
+ * which caller decided the video was ready.
+ */
+async function commissionEncode(
+  db: Database,
+  video: VideoMetadata,
+  gated: boolean,
+  allowlist: string[]
+): Promise<void> {
+  await db.updateVideoStatus(video.permlink, 'processing', {
+    gated,
+    gate_video_id: gated ? video.permlink : null,
+    allowlist,
+  });
+
+  const premium = await db.isUserPremium(video.owner);
+  await createEncodeJob(db, {
+    owner: video.owner,
+    permlink: video.permlink,
+    premium,
+    short: video.short === true,
+    fileSize: video.size ?? null,
+    gated,
+    gateVideoId: video.permlink,
+  });
+
+  console.log(
+    `${gated ? '🔐 Gated job' : 'Job'} commissioned for ${video.owner}/${video.permlink}` +
+    `${gated ? ' — trusted encoders only' : ''}`
+  );
+}
+
 async function processUploadAsync(
   filePath: string,
   meta: Record<string, string>,
@@ -1442,29 +1478,7 @@ app.post('/video/:permlink/encode', async (req: Request, res: Response) => {
       }
     }
 
-    // Gating is written before the job exists, so the dispatcher can never see a
-    // job whose video has not yet been marked gated.
-    await database.updateVideoStatus(permlink, 'processing', {
-      gated,
-      gate_video_id: gated ? permlink : null,
-      allowlist: cleanAllowlist,
-    });
-
-    const premium = await database.isUserPremium(video.owner);
-    await createEncodeJob(database, {
-      owner: video.owner,
-      permlink,
-      premium,
-      short: video.short === true,
-      fileSize: video.size ?? null,
-      gated,
-      gateVideoId: permlink,
-    });
-
-    console.log(
-      `${gated ? '🔐 Gated job' : 'Job'} commissioned at publish for ${video.owner}/${permlink}` +
-      `${gated ? ' — trusted encoders only' : ''}`
-    );
+    await commissionEncode(database, video, gated, cleanAllowlist);
 
     res.status(201).json({ success: true, gated, allowlist: cleanAllowlist });
   } catch (error) {
@@ -1619,10 +1633,20 @@ setInterval(async () => {
   try {
     const abandoned = await database.getAbandonedDeferred(DEFERRED_ENCODE_ABANDON_HOURS);
     for (const v of abandoned) {
-      try {
-        if (v.input_cid && v.ipfs_pin_endpoint) {
+      // Unpinning is best-effort cleanup, not a precondition for the status
+      // transition below. An IPFS 500 ("not pinned or pinned indirectly") is
+      // permanent, not transient — if it blocks the status write, the video
+      // matches this same query again next cycle, fails the same unpin again,
+      // and is orphaned in awaiting_encode forever: no job, no failed status,
+      // invisible to the dispatcher and to any dashboard.
+      if (v.input_cid && v.ipfs_pin_endpoint) {
+        try {
           await unpinFile(v.input_cid, v.ipfs_pin_endpoint);
+        } catch (unpinErr) {
+          console.warn(`Deferred sweep: unpin failed for ${v.permlink} (continuing to mark failed):`, unpinErr);
         }
+      }
+      try {
         await database.updateVideoStatus(v.permlink, 'failed', { encodingProgress: 0 });
         console.log(`Deferred sweep: abandoned ${v.owner}/${v.permlink} (never published)`);
       } catch (err) {
@@ -1633,6 +1657,55 @@ setInterval(async () => {
     console.error('Deferred sweep failed:', err);
   }
 }, DEFERRED_SWEEP_MS).unref?.();
+
+// Heal deferred uploads whose finalize call (POST /video/:permlink/encode)
+// never arrived despite the owner having actually published — proof being a
+// Hive post already linked via POST /video/:permlink/hive. This runs on a
+// much shorter clock than the abandon sweep above: a dropped signal from a
+// flaky frontend shouldn't strand a published video for 12 hours.
+//
+// Gating is never invented here — only ever carried forward from whatever the
+// video already has on file. `video.gated` is set once, at upload-token
+// issuance, and is only ever overwritten by a finalize call actually running
+// (see commissionEncode). So before finalize runs it already holds the
+// safest known value: usually false (most frontends don't ask about gating
+// until after the upload starts), but a video that already declared
+// gated:true up front is healed as gated, never silently downgraded to
+// public. If Pro has lapsed in the meantime, healing is skipped rather than
+// downgrading — the abandon sweep is the fallback for what this can't safely
+// resolve on its own.
+const DEFER_HEAL_GRACE_MINUTES = 20;
+const DEFER_HEAL_SWEEP_MS = 5 * 60_000;
+setInterval(async () => {
+  try {
+    const healable = await database.getHealableDeferred(DEFER_HEAL_GRACE_MINUTES);
+    for (const v of healable) {
+      try {
+        if (!v.input_cid) continue; // not actually pinned yet; not our problem to fix
+
+        // Idempotent against a late-arriving finalize call landing first.
+        const existingJob = await database.getJob(v.owner, v.permlink);
+        if (existingJob) continue;
+
+        const gated = v.gated === true;
+        if (gated) {
+          const isPro = await database.isUserPremium(v.owner);
+          if (!isPro) {
+            console.warn(`Heal sweep: skipping gated video ${v.owner}/${v.permlink} — Pro has lapsed, will not silently downgrade`);
+            continue;
+          }
+        }
+
+        await commissionEncode(database, v, gated, Array.isArray(v.allowlist) ? v.allowlist : []);
+        console.log(`Heal sweep: commissioned stalled encode for ${v.owner}/${v.permlink} (Hive post present, finalize signal never arrived)`);
+      } catch (err) {
+        console.error(`Heal sweep: failed to heal ${v.permlink}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error('Heal sweep failed:', err);
+  }
+}, DEFER_HEAL_SWEEP_MS).unref?.();
 
 // Register a freshly-uploaded asset as the replacement for an existing video.
 //

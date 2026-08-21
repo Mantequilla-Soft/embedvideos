@@ -357,6 +357,30 @@ export class Database {
     }).toArray();
   }
 
+  /**
+   * Deferred uploads whose finalize signal (POST /video/:permlink/encode)
+   * never arrived, even though the owner demonstrably finished publishing —
+   * a Hive post already references this asset. A flaky frontend that drops
+   * that one call shouldn't strand an otherwise-published video for the full
+   * abandon window, so this runs on a much shorter clock and is restricted to
+   * rows with proof of publish: `hive_permlink` only gets set by
+   * POST /video/:permlink/hive, which happens as part of the same publish
+   * flow. Rows with no Hive post are left for getAbandonedDeferred — that's
+   * genuine abandonment (tab closed on the details step), not a dropped
+   * signal, and shouldn't burn encoder time.
+   */
+  async getHealableDeferred(minutesIdle: number): Promise<VideoMetadata[]> {
+    if (!this.collection) {
+      throw new Error('Database not connected');
+    }
+    const cutoffDate = new Date(Date.now() - minutesIdle * 60 * 1000);
+    return this.collection.find({
+      status: 'awaiting_encode',
+      hive_permlink: { $ne: null },
+      updatedAt: { $lt: cutoffDate }
+    } as any).toArray();
+  }
+
   // API Key Management Methods
   async createApiKey(apiKey: ApiKey): Promise<void> {
     if (!this.db) {
