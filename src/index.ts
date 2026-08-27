@@ -50,6 +50,13 @@ const cleanupService = new CleanupService(config.uploadDir, config.cleanupRetent
 // Middleware
 app.use(cors({
   exposedHeaders: ['X-Embed-URL', 'x-embed-url'],
+  // Every chunk POST carries an upload progress listener, which makes it a
+  // non-simple request, which makes the browser preflight it. With no Max-Age
+  // Chrome caches that preflight for 5 SECONDS, so the chunked path was paying a
+  // full extra round trip per chunk: 923 preflights for 931 chunk POSTs measured
+  // over two days. On a 250ms mobile RTT that is most of a second per chunk, spent
+  // on links that have none to spare. 600 is Chrome's ceiling; it ignores more.
+  maxAge: 600,
 }));
 app.use(express.json());
 
@@ -388,7 +395,8 @@ app.post('/upload/simple', (req: Request, res: Response) => {
 // upload still needs to survive drops (unlike /upload/simple, which restarts
 // from 0). Every request is a plain multipart POST — no PATCH, and with no
 // custom request headers it stays CORS-preflight-free:
-//   POST /upload/chunk/create  {token, filename, duration, size, chunkSize}
+//   POST /upload/probe         {chunk}                     -> {ok, bytes}
+//   POST /upload/chunk/create  {token, filename, duration, size, chunkSize, probed}
 //        -> {sessionId, chunkSize, totalChunks, received:[], embed_url, permlink}
 //   POST /upload/chunk         {sessionId, index, chunk}   -> {index, receivedBytes, size, complete}
 //   POST /upload/chunk/status  {sessionId}                 -> {chunkSize, totalChunks, receivedBytes, size, received:[], finished}
@@ -418,6 +426,15 @@ interface ChunkSession {
 const chunkSessions = new Map<string, ChunkSession>();
 const CHUNK_PART_MAX = 64 * 1024 * 1024;            // hard ceiling for one chunk request body
 const CHUNK_MIN_SIZE = 256 * 1024;                  // smallest agreed chunkSize
+// Ceiling for a client that did NOT measure its link (no `probed` field). Such a
+// client sized its chunks from navigator.connection, which reports optimistically
+// on mobile — a dying carrier link still answers "4g" — and chunkSize is frozen
+// for the life of the session, so guessing high dead-ends the upload with no way
+// back. One account spent a week stuck at 0% retrying 1MB chunks over a link that
+// never delivered one. Clamping here is also the only fix that reaches clients
+// running an older cached bundle, which a frontend change cannot.
+const CHUNK_MAX_UNPROBED = 256 * 1024;
+const CHUNK_PROBE_MAX = 512 * 1024;                 // hard bound on a /upload/probe body
 const CHUNK_MAX_COUNT = 100_000;                    // sanity cap on totalChunks
 const CHUNK_SESSION_TTL_MS = 2 * 60 * 60 * 1000;    // idle-session lifetime before reap
 
@@ -438,12 +455,13 @@ if (typeof chunkReaper.unref === 'function') chunkReaper.unref();
 // buffered in memory (bounded by CHUNK_PART_MAX). Chunk bodies are small by design.
 function parseChunkRequest(
   req: Request,
-  withFile: boolean
+  withFile: boolean,
+  maxFileSize: number = CHUNK_PART_MAX
 ): Promise<{ fields: Record<string, string>; fileBuf: Buffer | null }> {
   return new Promise((resolve, reject) => {
     let bb: ReturnType<typeof busboy>;
     try {
-      bb = busboy({ headers: req.headers, limits: { files: withFile ? 1 : 0, fields: 15, fileSize: CHUNK_PART_MAX } });
+      bb = busboy({ headers: req.headers, limits: { files: withFile ? 1 : 0, fields: 15, fileSize: maxFileSize } });
     } catch {
       return reject(Object.assign(new Error('Expected multipart/form-data'), { status: 400 }));
     }
@@ -459,7 +477,7 @@ function parseChunkRequest(
     bb.on('error', (e: unknown) =>
       reject(Object.assign(new Error(e instanceof Error ? e.message : String(e)), { status: 400 })));
     bb.on('close', () => {
-      if (tooBig) return reject(Object.assign(new Error(`Chunk exceeds ${CHUNK_PART_MAX} bytes`), { status: 413 }));
+      if (tooBig) return reject(Object.assign(new Error(`Chunk exceeds ${maxFileSize} bytes`), { status: 413 }));
       resolve({ fields, fileBuf: parts.length ? Buffer.concat(parts) : null });
     });
     req.on('aborted', () => reject(Object.assign(new Error('client aborted'), { status: 499 })));
@@ -479,10 +497,16 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
   if (totalSize > config.maxUploadSize) {
     return res.status(413).json({ error: `Video exceeds the maximum allowed size of ${Math.round(config.maxUploadSize / (1024 * 1024 * 1024))}GB` });
   }
-  const chunkSize = parseInt(fields.chunkSize || '0', 10);
-  if (!Number.isFinite(chunkSize) || chunkSize < CHUNK_MIN_SIZE || chunkSize > CHUNK_PART_MAX) {
+  const requestedChunkSize = parseInt(fields.chunkSize || '0', 10);
+  if (!Number.isFinite(requestedChunkSize) || requestedChunkSize < CHUNK_MIN_SIZE || requestedChunkSize > CHUNK_PART_MAX) {
     return res.status(400).json({ error: `chunkSize must be between ${CHUNK_MIN_SIZE} and ${CHUNK_PART_MAX} bytes` });
   }
+  // A client that probed the link (POST /upload/probe) sends probed=1 and is
+  // trusted with the size it measured; one that did not is guessing, and gets the
+  // floor. The effective size goes back in the response and the client slices to
+  // THAT, so a clamp here silently corrects a bad guess instead of failing it.
+  const probed = fields.probed === '1';
+  const chunkSize = probed ? requestedChunkSize : Math.min(requestedChunkSize, CHUNK_MAX_UNPROBED);
   const totalChunks = Math.ceil(totalSize / chunkSize);
   if (totalChunks > CHUNK_MAX_COUNT) {
     return res.status(400).json({ error: 'chunkSize too small for this file (too many chunks)' });
@@ -535,8 +559,23 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
   });
 
   const embedUrl = `${config.baseUrl}?v=${owner}/${permlink}`;
-  console.log(`Chunked upload session created: ${owner}/${permlink} [${frontend_app}] (${totalSize} bytes, ${totalChunks}x${chunkSize})`);
+  console.log(`Chunked upload session created: ${owner}/${permlink} [${frontend_app}] (${totalSize} bytes, ${totalChunks}x${chunkSize}${probed ? ', probed' : `, clamped from ${requestedChunkSize}`})`);
   res.status(201).json({ success: true, sessionId, chunkSize, totalChunks, received: [], permlink, owner, embed_url: embedUrl });
+});
+
+// Throughput probe. The client pushes a small blob, times it, and sizes its
+// chunks from what the link actually did instead of from navigator.connection.
+// The probe is the smallest body the client will ever send, so a probe that
+// cannot get through is itself the answer: take the floor.
+//
+// Unauthenticated on purpose — it runs BEFORE the upload token is minted (create
+// consumes it), it writes nothing, and the body is bounded by CHUNK_PROBE_MAX.
+// The bytes are read only to drain the socket, then dropped.
+app.post('/upload/probe', async (req: Request, res: Response) => {
+  let fileBuf: Buffer | null;
+  try { ({ fileBuf } = await parseChunkRequest(req, true, CHUNK_PROBE_MAX)); }
+  catch (e) { return res.status((e as any)?.status || 400).json({ error: (e as any)?.message || 'Bad request' }); }
+  res.json({ ok: true, bytes: fileBuf ? fileBuf.length : 0 });
 });
 
 app.post('/upload/chunk/status', async (req: Request, res: Response) => {
