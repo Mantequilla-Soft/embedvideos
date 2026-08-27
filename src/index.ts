@@ -50,6 +50,13 @@ const cleanupService = new CleanupService(config.uploadDir, config.cleanupRetent
 // Middleware
 app.use(cors({
   exposedHeaders: ['X-Embed-URL', 'x-embed-url'],
+  // Every chunk POST carries an upload progress listener, which makes it a
+  // non-simple request, which makes the browser preflight it. With no Max-Age
+  // Chrome caches that preflight for 5 SECONDS, so the chunked path was paying a
+  // full extra round trip per chunk: 923 preflights for 931 chunk POSTs measured
+  // over two days. On a 250ms mobile RTT that is most of a second per chunk, spent
+  // on links that have none to spare. 600 is Chrome's ceiling; it ignores more.
+  maxAge: 600,
 }));
 app.use(express.json());
 
