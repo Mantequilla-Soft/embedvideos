@@ -65,6 +65,9 @@ export interface VideoMetadata {
   hive_tags: string[] | null;
   embed_url: string | null;
   embed_title: string | null;
+  /** Keyed hashes of the uploader's address and its /24 (/48); see utils/ipHash.ts. Never the address. */
+  uploader_ip_hash?: string | null;
+  uploader_net_hash?: string | null;
   listed_on_3speak: boolean;
   processed: boolean;
   processedAt: Date | null;

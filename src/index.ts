@@ -20,6 +20,7 @@ import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
 import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
+import { clientIpFrom, ipHashes } from './utils/ipHash';
 
 dotenv.config();
 
@@ -365,6 +366,7 @@ app.post('/upload/simple', (req: Request, res: Response) => {
       originalFilename,
       hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
       embed_url: null, embed_title: null,
+      ...ipHashes(clientIpFrom(req.headers)),
       listed_on_3speak: frontend_app === '3speak-tv',
       processed: false, processedAt: null, views: 0,
       createdAt: new Date(), updatedAt: new Date(),
@@ -535,6 +537,7 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
     originalFilename,
     hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
     embed_url: null, embed_title: null,
+    ...ipHashes(clientIpFrom(req.headers)),
     listed_on_3speak: frontend_app === '3speak-tv',
     processed: false, processedAt: null, views: 0,
     createdAt: new Date(), updatedAt: new Date(),
@@ -775,6 +778,8 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       hive_tags: null,
       embed_url: null,
       embed_title: null,
+      // tusd hands over the original request headers; X-Real-IP comes from nginx.
+      ...ipHashes(clientIpFrom(HTTPRequest?.Header)),
       listed_on_3speak: frontend_app === '3speak-tv',
       processed: false,
       processedAt: null,
