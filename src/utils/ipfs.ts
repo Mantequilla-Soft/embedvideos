@@ -158,6 +158,8 @@ async function unpinFromIpfs(apiUrl: string, cid: string): Promise<void> {
   });
 }
 
+const DHT_PROVIDE_TIMEOUT_MS = 30_000;
+
 async function provideDHT(apiUrl: string, cid: string): Promise<void> {
   return new Promise((resolve, reject) => {
     // Kubo removed /api/v0/dht/provide; the replacement is /api/v0/routing/provide
@@ -188,11 +190,18 @@ async function provideDHT(apiUrl: string, cid: string): Promise<void> {
         resolve();
       });
     });
-    
+
     req.on('error', (error) => {
       reject(error);
     });
-    
+
+    // A provide normally answers in under a second, but Kubo has been seen to
+    // never answer one at all (2026-10-29: vynith/b9q487p6 hung for hours).
+    // Without a cap the request, and anything awaiting it, waits forever.
+    req.setTimeout(DHT_PROVIDE_TIMEOUT_MS, () => {
+      req.destroy(new Error(`IPFS DHT provide timed out after ${DHT_PROVIDE_TIMEOUT_MS}ms`));
+    });
+
     req.end();
   });
 }
