@@ -1,62 +1,38 @@
 import { createReadStream } from 'fs';
-import { loadConfig } from '../config/config';
 import FormData from 'form-data';
 import http from 'http';
 import https from 'https';
 
-const config = loadConfig();
+const LOCAL_IPFS_ENDPOINT = 'http://127.0.0.1:5001';
 
 /**
- * Pin a file to IPFS using local daemon first, fallback to supernode
+ * Pin a file to the local IPFS daemon
  * @param filePath Absolute path to the file to pin
  * @returns Object with CID and endpoint where it was pinned
  */
 export async function pinFile(filePath: string): Promise<{ cid: string; endpoint: string }> {
-  const localEndpoint = 'http://127.0.0.1:5001';
-  
-  // Try local daemon first
+  console.log(`Attempting to pin to local IPFS daemon: ${LOCAL_IPFS_ENDPOINT}`);
   try {
-    console.log(`Attempting to pin to local IPFS daemon: ${localEndpoint}`);
-    const cid = await addToIpfs(localEndpoint, filePath);
+    const cid = await addToIpfs(LOCAL_IPFS_ENDPOINT, filePath);
     console.log(`Successfully pinned to local daemon: ${cid}`);
-    return { cid, endpoint: localEndpoint };
+    return { cid, endpoint: LOCAL_IPFS_ENDPOINT };
   } catch (localError) {
-    console.warn(`Local IPFS daemon failed: ${localError}`);
-    console.log(`Falling back to supernode: ${config.ipfsSupernodeEndpoint}`);
-    
-    // Fallback to supernode
-    try {
-      const cid = await addToIpfs(config.ipfsSupernodeEndpoint, filePath);
-      console.log(`Successfully pinned to supernode: ${cid}`);
-      return { cid, endpoint: config.ipfsSupernodeEndpoint };
-    } catch (supernodeError) {
-      console.error(`Supernode IPFS failed: ${supernodeError}`);
-      throw new Error(`Failed to pin file to IPFS: ${supernodeError}`);
-    }
+    console.error(`Local IPFS daemon failed: ${localError}`);
+    throw new Error(`Failed to pin file to IPFS: ${localError}`);
   }
 }
 
 /**
- * Announce CID to DHT for better discoverability
+ * Announce CID to DHT via the local daemon, which holds the block
  * @param cid IPFS CID to announce
  */
 export async function announceDHT(cid: string): Promise<void> {
-  // Try local daemon first
   try {
     console.log(`Announcing to DHT via local daemon: ${cid}`);
-    await provideDHT('http://127.0.0.1:5001', cid);
+    await provideDHT(LOCAL_IPFS_ENDPOINT, cid);
     console.log(`Successfully announced to DHT via local daemon: ${cid}`);
   } catch (localError) {
     console.warn(`Local IPFS daemon DHT announce failed: ${localError}`);
-  }
-  
-  // Try supernode
-  try {
-    console.log(`Announcing to DHT via supernode: ${cid}`);
-    await provideDHT(config.ipfsSupernodeEndpoint, cid);
-    console.log(`Successfully announced to DHT via supernode: ${cid}`);
-  } catch (supernodeError) {
-    console.warn(`Supernode IPFS DHT announce failed: ${supernodeError}`);
   }
 }
 

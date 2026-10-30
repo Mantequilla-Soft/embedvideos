@@ -20,7 +20,6 @@ export interface Config {
   demoApiKey: string;
   adminPassword: string;
   ipfsApiAddr: string;
-  ipfsSupernodeEndpoint: string;
   encoders: EncoderConfig[];
   webhookApiKey: string;
   webhookUrl: string;
@@ -94,7 +93,6 @@ export function loadConfig(): Config {
     demoApiKey: process.env.DEMO_API_KEY || 'sk_demo_b0d3f4b972c5065b701394df3de2f44fd59aa3244c58c478',
     adminPassword: process.env.ADMIN_PASSWORD || 'change-me-in-production',
     ipfsApiAddr: process.env.IPFS_API_ADDR || '/ip4/127.0.0.1/tcp/5001',
-    ipfsSupernodeEndpoint: process.env.THREESPEAK_IPFS_ENDPOINT || 'http://65.21.201.94:5002',
     encoders: parseEncoders(),
     webhookApiKey: process.env.WEBHOOK_API_KEY || '',
     webhookUrl: process.env.WEBHOOK_URL || '',
