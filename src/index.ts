@@ -944,11 +944,14 @@ async function processUploadAsync(
     const { cid: input_cid, endpoint: ipfs_pin_endpoint } = await pinFile(filePath);
     console.log(`File pinned successfully: ${input_cid} at ${ipfs_pin_endpoint}`);
 
-    try {
-      await announceDHT(input_cid);
-    } catch (dhtError) {
+    // Not awaited: the announce only helps outside peers find the file, and
+    // nothing below needs it. Awaiting it held the video at `uploading` for as
+    // long as Kubo took to answer, so a provide that never answered left the
+    // upload stuck there for good and every publish attempt 409'd
+    // not_awaiting_encode (vynith/b9q487p6, 2026-10-29).
+    announceDHT(input_cid).catch((dhtError) => {
       console.warn(`DHT announcement failed (non-critical): ${dhtError}`);
-    }
+    });
 
     await db.updateVideoStatus(permlink, 'processing', {
       size: uploadSize,
