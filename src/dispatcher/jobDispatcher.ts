@@ -1,6 +1,13 @@
 import { Database, Encoder, EncoderTier, EncodingJob } from '../database/mongodb';
 import { Config } from '../config/config';
 
+/** A dispatch failure after an encoder was chosen, so the caller knows whom to exclude next time. */
+class EncoderDispatchError extends Error {
+  constructor(message: string, readonly encoderName: string) {
+    super(message);
+  }
+}
+
 export class JobDispatcher {
   private database: Database;
   private config: Config;
@@ -22,6 +29,9 @@ export class JobDispatcher {
    *   Free jobs    → standard or lite (any access). Never performance.
    *   Short videos → any managed encoder (any tier), filtered by maxFileSize. Fast turnaround, but 480p doesn't need performance tier.
    *   Gated jobs   → TRUSTED managed encoders only, at any tier. No fallback.
+   *   Retries      → encoders that already failed this job are skipped, unless
+   *                  no other encoder can take it (then they are used again
+   *                  rather than leaving the job stuck in pending).
    *
    * File size is checked against encoder.maxFileSize when set.
    *
@@ -31,7 +41,7 @@ export class JobDispatcher {
    * an untrusted encoder" true by construction rather than by inspection of
    * each branch.
    */
-  private async getNextEncoder(premium: boolean, fileSize: number | null, isShort: boolean, gated: boolean) {
+  private async getNextEncoder(premium: boolean, fileSize: number | null, isShort: boolean, gated: boolean, failedWorkers: string[] = []): Promise<Encoder> {
     const allEncoders = await this.database.getAllEncoders();
 
     let candidates = allEncoders.filter(e =>
@@ -53,6 +63,32 @@ export class JobDispatcher {
 
     const tierKeyPrefix = gated ? 'gated-' : '';
 
+    // Narrowing only, like the trusted filter above: the fallback is the pool we
+    // already had, so it can never widen a gated job past the trusted set.
+    const failed = new Set(failedWorkers);
+    const fresh = candidates.filter(e => !failed.has(e.name));
+    const chosen = (fresh.length < candidates.length && this.pickByTier(fresh, premium, fileSize, isShort, tierKeyPrefix))
+      || this.pickByTier(candidates, premium, fileSize, isShort, tierKeyPrefix);
+    if (chosen) return chosen;
+
+    if (premium) {
+      throw new Error(
+        gated
+          ? 'No suitable trusted encoders available for premium gated job'
+          : 'No suitable managed encoders available for premium job'
+      );
+    }
+    throw new Error(
+      gated
+        ? 'No suitable trusted encoders available for gated job'
+        : 'No suitable encoders available for free job'
+    );
+  }
+
+  /** The tier rules. Returns null when no candidate fits. */
+  private pickByTier(candidates: Encoder[], premium: boolean, fileSize: number | null, isShort: boolean, tierKeyPrefix: string): Encoder | null {
+    if (candidates.length === 0) return null;
+
     if (isShort) {
       // Short videos — managed only (fast turnaround), any tier (480p doesn't need GPU)
       const eligibleShort = candidates.filter(
@@ -71,11 +107,7 @@ export class JobDispatcher {
       const stdEncoders = this.filterByTierAndSize(candidates, 'standard', fileSize);
       if (stdEncoders.length > 0) return this.roundRobin(stdEncoders, `${tierKeyPrefix}standard`);
 
-      throw new Error(
-        gated
-          ? 'No suitable trusted encoders available for premium gated job'
-          : 'No suitable managed encoders available for premium job'
-      );
+      return null;
     }
 
     // Free user: try managed standard first, then managed lite. Never performance.
@@ -86,11 +118,7 @@ export class JobDispatcher {
     const liteEncoders = this.filterByTierAndSize(candidates, 'lite', fileSize);
     if (liteEncoders.length > 0) return this.roundRobin(liteEncoders, `${tierKeyPrefix}free-lite`);
 
-    throw new Error(
-      gated
-        ? 'No suitable trusted encoders available for gated job'
-        : 'No suitable encoders available for free job'
-    );
+    return null;
   }
 
   /**
@@ -176,7 +204,7 @@ export class JobDispatcher {
         }
 
         // Atomically reset only if still encoding (prevents race with webhook completion)
-        const wasReset = await this.database.resetStalledJob(job.owner, job.permlink);
+        const wasReset = await this.database.resetStalledJob(job.owner, job.permlink, job.assignedWorker);
         if (wasReset) {
           console.log(`Stalled job reset to pending: ${job.owner}/${job.permlink}`);
         } else {
@@ -211,7 +239,8 @@ export class JobDispatcher {
         } catch (error) {
           console.error(`Failed to dispatch job ${job.owner}/${job.permlink}:`, error);
 
-          await this.database.incrementJobAttempt(job.owner, job.permlink);
+          const failedWorker = error instanceof EncoderDispatchError ? error.encoderName : null;
+          await this.database.incrementJobAttempt(job.owner, job.permlink, failedWorker);
           await this.database.updateJobStatus(job.owner, job.permlink, 'pending', {
             lastError: error instanceof Error ? error.message : String(error),
           });
@@ -272,7 +301,7 @@ export class JobDispatcher {
       ...(gated ? { gated: true, gate_video_id: gateVideoId } : {}),
     };
 
-    const encoder = await this.getNextEncoder(premium, fileSize, video.short, gated);
+    const encoder = await this.getNextEncoder(premium, fileSize, video.short, gated, job.failedWorkers ?? []);
 
     // Belt and braces. getNextEncoder already guarantees this, but the check is
     // one line and the failure it guards against is unrecoverable, so it is
@@ -288,21 +317,26 @@ export class JobDispatcher {
     console.log(`Dispatching job to [${encoder.name}] (${encoderAccess}/${encoderTier}${gated ? '/trusted' : ''}): ${owner}/${permlink} [premium=${premium}, gated=${gated}, size=${fileSize}]`);
     console.log(`Encoder request payload:`, JSON.stringify(encoderRequest, null, 2));
 
-    const response = await fetch(`${encoder.url}/encode`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': encoder.apiKey,
-      },
-      body: JSON.stringify(encoderRequest),
-    });
+    let result: { job_id: string; encoder_id?: string };
+    try {
+      const response = await fetch(`${encoder.url}/encode`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': encoder.apiKey,
+        },
+        body: JSON.stringify(encoderRequest),
+      });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Encoder API error: ${response.status} - ${errorText}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Encoder API error: ${response.status} - ${errorText}`);
+      }
+
+      result = await response.json() as { job_id: string; encoder_id?: string };
+    } catch (error) {
+      throw new EncoderDispatchError(error instanceof Error ? error.message : String(error), encoder.name);
     }
-
-    const result = await response.json() as { job_id: string; encoder_id?: string };
     console.log(`Job dispatched successfully to [${encoder.name}]: ${result.job_id}`);
 
     // Job is already 'encoding' from the atomic claim; just fill in the encoder details.

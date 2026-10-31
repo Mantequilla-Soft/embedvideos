@@ -1178,7 +1178,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
           encodingProgress: null,
           encodingStage: null,
         });
-        await database.incrementJobAttempt(owner, permlink);
+        await database.incrementJobAttempt(owner, permlink, job.assignedWorker);
         await database.updateVideoStatus(permlink, 'processing', { encodingProgress: 0 });
         console.warn(`Encoding failed for ${owner}/${permlink} (attempt ${nextAttempt}/${MAX_ENCODE_ATTEMPTS + 1}): ${encoderError} — requeueing`);
         res.json({ success: true, message: 'Webhook processed (failure recorded, job requeued)' });
