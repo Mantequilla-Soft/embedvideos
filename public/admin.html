@@ -289,12 +289,13 @@
             <th>Tier</th>
             <th>Status</th>
             <th>Info</th>
+            <th>Version</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody id="encodersTableBody">
           <tr>
-            <td colspan="6" style="text-align: center; padding: 30px; color: #999;">Loading...</td>
+            <td colspan="7" style="text-align: center; padding: 30px; color: #999;">Loading...</td>
           </tr>
         </tbody>
       </table>
@@ -571,7 +572,7 @@
         const tbody = document.getElementById('encodersTableBody');
 
         if (currentEncoders.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 30px; color: #999;">No encoders configured</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 30px; color: #999;">No encoders configured</td></tr>';
           return;
         }
 
@@ -594,6 +595,7 @@
           const infoCol = isCommunity
             ? `<span style="font-size:11px;color:#666;">${enc.did ? 'did:...' + escapeHtml(enc.did.slice(-8)) : ''}</span>${enc.hiveAccount ? `<br><span style="font-size:11px;">@${escapeHtml(enc.hiveAccount)}</span>` : ''}`
             : `<span style="font-family:monospace;font-size:11px;">${escapeHtml(enc.url)}</span>`;
+          const versionCol = versionCell(enc, isCommunity);
           const bannedBadge = enc.banned ? ' <span style="background:#e74c3c;color:white;padding:2px 6px;border-radius:10px;font-size:10px;">banned</span>' : '';
           // Use data attributes for encoder name to avoid inline JS injection
           const nameAttr = encodeURIComponent(enc.name);
@@ -609,6 +611,7 @@
               </span>
             </td>
             <td>${infoCol}</td>
+            <td>${versionCol}</td>
             <td style="display: flex; gap: 6px; flex-wrap: wrap;">
               <button type="button" class="btn btn-small" data-action="edit" data-name="${nameAttr}">Edit</button>
               ${enc.enabled
@@ -836,6 +839,26 @@
       const div = document.createElement('div');
       div.textContent = str;
       return div.innerHTML;
+    }
+
+    function escapeAttr(str) {
+      return escapeHtml(String(str)).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // Managed encoders don't report a version (they don't register over JWS).
+    function versionCell(enc, isCommunity) {
+      if (!isCommunity) return '<span style="color:#999;">—</span>';
+      // Server only stores 40-char lowercase hex, but re-check before building a URL from it.
+      if (!enc.encoderCommit || !/^[0-9a-f]{40}$/.test(enc.encoderCommit)) {
+        const tip = enc.commitHash ? ` title="commit_hash: ${escapeAttr(enc.commitHash)}"` : '';
+        return `<span style="background:#e2e3e5;color:#6c757d;padding:2px 6px;border-radius:10px;font-size:10px;"${tip}>legacy</span>`;
+      }
+      const sha = enc.encoderCommit;
+      const link = `<a href="https://github.com/Mantequilla-Soft/3speakencoder/commit/${sha}" target="_blank" rel="noopener noreferrer" style="font-family:monospace;font-size:11px;" title="${sha}">${sha.slice(0, 7)}</a>`;
+      const behind = typeof enc.behindBy === 'number' && enc.behindBy > 0
+        ? ` <span style="background:#fff3cd;color:#856404;padding:2px 6px;border-radius:10px;font-size:10px;">${enc.behindBy} behind</span>`
+        : '';
+      return link + behind;
     }
 
     function formatTime(ms) {
