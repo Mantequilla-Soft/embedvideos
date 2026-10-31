@@ -67,6 +67,8 @@ export function buildRegistrationVersionUpdate(reported: ReportedVersion, now: D
  */
 export function buildHeartbeatVersionUpdate(reported: ReportedVersion, storedCommit: string | undefined, now: Date): VersionUpdate {
   const update: VersionUpdate = { $set: {}, $unset: {} };
+  // Same rule as registration: a behind count with no known commit means nothing.
+  if ((reported.encoderCommit ?? storedCommit) === undefined) return update;
 
   if (reported.encoderCommit !== undefined && reported.encoderCommit !== storedCommit) {
     update.$set.encoderCommit = reported.encoderCommit;

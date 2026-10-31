@@ -212,7 +212,7 @@ export interface Encoder {
   /** Full SHA the encoder reports running. Missing = legacy (non-reporting) encoder. */
   encoderCommit?: string;
   /** Commits behind the encoder's upstream branch, as the encoder last measured it. */
-  behindBy?: number | null;
+  behindBy?: number;
   versionReportedAt?: Date;
   lastSeenAt?: Date;
   banned?: boolean;

@@ -117,4 +117,4 @@ Encoders running 3speakencoder with `EMBED_REPORT_COMMIT=true` add `encoder_comm
 
 Observability only: invalid values are dropped, never rejected, and an encoder that doesn't report is shown as "legacy". Registration describes the code running now, so it clears whatever it doesn't report. Heartbeats only add, because encoders with the flag off never send the fields. Parsing and update building live in `src/utils/encoderVersion.ts` (pure).
 
-Tests: `npx ts-node --transpile-only scripts/test-encoder-version.ts` (30 checks, no MongoDB required).
+Tests: `npx ts-node --transpile-only scripts/test-encoder-version.ts` (31 checks, no MongoDB required).

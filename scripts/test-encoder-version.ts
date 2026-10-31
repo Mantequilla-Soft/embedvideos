@@ -99,6 +99,10 @@ section('buildHeartbeatVersionUpdate');
   ok('behind_by only → updates behindBy', u.$set.behindBy === 7 && u.$set.versionReportedAt === NOW && isEmpty(u.$unset));
 }
 {
+  const u = buildHeartbeatVersionUpdate({ behindBy: 7 }, undefined, NOW);
+  ok('behind_by with no commit known → no change', isEmpty(u.$set) && isEmpty(u.$unset));
+}
+{
   const u = buildHeartbeatVersionUpdate({ encoderCommit: SHA, behindBy: 2 }, SHA, NOW);
   ok('same commit is not rewritten', !('encoderCommit' in u.$set) && u.$set.behindBy === 2);
 }
