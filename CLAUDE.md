@@ -110,3 +110,11 @@ A finalize token is rejected by `validateUploadAuth` (before consumption) so it 
 Deferred uploads that never reach step 3 are swept after `DEFERRED_ENCODE_ABANDON_HOURS` (12h): the input is unpinned and the row marked failed. This matters most for gated content, since that pinned input is the plaintext original.
 
 Tests: `npx ts-node --transpile-only scripts/test-deferred-encode.ts` (14 checks, no MongoDB required).
+
+### Community encoder version reporting
+
+Encoders running 3speakencoder with `EMBED_REPORT_COMMIT=true` add `encoder_commit` (full 40-char lowercase SHA) and `behind_by` (integer 0–100000) to the `updateNode` `node_info` and to the heartbeat payload. Stored as `encoderCommit` / `behindBy` / `versionReportedAt`; shown in the admin "Version" column and, shortened, on `GET /api/v0/encoders/community`.
+
+Observability only: invalid values are dropped, never rejected, and an encoder that doesn't report is shown as "legacy". Registration describes the code running now, so it clears whatever it doesn't report. Heartbeats only add, because encoders with the flag off never send the fields. Parsing and update building live in `src/utils/encoderVersion.ts` (pure).
+
+Tests: `npx ts-node --transpile-only scripts/test-encoder-version.ts` (31 checks, no MongoDB required).

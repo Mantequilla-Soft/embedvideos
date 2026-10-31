@@ -1,4 +1,5 @@
 import { MongoClient, Db, Collection } from 'mongodb';
+import { VersionUpdate } from '../utils/encoderVersion';
 
 export type VideoStatus =
   | 'uploading'
@@ -208,6 +209,11 @@ export interface Encoder {
   hiveAccount?: string;
   peerId?: string;
   commitHash?: string;
+  /** Full SHA the encoder reports running. Missing = legacy (non-reporting) encoder. */
+  encoderCommit?: string;
+  /** Commits behind the encoder's upstream branch, as the encoder last measured it. */
+  behindBy?: number;
+  versionReportedAt?: Date;
   lastSeenAt?: Date;
   banned?: boolean;
   createdAt: Date;
@@ -870,7 +876,7 @@ export class Database {
     hiveAccount?: string;
     peerId?: string;
     commitHash?: string;
-  }): Promise<Encoder> {
+  }, version: VersionUpdate): Promise<Encoder> {
     if (!this.db) {
       throw new Error('Database not connected');
     }
@@ -887,9 +893,11 @@ export class Database {
           ...(data.hiveAccount !== undefined && { hiveAccount: data.hiveAccount }),
           ...(data.peerId !== undefined && { peerId: data.peerId }),
           ...(data.commitHash !== undefined && { commitHash: data.commitHash }),
+          ...version.$set,
           lastSeenAt: now,
           updatedAt: now,
         },
+        ...(Object.keys(version.$unset).length > 0 && { $unset: version.$unset }),
         $setOnInsert: {
           name: stableName,
           did,
@@ -909,14 +917,17 @@ export class Database {
     return result!;
   }
 
-  async updateEncoderLastSeen(did: string): Promise<void> {
+  async updateEncoderLastSeen(did: string, version?: VersionUpdate): Promise<void> {
     if (!this.db) {
       throw new Error('Database not connected');
     }
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await encodersCollection.updateOne(
       { did },
-      { $set: { lastSeenAt: new Date() } }
+      {
+        $set: { ...version?.$set, lastSeenAt: new Date() },
+        ...(version && Object.keys(version.$unset).length > 0 && { $unset: version.$unset }),
+      }
     );
   }
 

@@ -21,6 +21,7 @@ import { CleanupService } from './utils/cleanup';
 import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
 import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
 import { clientIpFrom, ipHashes } from './utils/ipHash';
+import { parseReportedVersion, buildRegistrationVersionUpdate, buildHeartbeatVersionUpdate } from './utils/encoderVersion';
 
 dotenv.config();
 
@@ -1263,13 +1264,14 @@ app.post('/api/v0/gateway/updateNode', async (req: Request, res: Response) => {
     const hiveAccount = nodeInfo.cryptoAccounts?.hive || nodeInfo.hive_account;
     const peerId = nodeInfo.peer_id;
     const commitHash = nodeInfo.commit_hash;
+    const version = buildRegistrationVersionUpdate(parseReportedVersion(nodeInfo), new Date());
 
     const encoder = await database.upsertCommunityEncoder(did, {
       name,
       hiveAccount,
       peerId,
       commitHash,
-    });
+    }, version);
 
     console.log(`Community encoder registered: ${encoder.name} (${did})${hiveAccount ? ` [hive: ${hiveAccount}]` : ''}`);
     res.json({
@@ -1412,6 +1414,8 @@ app.get('/api/v0/encoders/community', async (req: Request, res: Response) => {
         enabled: e.enabled,
         banned: e.banned ?? false,
         lastSeenAt: e.lastSeenAt ?? null,
+        commit: e.encoderCommit ? e.encoderCommit.slice(0, 7) : null,
+        behindBy: e.encoderCommit ? (e.behindBy ?? null) : null,
         alive: e.lastSeenAt ? (now - new Date(e.lastSeenAt).getTime()) < ALIVE_THRESHOLD_MS : false,
       }));
 
