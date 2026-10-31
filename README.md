@@ -6,7 +6,7 @@ A modern, scalable video upload and encoding service with TUS resumable uploads,
 
 - **TUS Resumable Uploads**: Robust video uploads with pause/resume support
 - **Instant Embed URLs**: Get playable embed URLs immediately upon upload start
-- **IPFS Storage**: Automatic pinning to IPFS (local daemon + supernode fallback)
+- **IPFS Storage**: Automatic pinning to IPFS (local daemon)
 - **Multi-Encoder Support**: Round-robin load balancing across multiple encoder nodes
 - **Encoder Management**: Add, update, enable/disable encoders via admin panel or API
 - **Job Dispatcher**: Automatic job queuing and distribution to available encoders
