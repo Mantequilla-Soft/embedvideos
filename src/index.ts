@@ -1166,9 +1166,22 @@ app.post('/webhook', async (req: Request, res: Response) => {
       const MAX_ENCODE_ATTEMPTS = 2;
       const job = await database.getJob(owner, permlink);
 
+      // A late report from an encoder that already lost the job (stalled, then
+      // reassigned). Acting on it would requeue the new encoder's live work and
+      // blame that encoder in failedWorkers. Managed encoders share one API key,
+      // so the job id is the only way to tell; community jobs have no
+      // encoderJobId, and their per-claim callback token already rejects stale reports.
+      if (job && job_id && job.encoderJobId && job_id !== job.encoderJobId) {
+        console.warn(`Ignoring stale failure webhook for ${owner}/${permlink}: job_id ${job_id} is not the current ${job.encoderJobId} on [${job.assignedWorker}]`);
+        return res.json({ success: true, message: 'Stale failure ignored' });
+      }
+
       if (job && job.attemptCount < MAX_ENCODE_ATTEMPTS) {
         // Still within retry budget — requeue for the dispatcher to pick up.
         const nextAttempt = job.attemptCount + 1;
+        // Record the exclusion while the job is still 'encoding' and unclaimable;
+        // once it is 'pending' a poll could hand it straight back to this encoder.
+        await database.incrementJobAttempt(owner, permlink, job.assignedWorker);
         await database.updateJobStatus(owner, permlink, 'pending', {
           webhookReceivedAt: new Date(),
           lastError: `${encoderError || 'Encoding failed'} (attempt ${nextAttempt}/${MAX_ENCODE_ATTEMPTS + 1}, requeueing)`,
@@ -1178,7 +1191,6 @@ app.post('/webhook', async (req: Request, res: Response) => {
           encodingProgress: null,
           encodingStage: null,
         });
-        await database.incrementJobAttempt(owner, permlink);
         await database.updateVideoStatus(permlink, 'processing', { encodingProgress: 0 });
         console.warn(`Encoding failed for ${owner}/${permlink} (attempt ${nextAttempt}/${MAX_ENCODE_ATTEMPTS + 1}): ${encoderError} — requeueing`);
         res.json({ success: true, message: 'Webhook processed (failure recorded, job requeued)' });

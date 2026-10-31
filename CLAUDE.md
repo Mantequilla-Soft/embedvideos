@@ -44,6 +44,15 @@ Encoders have `tier` (`performance` | `standard` | `lite`) and `access` (`manage
 - Short videos → any managed encoder (tier ignored, 480p doesn't need GPU)
 - Community encoders always pull; never push-dispatched regardless of tier
 - **Gated jobs → `trusted: true` managed encoders only, any tier, no fallback**
+- Retries skip encoders in the job's `failedWorkers` when another encoder can take it (see below)
+
+### Retrying on a different encoder
+
+A job that fails (failure webhook), stalls, or can't be sent (dispatch error) goes back to `pending`, and the encoder involved is `$addToSet` into `failedWorkers` on the job. `getNextEncoder` drops those encoders from the pool right after the trusted filter, and only if the tier rules can't place the job without them does it try again with the full pool. So a job is never stuck just because its only suitable encoder failed it once. Like the trusted filter, this only narrows the pool: a gated job can't reach an untrusted encoder through it.
+
+Community pull uses `failedWorkers: { $ne: encoderName }`, which also matches jobs without the field. `resetJob` (admin retry) clears the list along with `attemptCount`.
+
+Tests: `npx ts-node --transpile-only scripts/test-retry-dispatch.ts` (18 checks, no MongoDB required).
 
 ### Gated (paid) content and encoder trust
 

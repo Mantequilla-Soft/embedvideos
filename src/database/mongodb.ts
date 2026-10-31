@@ -260,6 +260,12 @@ export interface EncodingJob {
   gated?: boolean;
   /** Video id the gate knows this asset by; passed through to the encoder. */
   gateVideoId?: string | null;
+  /**
+   * Encoders that failed, stalled on or rejected this job. Retries skip them
+   * when another encoder can take the job. Missing on jobs from before this
+   * field existed, which means "none".
+   */
+  failedWorkers?: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -624,14 +630,18 @@ export class Database {
     );
   }
 
-  async incrementJobAttempt(owner: string, permlink: string): Promise<void> {
+  async incrementJobAttempt(owner: string, permlink: string, failedWorker: string | null = null): Promise<void> {
     if (!this.db) {
       throw new Error('Database not connected');
     }
     const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
     await jobsCollection.updateOne(
       { owner, permlink },
-      { $inc: { attemptCount: 1 }, $set: { updatedAt: new Date() } }
+      {
+        $inc: { attemptCount: 1 },
+        $set: { updatedAt: new Date() },
+        ...(failedWorker && { $addToSet: { failedWorkers: failedWorker } }),
+      }
     );
   }
 
@@ -654,11 +664,13 @@ export class Database {
           encodingStage: null,
           updatedAt: new Date(),
         },
+        // A reset is a fresh start: the attempt budget and the exclusions go together.
+        $unset: { failedWorkers: '' },
       }
     );
   }
 
-  async resetStalledJob(owner: string, permlink: string): Promise<boolean> {
+  async resetStalledJob(owner: string, permlink: string, stalledWorker: string | null): Promise<boolean> {
     if (!this.db) {
       throw new Error('Database not connected');
     }
@@ -677,6 +689,7 @@ export class Database {
           updatedAt: new Date(),
         },
         $inc: { attemptCount: 1 },
+        ...(stalledWorker && { $addToSet: { failedWorkers: stalledWorker } }),
       }
     );
     return result.modifiedCount > 0;
@@ -952,6 +965,10 @@ export class Database {
       // The myJob handler re-checks the video after claiming, so a job that
       // somehow missed this denormalisation still cannot leak.
       gated: { $ne: true },
+      // Don't hand a job back to the encoder that already failed it; another
+      // community node or a managed encoder can take it. $ne on an array field
+      // also matches jobs without the field, so older jobs are unaffected.
+      failedWorkers: { $ne: encoderName },
     };
 
     // Capped encoders only claim jobs with known size within bounds
