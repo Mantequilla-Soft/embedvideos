@@ -229,6 +229,8 @@ export interface VideofixerJobView {
   lastError: string | null;
   attemptCount: number;
   assignedWorker: string | null;
+  /** Encoders that failed this job; retries skip them. Empty for jobs without the field. */
+  failedWorkers: string[];
   premium?: boolean;
   short?: boolean;
   createdAt: Date;
@@ -753,7 +755,8 @@ export class Database {
       { $unwind: { path: '$video', preserveNullAndEmptyArrays: true } },
       { $project: {
           _id: 0, owner: 1, permlink: 1, status: 1, lastError: 1, attemptCount: 1,
-          assignedWorker: 1, premium: 1, short: 1, createdAt: 1, updatedAt: 1, webhookReceivedAt: 1,
+          assignedWorker: 1, failedWorkers: { $ifNull: ['$failedWorkers', []] },
+          premium: 1, short: 1, createdAt: 1, updatedAt: 1, webhookReceivedAt: 1,
           input_cid: '$video.input_cid', originalFilename: '$video.originalFilename', videoStatus: '$video.status',
         } },
     ]).toArray();
