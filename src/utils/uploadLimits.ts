@@ -8,7 +8,9 @@
  * says the bytes landed (COUNTED_UPLOAD_STATUSES in database/mongodb.ts). An
  * upload still in flight, a failed one and a deleted one do not use a slot.
  * Stream recordings (VODs) published by the hangouts server never count and are
- * never refused.
+ * never refused. Nor are replacements: an upload that replaces the media of an
+ * existing video of the same owner (verified against the database, see
+ * verifyReplacementTarget), as long as it is then registered as one.
  *
  * Who is exempt: owners listed in UPLOAD_LIMIT_EXEMPT, 3Speak Pro owners
  * (embed-users `premium`), and warm-up accounts (incubating users with no Hive
@@ -42,6 +44,46 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
 /** `frontend_app` the hangouts server stamps on the stream recordings it publishes. */
 export const STREAM_VOD_APP = '3speak-hangouts';
 export const LIMIT_ERROR_CODE = 'daily_upload_limit';
+/**
+ * A replacement upload that was never registered as one (POST
+ * /video/:permlink/replaces) within this long of its creation starts counting
+ * like a normal upload. The frontend registers right after the bytes land, so
+ * this only has to outlast a slow upload. It closes the obvious dodge: claiming
+ * "replaces my old video" on every upload and then using the new asset as an
+ * ordinary video.
+ */
+export const REPLACEMENT_REGISTER_GRACE_MS = 6 * 60 * 60 * 1000;
+
+/** What verifyReplacementTarget needs from the database. */
+export interface ReplacementLookups {
+  getVideo(permlink: string): Promise<{ owner: string } | null>;
+  getLegacyVideo(permlink: string): Promise<{ owner: string } | null>;
+}
+
+/**
+ * Is `target` an existing video (embed-video, or the legacy `videos`
+ * collection) owned by `owner`? Same rule POST /video/:permlink/replaces
+ * applies when the swap is registered. A client flag alone never makes an
+ * upload a replacement. Lookup errors answer false, so the upload is simply
+ * treated as an ordinary one (and the limit check fails open on its own).
+ */
+export async function verifyReplacementTarget(
+  db: ReplacementLookups,
+  owner: string,
+  target: unknown,
+  newPermlink?: string,
+): Promise<boolean> {
+  if (typeof target !== 'string' || !target.trim()) return false;
+  const t = target.trim();
+  if (newPermlink && t === newPermlink) return false;
+  try {
+    const video = (await db.getVideo(t)) ?? (await db.getLegacyVideo(t));
+    return !!video && video.owner === owner;
+  } catch (err) {
+    console.warn(`[uploadLimits] replacement target lookup failed for ${owner}/${t}:`, (err as Error)?.message || err);
+    return false;
+  }
+}
 
 export interface LimiterDeps {
   getRecentCountedUploads(owner: string, since: Date): Promise<CountedUploadRow[]>;
@@ -139,15 +181,27 @@ export class UploadLimiter {
     }
   }
 
+  /**
+   * A verified replacement upload is free once it is registered as the
+   * replacement, and while it still has time to be. One never registered
+   * within the grace period was used as an ordinary video and counts.
+   */
+  private isFreeReplacement(row: CountedUploadRow, createdMs: number): boolean {
+    if (row.replaces_existing !== true) return false;
+    if (row.replacesPermlink) return true;
+    return this.now() - createdMs < REPLACEMENT_REGISTER_GRACE_MS;
+  }
+
   /** Creation times (ms, oldest first) of this owner's counted uploads in the window, per kind. */
   async usage(owner: string): Promise<Record<UploadKind, number[]>> {
     const since = new Date(this.now() - DAY_MS);
     const rows = await this.deps.getRecentCountedUploads(owner, since);
     const out: Record<UploadKind, number[]> = { video: [], short: [] };
     for (const row of rows) {
-      if (await this.isVodRow(owner, row)) continue;
       const t = new Date(row.createdAt).getTime();
       if (!Number.isFinite(t) || t < since.getTime()) continue;
+      if (this.isFreeReplacement(row, t)) continue;
+      if (await this.isVodRow(owner, row)) continue;
       out[row.short === true ? 'short' : 'video'].push(t);
     }
     out.video.sort((a, b) => a - b);

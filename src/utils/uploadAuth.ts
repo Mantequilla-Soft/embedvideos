@@ -2,7 +2,7 @@ import { Database } from '../database/mongodb';
 import { Config } from '../config/config';
 import { verifyUploadToken, UploadTokenClaims } from './uploadToken';
 import { generateVideoId } from './videoId';
-import { getUploadLimiter, STREAM_VOD_APP, UploadLimiter } from './uploadLimits';
+import { getUploadLimiter, STREAM_VOD_APP, UploadLimiter, verifyReplacementTarget } from './uploadLimits';
 
 export interface AuthSuccess {
   ok: true;
@@ -26,6 +26,12 @@ export interface AuthSuccess {
    * daily upload limit.
    */
   streamVod: boolean | undefined;
+  /**
+   * Permlink of the owner's existing video this upload replaces the media of,
+   * verified against the database; null when not a (verified) replacement.
+   * Written onto the row as `replaces_existing` / `replaces_target`.
+   */
+  replacesExisting: string | null;
 }
 
 export interface AuthFailure {
@@ -188,16 +194,31 @@ export async function validateUploadAuth(
     }
   }
 
+  // Replacing the media of an existing video is free (owner, 2026-11-20). The
+  // claim comes from the signed token (`replaces`, verified at issuance) or,
+  // for X-API-Key uploads, from the `replaces` metadata field; either way it
+  // is checked against the database HERE: the target must exist and belong to
+  // this owner. A claim that does not verify is an ordinary upload.
+  let replacesExisting: string | null = null;
+  const replacesClaim = tokenClaims ? tokenClaims.replaces : metadata?.replaces;
+  if (!isPartial && replacesClaim) {
+    if (await verifyReplacementTarget(database, owner, replacesClaim, permlink)) {
+      replacesExisting = String(replacesClaim).trim();
+    } else {
+      console.warn(`[uploadLimits] ${owner}/${permlink} claims to replace ${replacesClaim}, which is not theirs or does not exist; treated as an ordinary upload`);
+    }
+  }
+
   // Daily upload limit, for every auth method. The token route checks too
   // (better UX: refused before any bytes move), but an X-API-Key upload never
   // goes through it, and the key is public.
   // A VOD claim whose lookup failed (streamVod still undefined) is let through.
-  if (!isPartial && !(vodClaim && streamVod !== false)) {
+  if (!isPartial && !replacesExisting && !(vodClaim && streamVod !== false)) {
     const refusal = await (limiter ?? getUploadLimiter(database, config)).check(owner, short ? 'short' : 'video');
     if (refusal) {
       return { ok: false, status: refusal.status, error: refusal.body.error, body: { ...refusal.body }, headers: refusal.headers };
     }
   }
 
-  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod };
+  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod, replacesExisting };
 }

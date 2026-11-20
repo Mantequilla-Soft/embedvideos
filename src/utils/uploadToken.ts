@@ -57,6 +57,13 @@ export interface UploadTokenClaims {
    * the upload token because the user may sit on the details step for a while.
    */
   scope?: 'upload' | 'finalize';
+  /**
+   * Permlink of an existing video (embed or legacy) this upload will replace
+   * the media of, verified at issuance to belong to `owner`. Replacements are
+   * exempt from the daily upload limit; validateUploadAuth verifies the target
+   * again against the database before honouring it.
+   */
+  replaces?: string;
   /** Issued at (unix seconds) */
   iat: number;
   /** Expires at (unix seconds) */

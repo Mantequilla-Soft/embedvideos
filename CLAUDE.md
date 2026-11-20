@@ -134,6 +134,7 @@ Non-Pro owners: `UPLOAD_LIMIT_VIDEOS_PER_DAY` (1) videos and `UPLOAD_LIMIT_SHORT
 
 - Counts rows with `COUNTED_UPLOAD_STATUSES` (`processing`, `awaiting_encode`, `published`) in `embed-video`, index `{ owner: 1, createdAt: -1 }`.
 - Stream VODs: X-API-Key + `frontend_app: '3speak-hangouts'` + not short is only a CLAIM (the hangouts server uses the same public key as the browser). It is verified against `stream-stats` / `stream-golive` (owner + permlink = room name) and stored as `stream_vod` on the row; `true` rows never count.
+- Media replacements are free: `replaces` (signed token claim, or `replaces` metadata on X-API-Key uploads) is verified by `verifyReplacementTarget` (target exists in embed-video or legacy `videos` AND same owner), stored as `replaces_existing` / `replaces_target`, unlisted from creation. Not counted once registered (`replacesPermlink` set) or within `REPLACEMENT_REGISTER_GRACE_MS` (6h); unregistered after that it counts.
 - Exempt: `UPLOAD_LIMIT_EXEMPT`, `isUserPremium`, warm-up (checker `POST /incubation/authors` says `incubating` AND Hive has no account of that name; cached 5 min).
 - Everything fails open.
 

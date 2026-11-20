@@ -229,10 +229,19 @@ Generates a short-lived, single-use upload token. Requires `X-API-Key` header. S
 Owners without 3Speak Pro may upload **1 regular video** and **3 shorts** per **rolling 24 hours**. The limit is enforced by this API for every app that uses it, on every upload path: `POST /uploads/token`, TUS `POST /uploads` (token or `X-API-Key`), `POST /upload/simple` and `POST /upload/chunk/create`.
 
 - **What counts:** uploads whose bytes landed (video status `processing`, `awaiting_encode` or `published`), created in the last 24 hours. Uploads still in flight, failed uploads and deleted videos do not use a slot. Imports (YouTube, TikTok) that arrive here count like any upload.
-- **What never counts:** stream recordings (VODs) published by the 3Speak streaming server.
+- **What never counts:** stream recordings (VODs) published by the 3Speak streaming server, and **media replacements** (see below).
 - **Who is exempt:** 3Speak Pro owners, warm-up accounts (3Speak users with no Hive account yet), and owners an operator lists in `UPLOAD_LIMIT_EXEMPT`.
 - Shorts and regular videos have separate allowances: using the 1 video does not touch the 3 shorts.
 - `owner` is the name the limit is kept for; it is not verified by this API.
+
+#### Replacing a video's media is free
+
+An upload that replaces the media of one of the owner's existing videos (the `POST /video/:permlink/replaces` flow, legacy videos included) is never refused and does not use a slot. Say so when the upload starts, by naming the original permlink:
+
+- Upload token: `"replaces": "<original permlink>"` in the `POST /uploads/token` body. The response echoes `"replaces"`: the permlink when it was accepted, `null` when it was not.
+- X-API-Key uploads: a `replaces` field in the TUS metadata, or a `replaces` form field on `/upload/simple` and `/upload/chunk/create`. With an upload token the signed claim is used and a metadata `replaces` is ignored.
+
+The server checks the claim against the database (at token issuance and again when the upload is created): the original must exist, here or in the legacy catalogue, and belong to the same owner. A claim that does not check out makes it an ordinary upload, limited as usual. A replacement upload stays out of listings, like a registered replacement. It has to be registered with `POST /video/:permlink/replaces` within 6 hours; one that never is counts as a normal upload.
 
 #### Refusal: HTTP 429 `daily_upload_limit`
 

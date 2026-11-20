@@ -44,6 +44,8 @@ export interface CountedUploadRow {
   short: boolean;
   frontend_app: string;
   stream_vod?: boolean;
+  replaces_existing?: boolean;
+  replacesPermlink?: string | null;
   createdAt: Date;
 }
 
@@ -96,6 +98,15 @@ export interface VideoMetadata {
    * rows from before the limit existed.
    */
   stream_vod?: boolean;
+  /**
+   * Uploaded to replace the media of an existing video of the same owner
+   * (`replaces_target`), verified against the database at upload time. Free
+   * under the daily upload limit (see uploadLimits.ts). Distinct from
+   * `replacesPermlink`, which is only set once POST /video/:permlink/replaces
+   * registers the swap.
+   */
+  replaces_existing?: boolean;
+  replaces_target?: string | null;
   hive_author: string | null;
   hive_permlink: string | null;
   hive_title: string | null;
@@ -862,7 +873,7 @@ export class Database {
     return this.collection
       .find(
         { owner, createdAt: { $gte: since }, status: { $in: COUNTED_UPLOAD_STATUSES } },
-        { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, createdAt: 1 } }
+        { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, replaces_existing: 1, replacesPermlink: 1, createdAt: 1 } }
       )
       .sort({ createdAt: 1 })
       .limit(200)

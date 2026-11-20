@@ -17,6 +17,7 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import {
   UploadLimiter, LimiterDeps, createWarmupLookup, DAY_MS, STREAM_VOD_APP, isoSeconds,
+  verifyReplacementTarget, REPLACEMENT_REGISTER_GRACE_MS,
 } from '../src/utils/uploadLimits';
 import { loadUploadLimitsConfig, UploadLimitsConfig, Config } from '../src/config/config';
 import { Database, CountedUploadRow, COUNTED_UPLOAD_STATUSES, VideoStatus } from '../src/database/mongodb';
@@ -116,6 +117,8 @@ function stubDb(over: Partial<Record<string, unknown>> = {}): Database {
     isUserPremium: async () => false,
     streamRecordExists: async () => false,
     getRecentCountedUploads: async () => [],
+    getVideo: async () => null,
+    getLegacyVideo: async () => null,
     ...over,
   } as unknown as Database;
 }
@@ -361,6 +364,67 @@ async function main(): Promise<void> {
     ok('a "VOD" flagged short is a short, not a VOD', shortVod.ok === false && shortVod.status === 429);
     const plain = await validateUploadAuth({ 'X-Api-Key': ['k'] }, { owner: 'alice' }, 100, stubDb(), authConfig(limits));
     ok('an ordinary upload has streamVod undefined', plain.ok === true && plain.streamVod === undefined);
+  }
+
+  section('Replacing the media of an existing video is free');
+  {
+    ok('a registered replacement row is not counted',
+      (await limiter([row({ replaces_existing: true, replacesPermlink: 'orig1' })]).check('alice', 'video')) === null);
+    ok('a fresh, not yet registered replacement row is not counted',
+      (await limiter([row({ replaces_existing: true, hoursAgo: 1 })]).check('alice', 'video')) === null);
+    const stale = row({ replaces_existing: true, hoursAgo: REPLACEMENT_REGISTER_GRACE_MS / HOUR + 1 });
+    ok('a "replacement" never registered within the grace period counts like a video',
+      (await limiter([stale]).check('alice', 'video')) !== null);
+    const q = await limiter([row({ replaces_existing: true, replacesPermlink: 'orig1' }), row()]).quota('alice');
+    ok('quota shows only the ordinary upload as used', q.video.used === 1);
+  }
+  {
+    const videos: Record<string, { owner: string }> = { aliceold: { owner: 'alice' }, bobvid: { owner: 'bob' } };
+    const legacy: Record<string, { owner: string }> = { alicelegacy: { owner: 'alice' } };
+    const lookups = {
+      getVideo: async (p: string) => videos[p] ?? null,
+      getLegacyVideo: async (p: string) => legacy[p] ?? null,
+    };
+    ok('target: own embed video verifies', await verifyReplacementTarget(lookups, 'alice', 'aliceold'));
+    ok('target: own legacy video verifies', await verifyReplacementTarget(lookups, 'alice', 'alicelegacy'));
+    ok('target: someone else\'s video does not', !(await verifyReplacementTarget(lookups, 'alice', 'bobvid')));
+    ok('target: a non-existent video does not', !(await verifyReplacementTarget(lookups, 'alice', 'nope')));
+    ok('target: the upload itself does not', !(await verifyReplacementTarget({ ...lookups, getVideo: async () => ({ owner: 'alice' }) }, 'alice', 'self1', 'self1')));
+    ok('target: a non-string does not', !(await verifyReplacementTarget(lookups, 'alice', { $ne: null })));
+    ok('target: a lookup error does not (treated as an ordinary upload)',
+      !(await verifyReplacementTarget({ getVideo: async () => { throw new Error('down'); }, getLegacyVideo: async () => null }, 'alice', 'aliceold')));
+
+    const limits = cfg();
+    const atLimit = stubDb({ getRecentCountedUploads: async () => realTimeRows(1), ...lookups });
+    const key = { 'X-Api-Key': ['k'] };
+    const real = await validateUploadAuth(key, { owner: 'alice', replaces: 'aliceold' }, 100, atLimit, authConfig(limits));
+    ok('X-API-Key replacement of an own video is allowed at the limit', real.ok === true, JSON.stringify(real));
+    ok('  and marked replacesExisting = the target', real.ok === true && real.replacesExisting === 'aliceold');
+    const legacyReal = await validateUploadAuth(key, { owner: 'alice', replaces: 'alicelegacy' }, 100, atLimit, authConfig(limits));
+    ok('replacement of an own LEGACY video is allowed at the limit', legacyReal.ok === true);
+    const shortAtLimit = stubDb({ getRecentCountedUploads: async () => realTimeRows(3, true), ...lookups });
+    ok('a short replacement is allowed with all 3 shorts used',
+      (await validateUploadAuth(key, { owner: 'alice', short: 'true', replaces: 'aliceold' }, 100, shortAtLimit, authConfig(limits))).ok === true);
+    const others = await validateUploadAuth(key, { owner: 'alice', replaces: 'bobvid' }, 100, atLimit, authConfig(limits));
+    ok('fake replacement claim on someone else\'s video is still limited', others.ok === false && others.status === 429);
+    const missing = await validateUploadAuth(key, { owner: 'alice', replaces: 'nope' }, 100, atLimit, authConfig(limits));
+    ok('fake replacement claim on a non-existent video is still limited', missing.ok === false && missing.status === 429);
+    const fresh = await validateUploadAuth(key, { owner: 'alice', replaces: 'nope' }, 100, stubDb(lookups), authConfig(limits));
+    ok('  and, under the limit, is an ordinary upload (replacesExisting null)', fresh.ok === true && fresh.replacesExisting === null);
+    const viaToken = await validateUploadAuth(bearer({ replaces: 'aliceold' }), {}, 100, atLimit, authConfig(limits));
+    ok('token carrying a verified replaces claim is allowed at the limit', viaToken.ok === true && viaToken.replacesExisting === 'aliceold');
+    const tokenStale = await validateUploadAuth(bearer({ replaces: 'bobvid' }), {}, 100, atLimit, authConfig(limits));
+    ok('a token replaces claim is re-verified at upload (target not the owner\'s: limited)', tokenStale.ok === false && tokenStale.status === 429);
+    const tokenIgnoresMeta = await validateUploadAuth(bearer(), { replaces: 'aliceold' }, 100, atLimit, authConfig(limits));
+    ok('with a token, a replaces field in metadata is ignored (signed claim only)', tokenIgnoresMeta.ok === false && tokenIgnoresMeta.status === 429);
+  }
+  {
+    const src = readFileSync(path.join(__dirname, '../src/index.ts'), 'utf8');
+    const route = src.slice(src.indexOf("app.post('/uploads/token'"), src.indexOf("app.get('/uploads/quota'"));
+    ok('token route verifies the target before skipping the limit',
+      /verifyReplacementTarget\(database, owner, replaces\)/.test(route) && /replacesTarget \? null : await getUploadLimiter/.test(route));
+    ok('every upload path keeps replacements out of listings',
+      (src.match(/listed_on_3speak: !replacesExisting && frontend_app === '3speak-tv'/g) || []).length === 3);
   }
 
   section('Warm-up lookup');
