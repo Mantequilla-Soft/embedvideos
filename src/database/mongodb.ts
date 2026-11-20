@@ -17,6 +17,36 @@ export type VideoStatus =
   | 'failed'
   | 'deleted';
 
+/**
+ * Statuses that mean an upload's bytes LANDED, so it uses a daily upload slot
+ * (src/utils/uploadLimits.ts).
+ *
+ * - `processing`: set by processUploadAsync once the file is on disk and
+ *   pinned (and again for re-encodes of a landed file).
+ * - `awaiting_encode`: a deferred upload, landed and pinned, waiting for its
+ *   publish to commission the encode.
+ * - `published`: encoded and playable.
+ *
+ * Left out on purpose:
+ * - `uploading`: the bytes are still coming (or never came: an abandoned
+ *   upload stays here until the cleanup sweep marks it failed).
+ * - `failed`: nothing usable landed, or the encode gave up. The user gets the
+ *   slot back and can try again.
+ * - `deleted`: removed.
+ *
+ * There is no `encoding` VIDEO status; that one is a job status (embed-jobs).
+ */
+export const COUNTED_UPLOAD_STATUSES: VideoStatus[] = ['processing', 'awaiting_encode', 'published'];
+
+/** The fields the daily-limit count reads from a counted upload row. */
+export interface CountedUploadRow {
+  permlink: string;
+  short: boolean;
+  frontend_app: string;
+  stream_vod?: boolean;
+  createdAt: Date;
+}
+
 export interface VideoMetadata {
   owner: string;
   permlink: string;
@@ -59,6 +89,13 @@ export interface VideoMetadata {
    * known. Set from the signed token claim only.
    */
   defer_encode?: boolean;
+  /**
+   * A stream recording published by the hangouts server, verified against its
+   * stream records at upload time (see uploadAuth.ts). Never counts toward the
+   * daily upload limit. `false` = claimed to be one but not verified. Absent on
+   * rows from before the limit existed.
+   */
+  stream_vod?: boolean;
   hive_author: string | null;
   hive_permlink: string | null;
   hive_title: string | null;
@@ -314,6 +351,8 @@ export class Database {
 
     // Create indexes (tolerant of pre-existing conflicting definitions)
     await this.ensureIndex(this.collection, { permlink: 1 }, { unique: true });
+    // Daily upload limit count: one owner's uploads in the last 24 hours.
+    await this.ensureIndex(this.collection, { owner: 1, createdAt: -1 });
 
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
     await this.ensureIndex(encodersCollection, { name: 1 }, { unique: true });
@@ -806,6 +845,47 @@ export class Database {
       { username },
       { $set: { banned, updatedAt: new Date() } }
     );
+  }
+
+  // Daily upload limit lookups
+
+  /**
+   * One owner's uploads since `since` whose bytes landed (COUNTED_UPLOAD_STATUSES),
+   * oldest first. The limiter splits them into videos/shorts and drops stream
+   * VODs itself. Bounded: an owner is limited to a handful per day, so anything
+   * past the cap is already far over every limit.
+   */
+  async getRecentCountedUploads(owner: string, since: Date): Promise<CountedUploadRow[]> {
+    if (!this.collection) {
+      throw new Error('Database not connected');
+    }
+    return this.collection
+      .find(
+        { owner, createdAt: { $gte: since }, status: { $in: COUNTED_UPLOAD_STATUSES } },
+        { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, createdAt: 1 } }
+      )
+      .sort({ createdAt: 1 })
+      .limit(200)
+      .toArray() as unknown as Promise<CountedUploadRow[]>;
+  }
+
+  /**
+   * Did `host` really stream in room `roomName`? Both collections are written by
+   * the hangouts server (live.3speak.tv) into this database, server side only:
+   * `stream-stats` (kept, written via the checker on viewer/peak events) and
+   * `stream-golive` (written when the stream goes live, TTL 2 days). Either one
+   * is proof; a VOD is published from the room it was recorded in, and its
+   * permlink IS the room name.
+   */
+  async streamRecordExists(host: string, roomName: string): Promise<boolean> {
+    if (!this.db) {
+      throw new Error('Database not connected');
+    }
+    const [stats, golive] = await Promise.all([
+      this.db.collection('stream-stats').findOne({ host, roomName }, { projection: { _id: 1 } }),
+      this.db.collection('stream-golive').findOne({ owner: host, roomName }, { projection: { _id: 1 } }),
+    ]);
+    return !!(stats || golive);
   }
 
   // Premium User Methods

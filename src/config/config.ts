@@ -47,6 +47,50 @@ export interface Config {
   // CDN base the gate fetches encrypted manifests from. Must be a host in the
   // gate's own GATE_UPSTREAM_HOSTS allowlist or registration is rejected.
   gateCdnBase: string;
+  /** Daily upload limits for non-Pro owners. See src/utils/uploadLimits.ts. */
+  uploadLimits: UploadLimitsConfig;
+}
+
+export interface UploadLimitsConfig {
+  /** UPLOAD_DAILY_LIMITS_ENABLED. On unless set to exactly "false". */
+  enabled: boolean;
+  /** Regular (non-short) videos per rolling 24 hours. */
+  videosPerDay: number;
+  /** Shorts per rolling 24 hours. */
+  shortsPerDay: number;
+  /** Owners never limited (lowercased). */
+  exempt: string[];
+  /** Checker endpoint that says whether a handle is a warm-up (incubating) account. */
+  warmupLookupUrl: string;
+  /** Hive API nodes for the "this warm-up handle is not also a Hive account" check. */
+  hiveApiNodes: string[];
+  /** UPLOAD_UPGRADE_URL: where a refused uploader can get Pro. `{owner}` (or `{user}`) is replaced. */
+  upgradeUrl: string;
+}
+
+function parseCount(raw: string | undefined, fallback: number): number {
+  const n = parseInt(raw ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function parseList(raw: string | undefined): string[] {
+  return (raw || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase().replace(/^@/, ''))
+    .filter(Boolean);
+}
+
+export function loadUploadLimitsConfig(env: NodeJS.ProcessEnv = process.env): UploadLimitsConfig {
+  const hiveNodes = (env.UPLOAD_LIMIT_HIVE_NODES || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return {
+    enabled: env.UPLOAD_DAILY_LIMITS_ENABLED !== 'false',
+    videosPerDay: parseCount(env.UPLOAD_LIMIT_VIDEOS_PER_DAY, 1),
+    shortsPerDay: parseCount(env.UPLOAD_LIMIT_SHORTS_PER_DAY, 3),
+    exempt: parseList(env.UPLOAD_LIMIT_EXEMPT),
+    warmupLookupUrl: env.UPLOAD_LIMIT_WARMUP_LOOKUP_URL || 'https://checker.3speak.tv/incubation/authors',
+    hiveApiNodes: hiveNodes.length ? hiveNodes : ['https://api.hive.blog', 'https://api.deathwing.me', 'https://anyx.io'],
+    upgradeUrl: env.UPLOAD_UPGRADE_URL || 'https://3speak.tv/wallet/{owner}#pro',
+  };
 }
 
 function parseEncoders(): EncoderConfig[] {
@@ -108,5 +152,6 @@ export function loadConfig(): Config {
     gateUrl: process.env.GATE_URL || '',
     gateInternalApiKey: process.env.GATE_INTERNAL_API_KEY || '',
     gateCdnBase: process.env.GATE_CDN_BASE || 'https://ipfs.3speak.tv/ipfs',
+    uploadLimits: loadUploadLimitsConfig(),
   };
 }

@@ -2,6 +2,7 @@ import { Database } from '../database/mongodb';
 import { Config } from '../config/config';
 import { verifyUploadToken, UploadTokenClaims } from './uploadToken';
 import { generateVideoId } from './videoId';
+import { getUploadLimiter, STREAM_VOD_APP, UploadLimiter } from './uploadLimits';
 
 export interface AuthSuccess {
   ok: true;
@@ -18,12 +19,23 @@ export interface AuthSuccess {
   originalFilename: string | null;
   duration: number | null;
   size: number | null;
+  /**
+   * Verified stream recording from the hangouts server (true), a claim to be
+   * one that did not verify (false), or not claimed at all (undefined).
+   * Written onto the row as `stream_vod`; true rows never count toward the
+   * daily upload limit.
+   */
+  streamVod: boolean | undefined;
 }
 
 export interface AuthFailure {
   ok: false;
   status: number;
   error: string;
+  /** Full JSON body to send instead of `{ error }` (the daily-limit 429). */
+  body?: Record<string, unknown>;
+  /** Extra response headers (e.g. Retry-After). */
+  headers?: Record<string, string>;
 }
 
 export type AuthResult = AuthSuccess | AuthFailure;
@@ -40,7 +52,8 @@ export async function validateUploadAuth(
   uploadSize: number | null,
   database: Database,
   config: Config,
-  isPartial: boolean = false
+  isPartial: boolean = false,
+  limiter?: UploadLimiter
 ): Promise<AuthResult> {
   const h: Record<string, string[]> = {};
   for (const [k, v] of Object.entries(headers)) {
@@ -152,5 +165,39 @@ export async function validateUploadAuth(
     }
   }
 
-  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size };
+  // Stream recordings (VODs) are published by the hangouts server: X-API-Key,
+  // no token, frontend_app '3speak-hangouts', permlink = the room name. That
+  // metadata alone proves nothing, since the hangouts server uses the same
+  // public embed API key as the browser frontend (app_name '3speak'). So the
+  // claim is checked against the stream records the hangouts server writes
+  // into this database: this owner must have streamed in a room of exactly
+  // this name. A token upload is never a VOD.
+  const vodClaim = !isPartial && !tokenClaims && frontend_app === STREAM_VOD_APP && !short;
+  let streamVod: boolean | undefined;
+  if (vodClaim) {
+    try {
+      streamVod = await database.streamRecordExists(owner, permlink);
+    } catch (err) {
+      // Fail open: no verdict recorded (the count re-checks rows without
+      // one) and no limit applied to this upload.
+      console.warn(`[uploadLimits] stream record lookup failed for ${owner}/${permlink}:`, (err as Error)?.message || err);
+      streamVod = undefined;
+    }
+    if (streamVod === false) {
+      console.warn(`[uploadLimits] ${owner}/${permlink} claims to be a stream VOD but has no stream record; counted as a video`);
+    }
+  }
+
+  // Daily upload limit, for every auth method. The token route checks too
+  // (better UX: refused before any bytes move), but an X-API-Key upload never
+  // goes through it, and the key is public.
+  // A VOD claim whose lookup failed (streamVod still undefined) is let through.
+  if (!isPartial && !(vodClaim && streamVod !== false)) {
+    const refusal = await (limiter ?? getUploadLimiter(database, config)).check(owner, short ? 'short' : 'video');
+    if (refusal) {
+      return { ok: false, status: refusal.status, error: refusal.body.error, body: { ...refusal.body }, headers: refusal.headers };
+    }
+  }
+
+  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod };
 }

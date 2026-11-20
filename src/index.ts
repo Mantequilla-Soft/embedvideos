@@ -22,6 +22,7 @@ import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims 
 import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
 import { clientIpFrom, ipHashes } from './utils/ipHash';
 import { parseReportedVersion, buildRegistrationVersionUpdate, buildHeartbeatVersionUpdate } from './utils/encoderVersion';
+import { getUploadLimiter } from './utils/uploadLimits';
 
 dotenv.config();
 
@@ -51,7 +52,9 @@ const cleanupService = new CleanupService(config.uploadDir, config.cleanupRetent
 
 // Middleware
 app.use(cors({
-  exposedHeaders: ['X-Embed-URL', 'x-embed-url'],
+  // Retry-After rides on the daily upload limit 429, and a browser client can
+  // only read it when it is exposed.
+  exposedHeaders: ['X-Embed-URL', 'x-embed-url', 'Retry-After'],
   // Every chunk POST carries an upload progress listener, which makes it a
   // non-simple request, which makes the browser preflight it. With no Max-Age
   // Chrome caches that preflight for 5 SECONDS, so the chunked path was paying a
@@ -112,11 +115,11 @@ const tusProxy = createProxyMiddleware({
           pending204EmbedUrls.delete(uploadId);
         }
       }
-      const existing = (proxyRes.headers['access-control-expose-headers'] as string) || '';
-      if (!existing.toLowerCase().includes('x-embed-url')) {
-        proxyRes.headers['access-control-expose-headers'] =
-          existing ? `${existing}, X-Embed-URL` : 'X-Embed-URL';
+      let exposed = (proxyRes.headers['access-control-expose-headers'] as string) || '';
+      for (const h of ['X-Embed-URL', 'Retry-After']) {
+        if (!exposed.toLowerCase().includes(h.toLowerCase())) exposed = exposed ? `${exposed}, ${h}` : h;
       }
+      proxyRes.headers['access-control-expose-headers'] = exposed;
     },
   },
 });
@@ -182,6 +185,17 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
           code: 'pro_required',
         });
       }
+    }
+
+    // Daily upload limit for owners without Pro. Checked here so a client is
+    // refused before any bytes move; checked again when the upload is created
+    // (validateUploadAuth), which also covers X-API-Key uploads that never come
+    // through this route. `owner` is not verified here (the API key is public),
+    // so the limit is per owner name.
+    const refusal = await getUploadLimiter(database, config).check(owner, short ? 'short' : 'video');
+    if (refusal) {
+      res.set(refusal.headers);
+      return res.status(refusal.status).json(refusal.body);
     }
 
     const tokenTtl = Math.min(
@@ -272,6 +286,23 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
   }
 });
 
+// GET /uploads/quota?owner=<name>: an owner's daily upload allowance, so a
+// frontend can say "1 video left today" before the user picks a file. Must stay
+// registered before the app.all('/uploads/*') tusd proxy, like /uploads/token.
+app.get('/uploads/quota', requireApiKey, async (req: Request, res: Response) => {
+  const owner = typeof req.query.owner === 'string' ? req.query.owner.trim() : '';
+  if (!owner) {
+    return res.status(422).json({ error: 'owner (string) is required' });
+  }
+  try {
+    res.set('Cache-Control', 'no-store');
+    res.json(await getUploadLimiter(database, config).quota(owner));
+  } catch (error) {
+    console.error(`Error reading upload quota for ${owner}:`, error);
+    res.status(503).json({ error: 'Upload quota is unavailable right now' });
+  }
+});
+
 // ---- Simple (non-resumable) single-request upload ---------------------------
 // Fallback for clients where the TUS PATCH flow is blocked (some mobile carriers
 // / WebViews). ONE multipart POST, whole file in the body, NO resume.
@@ -305,11 +336,12 @@ app.post('/upload/simple', (req: Request, res: Response) => {
   let filePromise: Promise<void> = Promise.resolve();
 
   const cleanup = () => { if (tempPath) { try { unlinkSync(tempPath); } catch {} } };
-  const fail = (status: number, error: string) => {
+  const fail = (status: number, error: string, body?: Record<string, unknown>, headers?: Record<string, string>) => {
     if (responded) return;
     responded = true;
     cleanup();
-    res.status(status).json({ error });
+    if (headers) res.set(headers);
+    res.status(status).json(body ?? { error });
   };
 
   bb.on('field', (name, val) => { fields[name] = val; });
@@ -354,15 +386,16 @@ app.post('/upload/simple', (req: Request, res: Response) => {
     }
 
     const auth = await validateUploadAuth(synthHeaders, metadata, receivedSize, database, config, false);
-    if (!auth.ok) return fail(auth.status, auth.error);
+    if (!auth.ok) return fail(auth.status, auth.error, auth.body, auth.headers);
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration } = auth;
+    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod } = auth;
 
     await database.createVideoEntry({
       owner, permlink, frontend_app,
       status: 'uploading',
       input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
       short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: receivedSize,
+      ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
       encodingProgress: 0,
       originalFilename,
       hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -526,14 +559,18 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
   }
 
   const auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
-  if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
-  const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration } = auth;
+  if (!auth.ok) {
+    if (auth.headers) res.set(auth.headers);
+    return res.status(auth.status).json(auth.body ?? { error: auth.error });
+  }
+  const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod } = auth;
 
   await database.createVideoEntry({
     owner, permlink, frontend_app,
     status: 'uploading',
     input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
     short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: totalSize,
+    ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
     encodingProgress: 0,
     originalFilename,
     hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
@@ -717,12 +754,17 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
     );
 
     if (!authResult.ok) {
+      // tusd v2 reads the rejection's headers from `Header` (its Go field
+      // name); `Headers` is ignored. Both are sent so the Content-Type and the
+      // daily-limit Retry-After reach the tus client.
+      const header = { 'Content-Type': 'application/json', ...(authResult.headers || {}) };
       return res.json({
         RejectUpload: true,
         HTTPResponse: {
           StatusCode: authResult.status,
-          Body: JSON.stringify({ error: authResult.error }),
-          Headers: { 'Content-Type': 'application/json' },
+          Body: JSON.stringify(authResult.body ?? { error: authResult.error }),
+          Header: header,
+          Headers: header,
         },
       });
     }
@@ -732,7 +774,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       return res.json({});
     }
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size } = authResult;
+    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod } = authResult;
 
     // Hard size cap, enforced for every upload regardless of auth method.
     // For parallel/Concatenation uploads this fires on the final concat, whose
@@ -768,6 +810,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       gate_video_id: gated ? permlink : null,
       allowlist,
       defer_encode: deferEncode,
+      ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
       duration,
       size,
       encodingProgress: 0,

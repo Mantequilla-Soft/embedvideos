@@ -11,7 +11,7 @@ npm start         # Run compiled output (production)
 npm run watch     # Watch mode TypeScript compile
 ```
 
-No test suite exists. Validation is done by running `dev` and exercising endpoints manually.
+No test runner. The `scripts/test-*.ts` files are standalone checks (run each with `npx ts-node --transpile-only`); everything else is validated by running `dev` and exercising endpoints manually.
 
 ## Architecture
 
@@ -127,3 +127,14 @@ Encoders running 3speakencoder with `EMBED_REPORT_COMMIT=true` add `encoder_comm
 Observability only: invalid values are dropped, never rejected, and an encoder that doesn't report is shown as "legacy". Registration describes the code running now, so it clears whatever it doesn't report. Heartbeats only add, because encoders with the flag off never send the fields. Parsing and update building live in `src/utils/encoderVersion.ts` (pure).
 
 Tests: `npx ts-node --transpile-only scripts/test-encoder-version.ts` (31 checks, no MongoDB required).
+
+### Daily upload limits (`src/utils/uploadLimits.ts`)
+
+Non-Pro owners: `UPLOAD_LIMIT_VIDEOS_PER_DAY` (1) videos and `UPLOAD_LIMIT_SHORTS_PER_DAY` (3) shorts per rolling 24h. On unless `UPLOAD_DAILY_LIMITS_ENABLED=false`. Checked at `POST /uploads/token` AND inside `validateUploadAuth` (so X-API-Key uploads on TUS, simple and chunked are held to it too; the key is public). Refusal is a 429 with `code: 'daily_upload_limit'` (contract in README "Upload Limits"); `GET /uploads/quota` reports the allowance.
+
+- Counts rows with `COUNTED_UPLOAD_STATUSES` (`processing`, `awaiting_encode`, `published`) in `embed-video`, index `{ owner: 1, createdAt: -1 }`.
+- Stream VODs: X-API-Key + `frontend_app: '3speak-hangouts'` + not short is only a CLAIM (the hangouts server uses the same public key as the browser). It is verified against `stream-stats` / `stream-golive` (owner + permlink = room name) and stored as `stream_vod` on the row; `true` rows never count.
+- Exempt: `UPLOAD_LIMIT_EXEMPT`, `isUserPremium`, warm-up (checker `POST /incubation/authors` says `incubating` AND Hive has no account of that name; cached 5 min).
+- Everything fails open.
+
+Tests: `npx ts-node --transpile-only scripts/test-upload-limits.ts` (no MongoDB, no network).
