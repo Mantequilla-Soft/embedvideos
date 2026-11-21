@@ -156,6 +156,25 @@ describe('POST /webhook complete', () => {
     }
   });
 
+  it('keeps a gated replacement whose output came back unencrypted off the original', async () => {
+    gateWorld({ media: PLAIN_MEDIA });
+    const original = await insertVideo(database, { owner: 'gina', status: 'published', manifest_cid: 'QmPaidOld', gated: true });
+    const carrier = await insertVideo(database, {
+      owner: 'gina', status: 'processing', gated: true, replacesPermlink: original.permlink, replacesLegacy: false, replacementApplied: false,
+    });
+    const res = await hook({ owner: 'gina', permlink: carrier.permlink, status: 'complete', manifest_cid: 'QmPlainNew' });
+    expect(res.status).toBe(200);
+    expect(await database.getVideo(carrier.permlink)).toMatchObject({ status: 'failed', replacementApplied: false });
+    const o = await database.getVideo(original.permlink);
+    expect(o).toMatchObject({ status: 'published', manifest_cid: 'QmPaidOld' });
+    expect(o.previousManifestCid).toBeUndefined();
+
+    // The sweep does not pick it up later either.
+    const { mod } = await loadApp();
+    await mod.sweepReplacements();
+    expect((await database.getVideo(original.permlink)).manifest_cid).toBe('QmPaidOld');
+  });
+
   it('hands a finished replacement\'s manifest to the original embed video', async () => {
     const original = await insertVideo(database, { owner: 'rita', status: 'published', manifest_cid: 'QmOld', views: 42, hive_permlink: 'post', duration: 10 });
     const carrier = await insertVideo(database, {
@@ -275,6 +294,27 @@ describe('POST /webhook/progress', () => {
 
     await progress({ owner: v.owner, permlink: v.permlink, progress: 60 });
     expect((await database.getJob(v.owner, v.permlink)).encodingStage).toBeNull();
+  });
+
+  it('ignores a ping that arrives after the job finished: the published video stays published', async () => {
+    const v = await insertVideo(database, { status: 'processing' });
+    await insertJob(database, v.owner, v.permlink, { status: 'encoding' });
+    await hook({ owner: v.owner, permlink: v.permlink, status: 'complete', manifest_cid: 'QmDone' });
+    const late = await progress({ owner: v.owner, permlink: v.permlink, progress: 95, stage: 'upload' });
+    expect(late.status).toBe(200);
+    expect(late.body).toEqual({ success: true, ignored: true });
+    expect(await database.getVideo(v.permlink)).toMatchObject({ status: 'published', encodingProgress: 100, manifest_cid: 'QmDone' });
+    expect(await database.getJob(v.owner, v.permlink)).toMatchObject({ status: 'completed' });
+  });
+
+  it('ignores pings for a requeued or failed job', async () => {
+    for (const status of ['pending', 'failed']) {
+      const v = await insertVideo(database, { status: status === 'failed' ? 'failed' : 'processing', encodingProgress: 0 });
+      await insertJob(database, v.owner, v.permlink, { status });
+      expect((await progress({ owner: v.owner, permlink: v.permlink, progress: 50 })).body).toEqual({ success: true, ignored: true });
+      expect((await database.getVideo(v.permlink)).encodingProgress).toBe(0);
+      expect((await database.getJob(v.owner, v.permlink)).status).toBe(status);
+    }
   });
 
   it('accepts the per-job callback token and refuses anything else', async () => {

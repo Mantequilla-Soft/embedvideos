@@ -220,3 +220,77 @@ describe('POST /upload/simple', () => {
     await waitStatus(res.body.permlink, 'failed');
   });
 });
+
+describe('POST /upload/simple: errors are answered, never crash the process', () => {
+  // Temp files from earlier tests' async pipelines may still be around.
+  let before = new Set<string>();
+  beforeEach(() => { before = new Set(leftovers()); });
+  const newLeftovers = () => leftovers().filter((f) => !before.has(f));
+
+  it('an API-key upload with a permlink that is taken gets a 409 and leaves the row alone', async () => {
+    const who = owner();
+    const taken = await seedVideo(database, who, { agoMs: 25 * 60 * 60 * 1000 }); // outside the daily window
+    const res = await (await api()).post('/upload/simple').set('X-API-Key', key)
+      .field('owner', who).field('permlink', taken).attach('file', FILE, 'a.mp4');
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'A video with this permlink already exists' });
+    expect(await video(taken)).toMatchObject({ status: 'published' });
+    expect(newLeftovers()).toEqual([]);
+    // Still serving.
+    expect((await (await api()).get('/health')).status).toBe(200);
+  });
+
+  it('two uploads racing for one permlink: the loser gets a 409 from the insert', async () => {
+    const who = owner();
+    const taken = await seedVideo(database, who, { agoMs: 25 * 60 * 60 * 1000 }); // outside the daily window
+    const spy = vi.spyOn(database, 'videoExists').mockResolvedValueOnce(false);
+    try {
+      const res = await (await api()).post('/upload/simple').set('X-API-Key', key)
+        .field('owner', who).field('permlink', taken).attach('file', FILE, 'a.mp4');
+      expect(res.status).toBe(409);
+      expect(newLeftovers()).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a database error after the body is in is a 500', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const spy = vi.spyOn(database, 'createVideoEntry').mockRejectedValueOnce(new Error('mongo down'));
+    try {
+      const res = await (await api()).post('/upload/simple').set('X-API-Key', key)
+        .field('owner', owner()).attach('file', FILE, 'a.mp4');
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'Internal server error' });
+      expect(newLeftovers()).toEqual([]);
+    } finally {
+      spy.mockRestore();
+      err.mockRestore();
+    }
+  });
+
+  it('checks the credentials before the file is written', async () => {
+    const created = vi.spyOn(database, 'createVideoEntry');
+    try {
+      const res = await (await api()).post('/upload/simple').set('X-API-Key', 'sk_wrong')
+        .field('owner', owner()).attach('file', Buffer.alloc(3000, 1), 'a.mp4');
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: 'Invalid or inactive API key' });
+      expect(newLeftovers()).toEqual([]);
+      expect(created).not.toHaveBeenCalled();
+    } finally {
+      created.mockRestore();
+    }
+  });
+
+  it('stores the owner lowercased, however the client spelled it', async () => {
+    const who = owner();
+    const res = await (await api()).post('/upload/simple').set('X-API-Key', key)
+      .field('owner', ` @${who.toUpperCase()}`).attach('file', FILE, 'a.mp4');
+    expect(res.status).toBe(201);
+    expect(res.body.owner).toBe(who);
+    expect(await video(res.body.permlink)).toMatchObject({ owner: who });
+    await waitStatus(res.body.permlink, 'processing');
+  });
+});
+

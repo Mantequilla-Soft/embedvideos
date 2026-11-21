@@ -160,7 +160,7 @@ describe('gated dispatch', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('with no trusted encoder a poll cycle never sends it anywhere (and burns its attempts, see report)', async () => {
+  it('with no trusted encoder a poll cycle never sends it anywhere, and the job waits for the next cycle', async () => {
     await addEncoder({ name: 'untrusted' });
     const permlink = await seedVideoAndJob({ gated: true });
     await run(new JobDispatcher(database, config));
@@ -168,10 +168,8 @@ describe('gated dispatch', () => {
     const j = await database.getJob('alice', permlink);
     expect(j?.lastError).toContain('No trusted encoders available for gated job');
     expect(j?.failedWorkers).toBeUndefined();
-    // Current behaviour: the failed job is re-claimed within the same cycle
-    // until the attempt limit, so it ends up failed instead of waiting in pending.
-    expect(j?.status).toBe('failed');
-    expect(j?.attemptCount).toBe(4);
+    // One attempt per cycle: back in the queue, not burnt through.
+    expect(j).toMatchObject({ status: 'pending', attemptCount: 1 });
   });
 
   it('dispatchJob re-asserts trust even if selection were to return an untrusted encoder', async () => {
@@ -215,12 +213,16 @@ describe('dispatch failures', () => {
     expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'encoding', assignedWorker: 'b', lastError: null, failedWorkers: ['a'] });
   });
 
-  it('within a cycle a failed job is retried on another encoder', async () => {
+  it('a failed job is retried on another encoder in the next cycle, not the same one', async () => {
     await addEncoder({ name: 'a', url: 'http://a.test', createdAt: minutesAgo(10) });
     await addEncoder({ name: 'b', url: 'http://b.test', createdAt: minutesAgo(5) });
     fetchMock.mockResolvedValueOnce(new Response('encoder busy', { status: 503 }));
     const permlink = await seedVideoAndJob();
-    await run(new JobDispatcher(database, config));
+    const d = new JobDispatcher(database, config);
+    await run(d);
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['http://a.test/encode']);
+    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'pending', attemptCount: 1, failedWorkers: ['a'], lastError: 'Encoder API error: 503 - encoder busy' });
+    await run(d);
     expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['http://a.test/encode', 'http://b.test/encode']);
     expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'encoding', assignedWorker: 'b', attemptCount: 1, failedWorkers: ['a'], lastError: null });
   });
@@ -229,7 +231,9 @@ describe('dispatch failures', () => {
     await addEncoder({ name: 'down' });
     fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'));
     const permlink = await seedVideoAndJob();
-    await run(new JobDispatcher(database, config));
+    const d = new JobDispatcher(database, config);
+    await run(d);
+    await run(d);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'encoding', attemptCount: 1, failedWorkers: ['down'], assignedWorker: 'down' });
   });
@@ -238,33 +242,51 @@ describe('dispatch failures', () => {
     await addEncoder({ name: 'weird' });
     fetchMock.mockRejectedValue('plain string');
     const permlink = await seedVideoAndJob();
-    await run(new JobDispatcher(database, config));
+    const d = new JobDispatcher(database, config);
+    await run(d);
+    expect((await database.getJob('alice', permlink))?.lastError).toBe('plain string');
+    await run(d);
+    await run(d);
     expect((await database.getJob('alice', permlink))?.lastError).toBe('Max attempts exceeded: plain string');
   });
 
-  it('missing video or missing input_cid: retried without blaming an encoder', async () => {
+  it('missing video or missing input_cid: retried without blaming an encoder, one attempt per cycle', async () => {
     await addEncoder();
     await database.createJob(job({ permlink: 'orphan', createdAt: minutesAgo(5) }));
     await seedVideoAndJob({ permlink: 'nocid', input_cid: null }, { createdAt: minutesAgo(1) });
-    await run(new JobDispatcher(database, config));
+    const d = new JobDispatcher(database, config);
+    await run(d);
     expect(fetchMock).not.toHaveBeenCalled();
-    const orphan = await database.getJob('alice', 'orphan');
-    // Re-claimed four times in the cycle (oldest first), then given up on.
-    expect(orphan).toMatchObject({ status: 'failed', attemptCount: 4, lastError: 'Max attempts exceeded: Video not found: orphan' });
-    expect(orphan?.failedWorkers).toBeUndefined();
-    // The fifth claim of the cycle went to the next job.
+    expect(await database.getJob('alice', 'orphan')).toMatchObject({ status: 'pending', attemptCount: 1, lastError: 'Video not found: orphan' });
     expect(await database.getJob('alice', 'nocid')).toMatchObject({ status: 'pending', attemptCount: 1, lastError: 'Video has no input_cid: nocid' });
-    expect((await database.getVideo('nocid'))?.status).toBe('processing');
+
+    await run(d);
+    await run(d);
+    const orphan = await database.getJob('alice', 'orphan');
+    expect(orphan).toMatchObject({ status: 'failed', attemptCount: 3, lastError: 'Max attempts exceeded: Video not found: orphan' });
+    expect(orphan?.failedWorkers).toBeUndefined();
+    expect(await database.getJob('alice', 'nocid')).toMatchObject({ status: 'failed', attemptCount: 3 });
+    expect((await database.getVideo('nocid'))?.status).toBe('failed');
   });
 
-  it('an encoder that keeps failing exhausts a fresh job within ONE cycle (current behaviour, see report)', async () => {
+  it('an encoder that keeps failing uses one attempt per cycle, and the third failure ends the job', async () => {
     await addEncoder({ name: 'flaky' });
     fetchMock.mockImplementation(async () => new Response('down', { status: 502 }));
     const permlink = await seedVideoAndJob();
-    await run(new JobDispatcher(database, config));
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'failed', attemptCount: 4 });
+    const d = new JobDispatcher(database, config);
+    await run(d);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'pending', attemptCount: 1 });
+    expect((await database.getVideo(permlink))?.status).toBe('processing');
+    await run(d);
+    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'pending', attemptCount: 2 });
+    await run(d);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'failed', attemptCount: 3 });
     expect((await database.getVideo(permlink))?.status).toBe('failed');
+    // Failed for good: later cycles leave it alone.
+    await run(d);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it('a job already at 3 attempts is failed for good, video too', async () => {
@@ -279,13 +301,27 @@ describe('dispatch failures', () => {
     expect((await database.getVideo(permlink))?.status).toBe('failed');
   });
 
-  it('below the limit a failure is retried and the video stays as it was', async () => {
+  it('below the limit a failure is retried next cycle and the video stays as it was', async () => {
     await addEncoder({ name: 'bad' });
     fetchMock.mockResolvedValueOnce(new Response('nope', { status: 500 }));
-    const permlink = await seedVideoAndJob({}, { attemptCount: 2 });
-    await run(new JobDispatcher(database, config));
-    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'encoding', attemptCount: 3 });
+    const permlink = await seedVideoAndJob({}, { attemptCount: 1 });
+    const d = new JobDispatcher(database, config);
+    await run(d);
+    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'pending', attemptCount: 2 });
     expect((await database.getVideo(permlink))?.status).toBe('processing');
+    await run(d);
+    expect(await database.getJob('alice', permlink)).toMatchObject({ status: 'encoding', attemptCount: 2 });
+  });
+
+  it('a job whose failure cannot be recorded stays claimed for the stalled-job check', async () => {
+    await addEncoder({ name: 'bad' });
+    fetchMock.mockResolvedValueOnce(new Response('nope', { status: 500 }));
+    const permlink = await seedVideoAndJob();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(database, 'incrementJobAttempt').mockRejectedValueOnce(new Error('db down'));
+    await expect(run(new JobDispatcher(database, config))).resolves.toBeUndefined();
+    expect(err).toHaveBeenCalledWith(`Failed to record dispatch failure for alice/${permlink}:`, expect.any(Error));
+    expect((await database.getJob('alice', permlink))?.status).toBe('encoding');
   });
 
   it('a failing job does not stop the rest of the batch', async () => {
@@ -294,8 +330,9 @@ describe('dispatch failures', () => {
     await seedVideoAndJob({ permlink: 'f1' }, { createdAt: minutesAgo(5) });
     await seedVideoAndJob({ permlink: 'f2' }, { createdAt: minutesAgo(1) });
     await run(new JobDispatcher(database, config));
-    // f1 failed and went back to pending, so it is claimed again within the same cycle.
-    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // f1 failed and waits for the next cycle; f2 still went out in this one.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((await database.getJob('alice', 'f1'))?.status).toBe('pending');
     expect((await database.getJob('alice', 'f2'))?.status).toBe('encoding');
   });
 

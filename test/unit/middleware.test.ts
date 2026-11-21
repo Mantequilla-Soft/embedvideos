@@ -128,6 +128,19 @@ describe('requireAdminAuth middleware', () => {
     expect(next).toHaveBeenCalledOnce();
   });
 
+  it('never logs the password, right or wrong', () => {
+    const spies = (['log', 'warn', 'error', 'info', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
+    try {
+      mw({ headers: { 'x-admin-password': 'pw' }, method: 'GET', originalUrl: '/admin/x' } as any, mockRes(), vi.fn());
+      mw({ headers: { 'x-admin-password': 'pw-typo' }, method: 'GET', originalUrl: '/admin/x' } as any, mockRes(), vi.fn());
+      mw({ headers: {} } as any, mockRes(), vi.fn());
+      const logged = spies.flatMap((s) => s.mock.calls.flat().map(String)).join('\n');
+      expect(logged).not.toContain('pw');
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+  });
+
   it('X-Admin-Password takes precedence over Authorization', () => {
     const res = mockRes();
     const next = vi.fn();

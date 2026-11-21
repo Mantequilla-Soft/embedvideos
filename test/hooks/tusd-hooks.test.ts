@@ -229,7 +229,33 @@ describe('pre-create', () => {
     expect(res.body.RejectUpload).toBe(true);
     expect(res.body.HTTPResponse.StatusCode).toBe(413);
     expect(JSON.parse(res.body.HTTPResponse.Body).error).toMatch(/maximum allowed size/);
+    expect(res.body.HTTPResponse.Header['Content-Type']).toBe('application/json');
     expect(await database.getVideo(permlink)).toBeNull();
+  });
+
+  it('refuses a taken permlink with a 409 instead of crashing on the insert', async () => {
+    const taken = await insertVideo(database, { owner: 'carol', status: 'published' });
+    const res = await preCreate({ headers: { 'X-Api-Key': [apiKey] }, meta: { owner: 'carol', permlink: taken.permlink } });
+    expect(res.body.RejectUpload).toBe(true);
+    expect(res.body.HTTPResponse.StatusCode).toBe(409);
+    expect(JSON.parse(res.body.HTTPResponse.Body)).toEqual({ error: 'A video with this permlink already exists' });
+
+    // Lost in a race (the check passed, the insert did not): the same answer.
+    const spy = vi.spyOn(database, 'videoExists').mockResolvedValueOnce(false);
+    const raced = await preCreate({ headers: { 'X-Api-Key': [apiKey] }, meta: { owner: 'carol', permlink: taken.permlink } });
+    spy.mockRestore();
+    expect(raced.body.HTTPResponse.StatusCode).toBe(409);
+    expect((await database.getVideo(taken.permlink)).status).toBe('published');
+  });
+
+  it('answers a database failure with a 500 refusal, not an unhandled rejection', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const spy = vi.spyOn(database, 'createVideoEntry').mockRejectedValueOnce(new Error('mongo down'));
+    const res = await preCreate({ headers: { 'X-Api-Key': [apiKey] }, meta: { owner: 'carol', permlink: uid('dbfail') } });
+    spy.mockRestore();
+    err.mockRestore();
+    expect(res.body.RejectUpload).toBe(true);
+    expect(res.body.HTTPResponse.StatusCode).toBe(500);
   });
 
   it('records a verified replacement and keeps it unlisted', async () => {

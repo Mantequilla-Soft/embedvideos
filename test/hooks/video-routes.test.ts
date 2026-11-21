@@ -107,6 +107,34 @@ describe('POST /video/:permlink/encode', () => {
     expect(again.body).toEqual({ success: true, already_queued: true, gated: false });
   });
 
+  it('a failed job insert puts the video back, so a retried publish succeeds (no 409)', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const v = await parked({ allowlist: [] });
+    const spy = vi.spyOn(database, 'createJob').mockRejectedValueOnce(new Error('mongo blip'));
+    const res = await encode(v.permlink, finalizeFor(v.permlink));
+    spy.mockRestore();
+    err.mockRestore();
+    expect(res.status).toBe(500);
+    expect(await database.getVideo(v.permlink)).toMatchObject({ status: 'awaiting_encode', gated: false });
+    expect(await database.getJob('alice', v.permlink)).toBeNull();
+
+    const retry = await encode(v.permlink, finalizeFor(v.permlink));
+    expect(retry.status).toBe(201);
+    expect(await database.getVideo(v.permlink)).toMatchObject({ status: 'processing' });
+    expect(await database.getJob('alice', v.permlink)).toMatchObject({ status: 'pending' });
+  });
+
+  it('a job that already exists (concurrent publish) leaves the video processing', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const v = await parked();
+    const spy = vi.spyOn(database, 'createJob').mockRejectedValueOnce(Object.assign(new Error('E11000 duplicate key'), { code: 11000 }));
+    const res = await encode(v.permlink, finalizeFor(v.permlink));
+    spy.mockRestore();
+    err.mockRestore();
+    expect(res.status).toBe(500);
+    expect((await database.getVideo(v.permlink)).status).toBe('processing');
+  });
+
   it('commissions a gated encode for a Pro owner with a cleaned allowlist', async () => {
     await insertUser(database, 'paula', { premium: true });
     const v = await parked({ owner: 'paula', short: true });
@@ -438,10 +466,14 @@ describe('sweepHealableDeferred', () => {
   it('carries a non-array allowlist as empty and never throws', async () => {
     await insertUser(database, 'jpro', { premium: true });
     const v = await stalled({ owner: 'jpro', gated: true, allowlist: null });
-    const spy = vi.spyOn(database, 'createJob').mockRejectedValueOnce(new Error('dup'));
+    const spy = vi.spyOn(database, 'createJob').mockRejectedValueOnce(new Error('db blip'));
     await expect(mod.sweepHealableDeferred()).resolves.toBeUndefined();
     spy.mockRestore();
-    // commissionEncode wrote the gating before the job insert failed.
+    // The job insert failed, so the video is put back as it was (not stranded
+    // at 'processing' with no job), and the next sweep heals it.
+    expect(await database.getVideo(v.permlink)).toMatchObject({ status: 'awaiting_encode', allowlist: null });
+    expect(await database.getJob('jpro', v.permlink)).toBeNull();
+    await mod.sweepHealableDeferred();
     expect(await database.getVideo(v.permlink)).toMatchObject({ status: 'processing', allowlist: [] });
 
     const spy2 = vi.spyOn(database, 'getHealableDeferred').mockRejectedValueOnce(new Error('db'));

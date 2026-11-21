@@ -57,6 +57,15 @@ describe('POST /uploads/token', () => {
     expect((await token({ owner: 42 })).body).toEqual({ error: 'owner (string) is required' });
   });
 
+  it('lowercases the owner and refuses one that is only spaces or an @', async () => {
+    const who = owner();
+    const res = await (await api()).post('/uploads/token').set('X-API-Key', key).send({ owner: ` @${who.toUpperCase()}` });
+    expect(res.status).toBe(201);
+    expect(claimsOf(res.body.token).owner).toBe(who);
+    expect(res.body.embed_url).toBe(`${config.baseUrl}?v=${who}/${res.body.permlink}`);
+    expect((await token({ owner: ' @ ' })).status).toBe(422);
+  });
+
   it('issues a signed token bound to a fresh permlink', async () => {
     const who = owner();
     const before = Math.floor(Date.now() / 1000);

@@ -114,7 +114,7 @@ describe('community encoders', () => {
 });
 
 describe('index tolerance on a shared database', () => {
-  it('keeps a pre-existing case-insensitive name index (IndexOptionsConflict) and connects', async () => {
+  it('accepts the shared case-insensitive name index as it is, and connects', async () => {
     const dbName = `${process.env.MONGODB_DATABASE}_collation`;
     const pre = client.db(dbName);
     await pre.collection('embed-encoders').createIndex(
@@ -125,12 +125,45 @@ describe('index tolerance on a shared database', () => {
     const db2 = new Database(process.env.MONGODB_URI!, dbName, VIDEOS);
     try {
       await db2.connect(dbName, VIDEOS);
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('already exists with different options'));
+      // Same definition as ours: no conflict to tolerate.
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('{"name":1}'));
       const idx = (await pre.collection('embed-encoders').indexes()).find((i) => i.name === 'name_1');
       expect(idx?.collation?.strength).toBe(2);
-      // The existing collation makes names case-insensitively unique.
       await db2.createEncoder(encoder({ name: 'Encoder-One' }));
       await expect(db2.createEncoder(encoder({ name: 'encoder-one' }))).rejects.toMatchObject({ code: 11000 });
+    } finally {
+      warn.mockRestore();
+      await db2.close();
+      await pre.dropDatabase();
+    }
+  });
+
+  it('makes encoder names case-insensitively unique on a fresh database too', async () => {
+    const dbName = `${process.env.MONGODB_DATABASE}_fresh`;
+    const db2 = new Database(process.env.MONGODB_URI!, dbName, VIDEOS);
+    try {
+      await db2.connect(dbName, VIDEOS);
+      const idx = (await client.db(dbName).collection('embed-encoders').indexes()).find((i) => i.key?.name === 1);
+      expect(idx).toMatchObject({ unique: true, collation: { locale: 'en', strength: 2 } });
+      await db2.createEncoder(encoder({ name: 'Encoder-One' }));
+      await expect(db2.createEncoder(encoder({ name: 'ENCODER-ONE' }))).rejects.toMatchObject({ code: 11000 });
+    } finally {
+      await db2.close();
+      await client.db(dbName).dropDatabase();
+    }
+  });
+
+  it('keeps an older name index without a collation (IndexOptionsConflict) and connects', async () => {
+    const dbName = `${process.env.MONGODB_DATABASE}_plain`;
+    const pre = client.db(dbName);
+    await pre.collection('embed-encoders').createIndex({ name: 1 }, { unique: true, name: 'name_1' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const db2 = new Database(process.env.MONGODB_URI!, dbName, VIDEOS);
+    try {
+      await db2.connect(dbName, VIDEOS);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('already exists with different options'));
+      const idx = (await pre.collection('embed-encoders').indexes()).find((i) => i.name === 'name_1');
+      expect(idx?.collation).toBeUndefined();
     } finally {
       warn.mockRestore();
       await db2.close();

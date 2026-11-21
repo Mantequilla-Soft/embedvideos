@@ -145,16 +145,53 @@ describe('POST /upload/chunk/create', () => {
     expect(await database.getVideo('chunkroom')).toMatchObject({ stream_vod: true });
   });
 
-  it('answers 500 when the temp file cannot be allocated', async () => {
+  it('answers 500 when the temp file cannot be allocated, leaving the token usable and no row behind', async () => {
     const saved = config.uploadDir;
+    const who = owner();
+    const { token, claims } = mintToken(config.uploadTokenSecret, { owner: who });
     config.uploadDir = '/nonexistent-embed-test-dir/x';
     try {
-      const res = await create({ owner: owner(), size: String(SIZE), chunkSize: String(MIN) });
+      const res = await create({ token, size: String(SIZE), chunkSize: String(MIN) }, {});
       expect(res.status).toBe(500);
       expect(res.body.error).toBe('Failed to allocate upload storage');
     } finally {
       config.uploadDir = saved;
     }
+    expect(await database.getVideo(claims.permlink!)).toBeNull();
+    // The same token works once the disk is back.
+    const retry = await create({ token, size: String(SIZE), chunkSize: String(MIN) }, {});
+    expect(retry.status).toBe(201);
+    expect(retry.body.permlink).toBe(claims.permlink);
+  });
+
+  it('a taken permlink gets a 409 and no temp file', async () => {
+    const who = owner();
+    const taken = await seedVideo(database, who, { agoMs: 25 * 60 * 60 * 1000 }); // outside the daily window
+    const before = readdirSync(config.uploadDir).filter((f) => f.startsWith('chunked-')).length;
+    const res = await create({ owner: who, permlink: taken, size: String(SIZE), chunkSize: String(MIN) });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'A video with this permlink already exists' });
+    expect(readdirSync(config.uploadDir).filter((f) => f.startsWith('chunked-')).length).toBe(before);
+  });
+
+  it('a permlink lost in a race is a 409 from the insert; other database errors are a 500', async () => {
+    const who = owner();
+    const taken = await seedVideo(database, who, { agoMs: 25 * 60 * 60 * 1000 }); // outside the daily window
+    const exists = vi.spyOn(database, 'videoExists').mockResolvedValueOnce(false);
+    const res = await create({ owner: who, permlink: taken, size: String(SIZE), chunkSize: String(MIN) });
+    exists.mockRestore();
+    expect(res.status).toBe(409);
+
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const insert = vi.spyOn(database, 'createVideoEntry').mockRejectedValueOnce(new Error('mongo down'));
+    const res2 = await create({ owner: owner(), size: String(SIZE), chunkSize: String(MIN) });
+    expect(res2.status).toBe(500);
+    const auth = vi.spyOn(database, 'getApiKey').mockRejectedValueOnce(new Error('mongo down'));
+    const res3 = await create({ owner: owner(), size: String(SIZE), chunkSize: String(MIN) });
+    expect(res3.status).toBe(500);
+    insert.mockRestore();
+    auth.mockRestore();
+    err.mockRestore();
   });
 });
 

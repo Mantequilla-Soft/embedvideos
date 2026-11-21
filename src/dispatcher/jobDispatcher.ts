@@ -8,6 +8,9 @@ class EncoderDispatchError extends Error {
   }
 }
 
+/** Dispatch attempts before a job is failed (the 3rd failure ends it). */
+const MAX_DISPATCH_ATTEMPTS = 3;
+
 export class JobDispatcher {
   private database: Database;
   private config: Config;
@@ -228,7 +231,13 @@ export class JobDispatcher {
       // Claim and dispatch up to 5 jobs per cycle. We claim one at a time so
       // the atomic findOneAndUpdate prevents a second dispatcher replica from
       // seeing the same job between our read and our status update.
+      //
+      // A job whose dispatch failed is put back only AFTER the loop. Requeued
+      // at once, the next claim in this same loop took it straight back, so a
+      // flaky encoder used up every attempt within milliseconds; now each job
+      // gets at most one attempt per cycle (one poll interval apart).
       let dispatched = 0;
+      const failed: Array<{ job: EncodingJob; error: unknown }> = [];
       for (let i = 0; i < 5; i++) {
         const job = await this.database.claimNextManagedJob({});
         if (!job) break;
@@ -238,21 +247,12 @@ export class JobDispatcher {
           await this.dispatchJob(job.owner, job.permlink, job);
         } catch (error) {
           console.error(`Failed to dispatch job ${job.owner}/${job.permlink}:`, error);
-
-          const failedWorker = error instanceof EncoderDispatchError ? error.encoderName : null;
-          await this.database.incrementJobAttempt(job.owner, job.permlink, failedWorker);
-          await this.database.updateJobStatus(job.owner, job.permlink, 'pending', {
-            lastError: error instanceof Error ? error.message : String(error),
-          });
-
-          if (job.attemptCount >= 3) {
-            await this.database.updateJobStatus(job.owner, job.permlink, 'failed', {
-              lastError: `Max attempts exceeded: ${error instanceof Error ? error.message : String(error)}`,
-            });
-            await this.database.updateVideoStatus(job.permlink, 'failed');
-            console.error(`Job ${job.owner}/${job.permlink} failed after ${job.attemptCount} attempts`);
-          }
+          failed.push({ job, error });
         }
+      }
+
+      for (const { job, error } of failed) {
+        await this.recordDispatchFailure(job, error);
       }
 
       if (dispatched > 0) {
@@ -260,6 +260,34 @@ export class JobDispatcher {
       }
     } catch (error) {
       console.error('Error processing jobs:', error);
+    }
+  }
+
+  /**
+   * Count a failed dispatch against the job, then requeue it or, once it has
+   * used MAX_DISPATCH_ATTEMPTS, fail it and its video. The attempt count is
+   * shared with the encoder's failure webhook, which also gives up at 3.
+   */
+  private async recordDispatchFailure(job: EncodingJob, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      const failedWorker = error instanceof EncoderDispatchError ? error.encoderName : null;
+      await this.database.incrementJobAttempt(job.owner, job.permlink, failedWorker);
+      const attempts = (job.attemptCount ?? 0) + 1;
+
+      if (attempts >= MAX_DISPATCH_ATTEMPTS) {
+        await this.database.updateJobStatus(job.owner, job.permlink, 'failed', {
+          lastError: `Max attempts exceeded: ${message}`,
+        });
+        await this.database.updateVideoStatus(job.permlink, 'failed');
+        console.error(`Job ${job.owner}/${job.permlink} failed after ${attempts} attempts`);
+        return;
+      }
+
+      await this.database.updateJobStatus(job.owner, job.permlink, 'pending', { lastError: message });
+    } catch (dbError) {
+      // Left at 'encoding' with no assignment, the stalled-job check requeues it.
+      console.error(`Failed to record dispatch failure for ${job.owner}/${job.permlink}:`, dbError);
     }
   }
 

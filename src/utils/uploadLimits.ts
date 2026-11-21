@@ -135,6 +135,15 @@ export interface QuotaResponse {
 }
 
 /** ISO 8601 without milliseconds, e.g. 2026-11-21T14:32:00Z. */
+/**
+ * Hive account names are lowercase, so `Alice`, ` alice` and `@alice` are the
+ * same owner. Rows are written and counted under this form; without it each
+ * spelling had its own daily allowance.
+ */
+export function normalizeOwner(name: unknown): string {
+  return String(name ?? '').trim().replace(/^@/, '').toLowerCase();
+}
+
 export function isoSeconds(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
@@ -253,8 +262,9 @@ export class UploadLimiter {
    * Cheapest first: the count needs one indexed query, and only an owner who
    * is already at the limit pays for the Pro and warm-up lookups.
    */
-  async check(owner: string, kind: UploadKind): Promise<LimitRefusal | null> {
+  async check(rawOwner: string, kind: UploadKind): Promise<LimitRefusal | null> {
     if (!this.enabled) return null;
+    const owner = normalizeOwner(rawOwner);
     try {
       if (this.isListed(owner)) return null;
       const limit = this.limitFor(kind);
@@ -280,7 +290,8 @@ export class UploadLimiter {
   }
 
   /** Body of GET /uploads/quota. Throws when the count cannot be read. */
-  async quota(owner: string): Promise<QuotaResponse> {
+  async quota(rawOwner: string): Promise<QuotaResponse> {
+    const owner = normalizeOwner(rawOwner);
     if (!this.enabled) {
       return { enabled: false, exempt: true, reason: null, video: { ...UNLIMITED }, short: { ...UNLIMITED } };
     }

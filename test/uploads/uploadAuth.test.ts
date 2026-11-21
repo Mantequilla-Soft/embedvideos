@@ -128,6 +128,21 @@ describe('single-use tokens', () => {
     expect(await auth(bearer(t.token))).toEqual({ ok: false, status: 403, error: 'Upload token has already been used' });
   });
 
+  it('a client-chosen permlink that is taken is a 409; a token-bound one is left to the token check', async () => {
+    const who = owner();
+    const taken = await seedVideo(database, who, { agoMs: 25 * 60 * 60 * 1000 }); // outside the daily window
+    expect(await auth({ 'x-api-key': [key] }, { owner: who, permlink: taken })).toEqual({
+      ok: false, status: 409, error: 'A video with this permlink already exists',
+    });
+    // Partial pieces never create a row, so they are not checked.
+    expect(await auth({ 'x-api-key': [key] }, { owner: who, permlink: taken }, true)).toMatchObject({ ok: true });
+    // A legacy token without a bound permlink uses the metadata one: checked
+    // before the token is consumed, so it stays usable.
+    const t = mintToken(config.uploadTokenSecret, { owner: who, permlink: undefined });
+    expect(await auth(bearer(t.token), { permlink: taken })).toMatchObject({ ok: false, status: 409 });
+    expect(await auth(bearer(t.token), { permlink: `${taken}2` })).toMatchObject({ ok: true, permlink: `${taken}2` });
+  });
+
   it('partial uploads do not consume it', async () => {
     const t = mintToken(config.uploadTokenSecret, { owner: owner() });
     expect(await auth(bearer(t.token), {}, true)).toMatchObject({ ok: true });
@@ -159,6 +174,16 @@ describe('daily upload limit', () => {
     expect(Number(r.headers!['Retry-After'])).toBeGreaterThan(22 * 3600);
     // Shorts have their own allowance.
     expect(await auth({ 'x-api-key': [key] }, { owner: who, short: 'true' })).toMatchObject({ ok: true, short: true });
+  });
+
+  it('counts Alice, @alice and alice as one owner', async () => {
+    const who = owner();
+    const first = await auth({ 'x-api-key': [key] }, { owner: who.toUpperCase() });
+    expect(first).toMatchObject({ ok: true, owner: who });
+    if (!first.ok) return;
+    await seedVideo(database, who, { permlink: `${first.permlink}x` });
+    expect(await auth({ 'x-api-key': [key] }, { owner: `@${who}` })).toMatchObject({ ok: false, status: 429 });
+    expect(await auth({ 'x-api-key': [key] }, { owner: ` ${who.toUpperCase()} ` })).toMatchObject({ ok: false, status: 429 });
   });
 
   it('does not count failed or in-flight uploads, or uploads older than 24h', async () => {

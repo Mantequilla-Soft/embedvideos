@@ -285,15 +285,21 @@ describe('POST /api/v0/gateway/heartbeat', () => {
     expect(await ctx.database.getEncoderByDid(id.did)).toMatchObject({ encoderCommit: SHA, behindBy: 3 });
   });
 
-  // CLAUDE.md ("Community encoder version reporting") says heartbeats carry
-  // encoder_commit / behind_by and add them, and buildHeartbeatVersionUpdate
-  // exists for it, but the heartbeat handler never calls it: the fields are
-  // ignored. Marked `fails` so this flips to a real failure once it is wired.
-  it.fails('stores a newer commit and behind count reported in a heartbeat', async () => {
+  it('stores a newer commit and behind count reported in a heartbeat', async () => {
     const id = makeDid();
     await register(id, { encoder_commit: SHA, behind_by: 3 });
     await beat(id, { encoder_commit: SHA2, behind_by: 0 });
     expect(await ctx.database.getEncoderByDid(id.did)).toMatchObject({ encoderCommit: SHA2, behindBy: 0 });
+  });
+
+  it('reads the version from a node_info wrapper too, and drops a stale behind count on a new commit', async () => {
+    const id = makeDid();
+    await register(id, { encoder_commit: SHA, behind_by: 3 });
+    await beat(id, { node_info: { encoder_commit: SHA2 } });
+    const enc = await ctx.database.getEncoderByDid(id.did);
+    expect(enc).toMatchObject({ encoderCommit: SHA2 });
+    expect(enc?.behindBy).toBeUndefined();
+    expect(enc?.versionReportedAt).toBeInstanceOf(Date);
   });
 
   it('500s when the database fails', async () => {

@@ -217,6 +217,8 @@ TUS protocol endpoint for video uploads. Requires either `X-API-Key` header or `
 **Response Headers:**
 - `X-Embed-URL`: The embed URL for the video (format: `https://play.3speak.tv/embed?v={owner}/{permlink}`)
 
+**Owner and permlink:** owner names are stored lowercased (`Alice`, `@alice` and `alice` are one owner). An `X-API-Key` upload may name its own `permlink`; one that is already taken is refused with HTTP 409 `{"error": "A video with this permlink already exists"}` on every upload path. A token's permlink is fresh by construction.
+
 ### Request Upload Token
 
 ```http
@@ -232,7 +234,7 @@ Owners without 3Speak Pro may upload **1 regular video** and **3 shorts** per **
 - **What never counts:** stream recordings (VODs) published by the 3Speak streaming server, and **media replacements** (see below).
 - **Who is exempt:** 3Speak Pro owners, warm-up accounts (3Speak users with no Hive account yet), and owners an operator lists in `UPLOAD_LIMIT_EXEMPT`.
 - Shorts and regular videos have separate allowances: using the 1 video does not touch the 3 shorts.
-- `owner` is the name the limit is kept for; it is not verified by this API.
+- `owner` is the name the limit is kept for (lowercased, so spelling it differently does not give a new allowance); it is not verified by this API.
 
 #### Replacing a video's media is free
 
@@ -609,7 +611,7 @@ The dispatcher runs every 30 seconds:
 2. Selects next available encoder using round-robin algorithm
 3. Sends job to encoder with IPFS gateway URL and webhook credentials
 4. Updates job status to `encoding` with assigned encoder name
-5. Retries failed jobs up to 3 times before marking as `failed`
+5. A job that cannot be sent goes back to `pending` for the next cycle (one attempt per job per cycle); the third failed attempt marks it `failed`
 
 See [ENCODERS.md](./ENCODERS.md) for multi-encoder configuration details.
 
