@@ -86,10 +86,12 @@ function memDatabase(rows: MemRow[]): { db: Database; lastFilter: () => any } {
         r.owner === filter.owner &&
         r.createdAt.getTime() >= filter.createdAt.$gte.getTime() &&
         filter.status.$in.includes(r.status));
+      // Honours limit() like a real cursor, so a cap in the query shows up here.
+      let cap = Infinity;
       const cursor = {
         sort: () => cursor,
-        limit: () => cursor,
-        toArray: async () => [...matched].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
+        limit: (n: number) => { cap = n; return cursor; },
+        toArray: async () => [...matched].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()).slice(0, cap),
       };
       return cursor;
     },
@@ -283,6 +285,29 @@ async function main(): Promise<void> {
     rows.length = 3;
     ok('with only failed/uploading/deleted rows the owner may upload', (await l.check('alice', 'video')) === null);
   }
+  {
+    // Regression: no cap before the limiter drops exempt rows.
+    const t0 = Date.now() - 20 * HOUR;
+    const rows: MemRow[] = Array.from({ length: 250 }, (_, i) => ({
+      owner: 'alice', permlink: `r${i}`, status: 'published' as VideoStatus, short: false, frontend_app: '3speak-tv',
+      createdAt: new Date(t0 + i * 1000), replaces_existing: true, replacesPermlink: 'orig1',
+    }));
+    rows.push({ owner: 'alice', permlink: 'ordinary', status: 'published', short: false, frontend_app: '3speak-tv', createdAt: new Date(Date.now() - HOUR) });
+    const { db } = memDatabase(rows);
+    const deps = {
+      getRecentCountedUploads: (o: string, s: Date) => db.getRecentCountedUploads(o, s),
+      isUserPremium: async () => false, streamRecordExists: async () => false, isWarmup: async () => false,
+    };
+    const r = await new UploadLimiter(cfg(), deps).check('alice', 'video');
+    ok('250 older free replacements do not hide a newer ordinary upload', r?.body.used === 1, String(r?.body.used));
+    const many: MemRow[] = Array.from({ length: 300 }, (_, i) => ({
+      owner: 'alice', permlink: `v${i}`, status: 'published' as VideoStatus, short: false, frontend_app: '3speak-tv',
+      createdAt: new Date(t0 + i * 1000),
+    }));
+    const { db: db2 } = memDatabase(many);
+    const r2 = await new UploadLimiter(cfg({ videosPerDay: 300 }), { ...deps, getRecentCountedUploads: (o, s) => db2.getRecentCountedUploads(o, s) }).check('alice', 'video');
+    ok('a limit above 200 is enforced (300 of 300 used: refused)', r2?.body.used === 300 && r2.body.limit === 300, String(r2?.body.used));
+  }
 
   section('Quota');
   {
@@ -370,6 +395,8 @@ async function main(): Promise<void> {
   {
     ok('a registered replacement row is not counted',
       (await limiter([row({ replaces_existing: true, replacesPermlink: 'orig1' })]).check('alice', 'video')) === null);
+    ok('a registered replacement without the upload-time marker is not counted',
+      (await limiter([row({ replacesPermlink: 'orig1' })]).check('alice', 'video')) === null);
     ok('a fresh, not yet registered replacement row is not counted',
       (await limiter([row({ replaces_existing: true, hoursAgo: 1 })]).check('alice', 'video')) === null);
     const stale = row({ replaces_existing: true, hoursAgo: REPLACEMENT_REGISTER_GRACE_MS / HOUR + 1 });
@@ -385,14 +412,15 @@ async function main(): Promise<void> {
       getVideo: async (p: string) => videos[p] ?? null,
       getLegacyVideo: async (p: string) => legacy[p] ?? null,
     };
-    ok('target: own embed video verifies', await verifyReplacementTarget(lookups, 'alice', 'aliceold'));
-    ok('target: own legacy video verifies', await verifyReplacementTarget(lookups, 'alice', 'alicelegacy'));
-    ok('target: someone else\'s video does not', !(await verifyReplacementTarget(lookups, 'alice', 'bobvid')));
-    ok('target: a non-existent video does not', !(await verifyReplacementTarget(lookups, 'alice', 'nope')));
-    ok('target: the upload itself does not', !(await verifyReplacementTarget({ ...lookups, getVideo: async () => ({ owner: 'alice' }) }, 'alice', 'self1', 'self1')));
-    ok('target: a non-string does not', !(await verifyReplacementTarget(lookups, 'alice', { $ne: null })));
-    ok('target: a lookup error does not (treated as an ordinary upload)',
-      !(await verifyReplacementTarget({ getVideo: async () => { throw new Error('down'); }, getLegacyVideo: async () => null }, 'alice', 'aliceold')));
+    ok('target: own embed video verifies', (await verifyReplacementTarget(lookups, 'alice', 'aliceold')) === true);
+    ok('target: own legacy video verifies', (await verifyReplacementTarget(lookups, 'alice', 'alicelegacy')) === true);
+    ok('target: someone else\'s video does not', (await verifyReplacementTarget(lookups, 'alice', 'bobvid')) === false);
+    ok('target: a non-existent video does not', (await verifyReplacementTarget(lookups, 'alice', 'nope')) === false);
+    ok('target: the upload itself does not', (await verifyReplacementTarget({ ...lookups, getVideo: async () => ({ owner: 'alice' }) }, 'alice', 'self1', 'self1')) === false);
+    ok('target: a non-string does not', (await verifyReplacementTarget(lookups, 'alice', { $ne: null })) === false);
+    const downLookups = { getVideo: async () => { throw new Error('down'); }, getLegacyVideo: async () => null };
+    ok('target: a lookup error is unknown (null), not a confirmed mismatch',
+      (await verifyReplacementTarget(downLookups, 'alice', 'aliceold')) === null);
 
     const limits = cfg();
     const atLimit = stubDb({ getRecentCountedUploads: async () => realTimeRows(1), ...lookups });
@@ -417,14 +445,43 @@ async function main(): Promise<void> {
     ok('a token replaces claim is re-verified at upload (target not the owner\'s: limited)', tokenStale.ok === false && tokenStale.status === 429);
     const tokenIgnoresMeta = await validateUploadAuth(bearer(), { replaces: 'aliceold' }, 100, atLimit, authConfig(limits));
     ok('with a token, a replaces field in metadata is ignored (signed claim only)', tokenIgnoresMeta.ok === false && tokenIgnoresMeta.status === 429);
+    const lookupDown = await validateUploadAuth(key, { owner: 'alice', replaces: 'aliceold' }, 100,
+      stubDb({ getRecentCountedUploads: async () => realTimeRows(1), ...downLookups }), authConfig(limits));
+    ok('replacement whose target lookup fails is let through at the limit (fail open)', lookupDown.ok === true, JSON.stringify(lookupDown));
+    ok('  but not recorded as a verified replacement', lookupDown.ok === true && lookupDown.replacesExisting === null);
   }
   {
     const src = readFileSync(path.join(__dirname, '../src/index.ts'), 'utf8');
     const route = src.slice(src.indexOf("app.post('/uploads/token'"), src.indexOf("app.get('/uploads/quota'"));
     ok('token route verifies the target before skipping the limit',
-      /verifyReplacementTarget\(database, owner, replaces\)/.test(route) && /replacesTarget \? null : await getUploadLimiter/.test(route));
+      /verifyReplacementTarget\(database, owner, replaces\)/.test(route) && /replacesVerdict !== false \? null : await getUploadLimiter/.test(route));
+    ok('token route signs only a verified target into the token', /replacesTarget = replacesVerdict === true \?/.test(route));
     ok('every upload path keeps replacements out of listings',
       (src.match(/listed_on_3speak: !replacesExisting && frontend_app === '3speak-tv'/g) || []).length === 3);
+  }
+
+  section('A refused upload does not burn its token');
+  {
+    const limits = cfg();
+    const used = new Set<string>();
+    const consume = async (jti: string) => { if (used.has(jti)) return false; used.add(jti); return true; };
+    const headers = bearer({ jti: 'retry-me' });
+    const full = stubDb({ consumeUploadToken: consume, getRecentCountedUploads: async () => realTimeRows(1) });
+    const refused = await validateUploadAuth(headers, {}, 100, full, authConfig(limits));
+    ok('over the limit: 429', refused.ok === false && refused.status === 429);
+    ok('  and the token is not consumed', !used.has('retry-me'));
+    const tooBig = await validateUploadAuth(headers, {}, 5_000_000, stubDb({ consumeUploadToken: consume }), authConfig(limits));
+    ok('over the token size limit: 413, token not consumed', tooBig.ok === false && tooBig.status === 413 && !used.has('retry-me'));
+    const banned = await validateUploadAuth(headers, {}, 100, stubDb({ consumeUploadToken: consume, getUser: async () => ({ username: 'alice', banned: true }) }), authConfig(limits));
+    ok('banned owner: 403, token not consumed', banned.ok === false && banned.status === 403 && !used.has('retry-me'));
+    const retry = await validateUploadAuth(headers, {}, 100, stubDb({ consumeUploadToken: consume }), authConfig(limits));
+    ok('a retry with the same token, once a slot is free, is accepted', retry.ok === true, JSON.stringify(retry));
+    ok('  and consumes it', used.has('retry-me'));
+    const replay = await validateUploadAuth(headers, {}, 100, stubDb({ consumeUploadToken: consume }), authConfig(limits));
+    ok('a replay of the accepted token is refused with 403', replay.ok === false && replay.status === 403 && /already been used/.test(replay.error));
+    let partialConsumed = false;
+    const partial = await validateUploadAuth(bearer(), {}, 100, stubDb({ consumeUploadToken: async () => { partialConsumed = true; return true; } }), authConfig(limits), true);
+    ok('a partial (chunk) upload does not consume the token', partial.ok === true && !partialConsumed);
   }
 
   section('Warm-up lookup');

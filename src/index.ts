@@ -195,10 +195,11 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     // Replacing the media of one of the owner's existing videos is free. The
     // target is verified against the database (exists, same owner) before the
     // limit is skipped, signed into the token, and verified again at upload.
-    const replacesTarget = replaces !== undefined && await verifyReplacementTarget(database, owner, replaces)
-      ? String(replaces).trim()
-      : null;
-    const refusal = replacesTarget ? null : await getUploadLimiter(database, config).check(owner, short ? 'short' : 'video');
+    // A target lookup that failed (null) skips the limit here (fail open) but
+    // is not signed into the token, so the upload is checked again on creation.
+    const replacesVerdict = replaces !== undefined ? await verifyReplacementTarget(database, owner, replaces) : false;
+    const replacesTarget = replacesVerdict === true ? String(replaces).trim() : null;
+    const refusal = replacesVerdict !== false ? null : await getUploadLimiter(database, config).check(owner, short ? 'short' : 'video');
     if (refusal) {
       res.set(refusal.headers);
       return res.status(refusal.status).json(refusal.body);

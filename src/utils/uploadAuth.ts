@@ -97,20 +97,12 @@ export async function validateUploadAuth(
       }
     }
 
-    // Partial uploads are chunk pieces — the token is consumed only on the final/regular upload.
-    if (!isPartial) {
-      const consumed = await database.consumeUploadToken(
-        tokenClaims.jti,
-        new Date(tokenClaims.exp * 1000)
-      );
-      if (!consumed) {
-        return { ok: false, status: 403, error: 'Upload token has already been used' };
-      }
-
-      if (tokenClaims.maxFileSize && uploadSize && uploadSize > tokenClaims.maxFileSize) {
-        return { ok: false, status: 413, error: 'File size exceeds token limit' };
-      }
+    if (!isPartial && tokenClaims.maxFileSize && uploadSize && uploadSize > tokenClaims.maxFileSize) {
+      return { ok: false, status: 413, error: 'File size exceeds token limit' };
     }
+
+    // The token is consumed further down, once every refusal (size, ban,
+    // daily limit) has had its say, so a refused upload leaves it usable.
   } else {
     return { ok: false, status: 401, error: 'API key or upload token required' };
   }
@@ -200,10 +192,16 @@ export async function validateUploadAuth(
   // is checked against the database HERE: the target must exist and belong to
   // this owner. A claim that does not verify is an ordinary upload.
   let replacesExisting: string | null = null;
+  // The target lookup failed: let the upload through without the limit (fail
+  // open) but do not record it as a verified replacement.
+  let replacesUnknown = false;
   const replacesClaim = tokenClaims ? tokenClaims.replaces : metadata?.replaces;
   if (!isPartial && replacesClaim) {
-    if (await verifyReplacementTarget(database, owner, replacesClaim, permlink)) {
+    const verdict = await verifyReplacementTarget(database, owner, replacesClaim, permlink);
+    if (verdict === true) {
       replacesExisting = String(replacesClaim).trim();
+    } else if (verdict === null) {
+      replacesUnknown = true;
     } else {
       console.warn(`[uploadLimits] ${owner}/${permlink} claims to replace ${replacesClaim}, which is not theirs or does not exist; treated as an ordinary upload`);
     }
@@ -213,10 +211,24 @@ export async function validateUploadAuth(
   // (better UX: refused before any bytes move), but an X-API-Key upload never
   // goes through it, and the key is public.
   // A VOD claim whose lookup failed (streamVod still undefined) is let through.
-  if (!isPartial && !replacesExisting && !(vodClaim && streamVod !== false)) {
+  if (!isPartial && !replacesExisting && !replacesUnknown && !(vodClaim && streamVod !== false)) {
     const refusal = await (limiter ?? getUploadLimiter(database, config)).check(owner, short ? 'short' : 'video');
     if (refusal) {
       return { ok: false, status: refusal.status, error: refusal.body.error, body: { ...refusal.body }, headers: refusal.headers };
+    }
+  }
+
+  // Single use. Partial uploads are chunk pieces: the token is consumed only
+  // on the final/regular upload. Consumed last so that a refusal above leaves
+  // it usable for a retry after Retry-After; consumption is atomic, so two
+  // uploads racing with one token still get exactly one through.
+  if (tokenClaims && !isPartial) {
+    const consumed = await database.consumeUploadToken(
+      tokenClaims.jti,
+      new Date(tokenClaims.exp * 1000)
+    );
+    if (!consumed) {
+      return { ok: false, status: 403, error: 'Upload token has already been used' };
     }
   }
 

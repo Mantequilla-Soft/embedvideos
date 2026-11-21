@@ -241,7 +241,7 @@ An upload that replaces the media of one of the owner's existing videos (the `PO
 - Upload token: `"replaces": "<original permlink>"` in the `POST /uploads/token` body. The response echoes `"replaces"`: the permlink when it was accepted, `null` when it was not.
 - X-API-Key uploads: a `replaces` field in the TUS metadata, or a `replaces` form field on `/upload/simple` and `/upload/chunk/create`. With an upload token the signed claim is used and a metadata `replaces` is ignored.
 
-The server checks the claim against the database (at token issuance and again when the upload is created): the original must exist, here or in the legacy catalogue, and belong to the same owner. A claim that does not check out makes it an ordinary upload, limited as usual. A replacement upload stays out of listings, like a registered replacement. It has to be registered with `POST /video/:permlink/replaces` within 6 hours; one that never is counts as a normal upload.
+The server checks the claim against the database (at token issuance and again when the upload is created): the original must exist, here or in the legacy catalogue, and belong to the same owner. A claim that does not check out makes it an ordinary upload, limited as usual. If the lookup itself fails (database trouble), the upload is let through without the limit, like every other limit lookup, but is not marked as a replacement. A video registered with `POST /video/:permlink/replaces` is free whether or not its upload named the original. A replacement upload stays out of listings, like a registered replacement. It has to be registered with `POST /video/:permlink/replaces` within 6 hours; one that never is counts as a normal upload.
 
 #### Refusal: HTTP 429 `daily_upload_limit`
 
@@ -273,6 +273,8 @@ Every refusal has the same body and a standard `Retry-After` header (seconds), o
 | `upgrade_url` | Where the owner can get 3Speak Pro. |
 
 `next_at` and `retry_after_seconds` are `null` (and `Retry-After` is absent) only when an operator sets an allowance to 0.
+
+A refused upload does not use up its upload token: the token is consumed only when an upload is accepted, so the same token can be retried after `Retry-After` while it is still valid (tokens expire, so a long wait usually means asking `POST /uploads/token` for a new one). The same holds for the other upload refusals (file too large for the token, banned owner).
 
 #### Check the allowance first
 

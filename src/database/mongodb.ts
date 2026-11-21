@@ -863,8 +863,9 @@ export class Database {
   /**
    * One owner's uploads since `since` whose bytes landed (COUNTED_UPLOAD_STATUSES),
    * oldest first. The limiter splits them into videos/shorts and drops stream
-   * VODs itself. Bounded: an owner is limited to a handful per day, so anything
-   * past the cap is already far over every limit.
+   * VODs and free replacements itself. Not capped: a cap applied before that
+   * split would let exempt rows crowd ordinary uploads out of the count, and
+   * one owner's last 24 hours is a small result.
    */
   async getRecentCountedUploads(owner: string, since: Date): Promise<CountedUploadRow[]> {
     if (!this.collection) {
@@ -876,7 +877,6 @@ export class Database {
         { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, replaces_existing: 1, replacesPermlink: 1, createdAt: 1 } }
       )
       .sort({ createdAt: 1 })
-      .limit(200)
       .toArray() as unknown as Promise<CountedUploadRow[]>;
   }
 

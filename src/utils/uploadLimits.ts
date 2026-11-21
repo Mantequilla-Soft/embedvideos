@@ -64,15 +64,19 @@ export interface ReplacementLookups {
  * Is `target` an existing video (embed-video, or the legacy `videos`
  * collection) owned by `owner`? Same rule POST /video/:permlink/replaces
  * applies when the swap is registered. A client flag alone never makes an
- * upload a replacement. Lookup errors answer false, so the upload is simply
- * treated as an ordinary one (and the limit check fails open on its own).
+ * upload a replacement.
+ *
+ * true = verified, false = confirmed not (missing, someone else's, itself, not
+ * a string): an ordinary upload. null = the lookup failed, so nobody can tell:
+ * callers let the upload through without the limit (fail open, like every
+ * other lookup here) but do not record it as a verified replacement.
  */
 export async function verifyReplacementTarget(
   db: ReplacementLookups,
   owner: string,
   target: unknown,
   newPermlink?: string,
-): Promise<boolean> {
+): Promise<boolean | null> {
   if (typeof target !== 'string' || !target.trim()) return false;
   const t = target.trim();
   if (newPermlink && t === newPermlink) return false;
@@ -81,7 +85,7 @@ export async function verifyReplacementTarget(
     return !!video && video.owner === owner;
   } catch (err) {
     console.warn(`[uploadLimits] replacement target lookup failed for ${owner}/${t}:`, (err as Error)?.message || err);
-    return false;
+    return null;
   }
 }
 
@@ -182,13 +186,16 @@ export class UploadLimiter {
   }
 
   /**
-   * A verified replacement upload is free once it is registered as the
-   * replacement, and while it still has time to be. One never registered
-   * within the grace period was used as an ordinary video and counts.
+   * A replacement upload is free once it is registered as the replacement
+   * (`replacesPermlink`, set only by POST /video/:permlink/replaces after it
+   * checked that both videos belong to the same owner), whether or not the
+   * upload announced itself. A verified upload-time claim stays free while it
+   * still has time to be registered; one never registered within the grace
+   * period was used as an ordinary video and counts.
    */
   private isFreeReplacement(row: CountedUploadRow, createdMs: number): boolean {
-    if (row.replaces_existing !== true) return false;
     if (row.replacesPermlink) return true;
+    if (row.replaces_existing !== true) return false;
     return this.now() - createdMs < REPLACEMENT_REGISTER_GRACE_MS;
   }
 
