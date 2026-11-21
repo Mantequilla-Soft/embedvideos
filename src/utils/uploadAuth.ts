@@ -2,6 +2,7 @@ import { Database } from '../database/mongodb';
 import { Config } from '../config/config';
 import { verifyUploadToken, UploadTokenClaims } from './uploadToken';
 import { generateVideoId } from './videoId';
+import { getUploadLimiter, STREAM_VOD_APP, UploadLimiter, verifyReplacementTarget } from './uploadLimits';
 
 export interface AuthSuccess {
   ok: true;
@@ -18,12 +19,29 @@ export interface AuthSuccess {
   originalFilename: string | null;
   duration: number | null;
   size: number | null;
+  /**
+   * Verified stream recording from the hangouts server (true), a claim to be
+   * one that did not verify (false), or not claimed at all (undefined).
+   * Written onto the row as `stream_vod`; true rows never count toward the
+   * daily upload limit.
+   */
+  streamVod: boolean | undefined;
+  /**
+   * Permlink of the owner's existing video this upload replaces the media of,
+   * verified against the database; null when not a (verified) replacement.
+   * Written onto the row as `replaces_existing` / `replaces_target`.
+   */
+  replacesExisting: string | null;
 }
 
 export interface AuthFailure {
   ok: false;
   status: number;
   error: string;
+  /** Full JSON body to send instead of `{ error }` (the daily-limit 429). */
+  body?: Record<string, unknown>;
+  /** Extra response headers (e.g. Retry-After). */
+  headers?: Record<string, string>;
 }
 
 export type AuthResult = AuthSuccess | AuthFailure;
@@ -40,7 +58,8 @@ export async function validateUploadAuth(
   uploadSize: number | null,
   database: Database,
   config: Config,
-  isPartial: boolean = false
+  isPartial: boolean = false,
+  limiter?: UploadLimiter
 ): Promise<AuthResult> {
   const h: Record<string, string[]> = {};
   for (const [k, v] of Object.entries(headers)) {
@@ -78,20 +97,12 @@ export async function validateUploadAuth(
       }
     }
 
-    // Partial uploads are chunk pieces — the token is consumed only on the final/regular upload.
-    if (!isPartial) {
-      const consumed = await database.consumeUploadToken(
-        tokenClaims.jti,
-        new Date(tokenClaims.exp * 1000)
-      );
-      if (!consumed) {
-        return { ok: false, status: 403, error: 'Upload token has already been used' };
-      }
-
-      if (tokenClaims.maxFileSize && uploadSize && uploadSize > tokenClaims.maxFileSize) {
-        return { ok: false, status: 413, error: 'File size exceeds token limit' };
-      }
+    if (!isPartial && tokenClaims.maxFileSize && uploadSize && uploadSize > tokenClaims.maxFileSize) {
+      return { ok: false, status: 413, error: 'File size exceeds token limit' };
     }
+
+    // The token is consumed further down, once every refusal (size, ban,
+    // daily limit) has had its say, so a refused upload leaves it usable.
   } else {
     return { ok: false, status: 401, error: 'API key or upload token required' };
   }
@@ -152,5 +163,74 @@ export async function validateUploadAuth(
     }
   }
 
-  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size };
+  // Stream recordings (VODs) are published by the hangouts server: X-API-Key,
+  // no token, frontend_app '3speak-hangouts', permlink = the room name. That
+  // metadata alone proves nothing, since the hangouts server uses the same
+  // public embed API key as the browser frontend (app_name '3speak'). So the
+  // claim is checked against the stream records the hangouts server writes
+  // into this database: this owner must have streamed in a room of exactly
+  // this name. A token upload is never a VOD.
+  const vodClaim = !isPartial && !tokenClaims && frontend_app === STREAM_VOD_APP && !short;
+  let streamVod: boolean | undefined;
+  if (vodClaim) {
+    try {
+      streamVod = await database.streamRecordExists(owner, permlink);
+    } catch (err) {
+      // Fail open: no verdict recorded (the count re-checks rows without
+      // one) and no limit applied to this upload.
+      console.warn(`[uploadLimits] stream record lookup failed for ${owner}/${permlink}:`, (err as Error)?.message || err);
+      streamVod = undefined;
+    }
+    if (streamVod === false) {
+      console.warn(`[uploadLimits] ${owner}/${permlink} claims to be a stream VOD but has no stream record; counted as a video`);
+    }
+  }
+
+  // Replacing the media of an existing video is free (owner, 2026-11-20). The
+  // claim comes from the signed token (`replaces`, verified at issuance) or,
+  // for X-API-Key uploads, from the `replaces` metadata field; either way it
+  // is checked against the database HERE: the target must exist and belong to
+  // this owner. A claim that does not verify is an ordinary upload.
+  let replacesExisting: string | null = null;
+  // The target lookup failed: let the upload through without the limit (fail
+  // open) but do not record it as a verified replacement.
+  let replacesUnknown = false;
+  const replacesClaim = tokenClaims ? tokenClaims.replaces : metadata?.replaces;
+  if (!isPartial && replacesClaim) {
+    const verdict = await verifyReplacementTarget(database, owner, replacesClaim, permlink);
+    if (verdict === true) {
+      replacesExisting = String(replacesClaim).trim();
+    } else if (verdict === null) {
+      replacesUnknown = true;
+    } else {
+      console.warn(`[uploadLimits] ${owner}/${permlink} claims to replace ${replacesClaim}, which is not theirs or does not exist; treated as an ordinary upload`);
+    }
+  }
+
+  // Daily upload limit, for every auth method. The token route checks too
+  // (better UX: refused before any bytes move), but an X-API-Key upload never
+  // goes through it, and the key is public.
+  // A VOD claim whose lookup failed (streamVod still undefined) is let through.
+  if (!isPartial && !replacesExisting && !replacesUnknown && !(vodClaim && streamVod !== false)) {
+    const refusal = await (limiter ?? getUploadLimiter(database, config)).check(owner, short ? 'short' : 'video');
+    if (refusal) {
+      return { ok: false, status: refusal.status, error: refusal.body.error, body: { ...refusal.body }, headers: refusal.headers };
+    }
+  }
+
+  // Single use. Partial uploads are chunk pieces: the token is consumed only
+  // on the final/regular upload. Consumed last so that a refusal above leaves
+  // it usable for a retry after Retry-After; consumption is atomic, so two
+  // uploads racing with one token still get exactly one through.
+  if (tokenClaims && !isPartial) {
+    const consumed = await database.consumeUploadToken(
+      tokenClaims.jti,
+      new Date(tokenClaims.exp * 1000)
+    );
+    if (!consumed) {
+      return { ok: false, status: 403, error: 'Upload token has already been used' };
+    }
+  }
+
+  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod, replacesExisting };
 }

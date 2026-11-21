@@ -224,6 +224,96 @@ POST /uploads/token
 ```
 Generates a short-lived, single-use upload token. Requires `X-API-Key` header. See [Authentication](#authentication) for details.
 
+### Upload Limits
+
+Owners without 3Speak Pro may upload **1 regular video** and **3 shorts** per **rolling 24 hours**. The limit is enforced by this API for every app that uses it, on every upload path: `POST /uploads/token`, TUS `POST /uploads` (token or `X-API-Key`), `POST /upload/simple` and `POST /upload/chunk/create`.
+
+- **What counts:** uploads whose bytes landed (video status `processing`, `awaiting_encode` or `published`), created in the last 24 hours. Uploads still in flight, failed uploads and deleted videos do not use a slot. Imports (YouTube, TikTok) that arrive here count like any upload.
+- **What never counts:** stream recordings (VODs) published by the 3Speak streaming server, and **media replacements** (see below).
+- **Who is exempt:** 3Speak Pro owners, warm-up accounts (3Speak users with no Hive account yet), and owners an operator lists in `UPLOAD_LIMIT_EXEMPT`.
+- Shorts and regular videos have separate allowances: using the 1 video does not touch the 3 shorts.
+- `owner` is the name the limit is kept for; it is not verified by this API.
+
+#### Replacing a video's media is free
+
+An upload that replaces the media of one of the owner's existing videos (the `POST /video/:permlink/replaces` flow, legacy videos included) is never refused and does not use a slot. Say so when the upload starts, by naming the original permlink:
+
+- Upload token: `"replaces": "<original permlink>"` in the `POST /uploads/token` body. The response echoes `"replaces"`: the permlink when it was accepted, `null` when it was not.
+- X-API-Key uploads: a `replaces` field in the TUS metadata, or a `replaces` form field on `/upload/simple` and `/upload/chunk/create`. With an upload token the signed claim is used and a metadata `replaces` is ignored.
+
+The server checks the claim against the database (at token issuance and again when the upload is created): the original must exist, here or in the legacy catalogue, and belong to the same owner. A claim that does not check out makes it an ordinary upload, limited as usual. If the lookup itself fails (database trouble), the upload is let through without the limit, like every other limit lookup, but is not marked as a replacement. A video registered with `POST /video/:permlink/replaces` is free whether or not its upload named the original. A replacement upload stays out of listings, like a registered replacement. It has to be registered with `POST /video/:permlink/replaces` within 6 hours; one that never is counts as a normal upload.
+
+#### Refusal: HTTP 429 `daily_upload_limit`
+
+Every refusal has the same body and a standard `Retry-After` header (seconds), on every path. On TUS uploads it is the response to the creation `POST` (tus-js-client: `error.originalResponse.getBody()` and `getHeader('Retry-After')`); 429 is not retried by tus-js-client.
+
+```json
+{
+  "error": "Daily video upload limit reached",
+  "code": "daily_upload_limit",
+  "kind": "video",
+  "limit": 1,
+  "used": 1,
+  "next_at": "2026-11-21T14:32:00Z",
+  "retry_after_seconds": 68400,
+  "message": "Free accounts can upload 1 video per 24 hours. Your next video upload is possible at 2026-11-21T14:32:00Z. 3Speak Pro removes this limit.",
+  "upgrade_url": "https://3speak.tv/wallet/alice#pro"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `code` | Always `daily_upload_limit`. Branch on this, not on `error` or `message`. |
+| `error` | Short text, stable. |
+| `message` | Full English sentence, safe to show to the user as is. |
+| `kind` | `video` or `short`: which allowance is used up. |
+| `limit` / `used` | The allowance and how many counted uploads are in the window. |
+| `next_at` | ISO 8601 (UTC, no milliseconds): when the next slot frees, i.e. when the oldest counted upload turns 24 hours old. |
+| `retry_after_seconds` | Seconds until `next_at`; same value as the `Retry-After` header. |
+| `upgrade_url` | Where the owner can get 3Speak Pro. |
+
+`next_at` and `retry_after_seconds` are `null` (and `Retry-After` is absent) only when an operator sets an allowance to 0.
+
+A refused upload does not use up its upload token: the token is consumed only when an upload is accepted, so the same token can be retried after `Retry-After` while it is still valid (tokens expire, so a long wait usually means asking `POST /uploads/token` for a new one). The same holds for the other upload refusals (file too large for the token, banned owner).
+
+#### Check the allowance first
+
+```http
+GET /uploads/quota?owner=<name>
+```
+
+Requires `X-API-Key`. Lets a frontend show "1 short left today" before the user picks a file.
+
+```json
+{
+  "enabled": true,
+  "exempt": false,
+  "reason": null,
+  "video": { "limit": 1, "used": 1, "remaining": 0, "next_at": "2026-11-21T14:32:00Z" },
+  "short": { "limit": 3, "used": 1, "remaining": 2, "next_at": null }
+}
+```
+
+- `reason`: `"pro"`, `"warmup"`, `"listed"` when `exempt` is true, else `null`.
+- For an exempt owner `limit`, `remaining` and `next_at` are `null` (unlimited); `used` is still reported.
+- `next_at` is `null` while `remaining` is above 0.
+- When limits are switched off: `{ "enabled": false, "exempt": true, "reason": null, ... }` with `null` limits.
+- `503` if the count cannot be read right now; uploads are not blocked while that is the case.
+
+#### Configuration
+
+| Env | Default | |
+|---|---|---|
+| `UPLOAD_DAILY_LIMITS_ENABLED` | on | Set to `false` to switch the limits off. |
+| `UPLOAD_LIMIT_VIDEOS_PER_DAY` | `1` | Regular videos per rolling 24 hours. |
+| `UPLOAD_LIMIT_SHORTS_PER_DAY` | `3` | Shorts per rolling 24 hours. |
+| `UPLOAD_LIMIT_EXEMPT` | empty | Comma list of owners who are never limited. |
+| `UPLOAD_LIMIT_WARMUP_LOOKUP_URL` | `https://checker.3speak.tv/incubation/authors` | Warm-up registry lookup. |
+| `UPLOAD_LIMIT_HIVE_NODES` | `api.hive.blog`, `api.deathwing.me`, `anyx.io` | Hive API nodes for the warm-up check. |
+| `UPLOAD_UPGRADE_URL` | `https://3speak.tv/wallet/{owner}#pro` | `upgrade_url`; `{owner}` (or `{user}`) is replaced. |
+
+Every lookup behind the limit fails open: if Mongo, the warm-up registry or Hive cannot answer, the upload is allowed.
+
 ## Upload Examples
 
 ### Direct API Key (Server-to-Server / Mobile)
@@ -505,6 +595,7 @@ interface Encoder {
 
 - **uploading** - TUS upload in progress
 - **processing** - Upload complete, encoder is working on it
+- **awaiting_encode** - Upload complete and pinned, encode deferred until publish (`defer_encode`)
 - **published** - Video is ready to watch
 - **failed** - Processing failed
 - **deleted** - Video marked for deletion

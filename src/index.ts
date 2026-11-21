@@ -22,6 +22,7 @@ import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims 
 import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
 import { clientIpFrom, ipHashes } from './utils/ipHash';
 import { parseReportedVersion, buildRegistrationVersionUpdate, buildHeartbeatVersionUpdate } from './utils/encoderVersion';
+import { getUploadLimiter, verifyReplacementTarget } from './utils/uploadLimits';
 
 dotenv.config();
 
@@ -51,7 +52,9 @@ const cleanupService = new CleanupService(config.uploadDir, config.cleanupRetent
 
 // Middleware
 app.use(cors({
-  exposedHeaders: ['X-Embed-URL', 'x-embed-url'],
+  // Retry-After rides on the daily upload limit 429, and a browser client can
+  // only read it when it is exposed.
+  exposedHeaders: ['X-Embed-URL', 'x-embed-url', 'Retry-After'],
   // Every chunk POST carries an upload progress listener, which makes it a
   // non-simple request, which makes the browser preflight it. With no Max-Age
   // Chrome caches that preflight for 5 SECONDS, so the chunked path was paying a
@@ -112,11 +115,11 @@ const tusProxy = createProxyMiddleware({
           pending204EmbedUrls.delete(uploadId);
         }
       }
-      const existing = (proxyRes.headers['access-control-expose-headers'] as string) || '';
-      if (!existing.toLowerCase().includes('x-embed-url')) {
-        proxyRes.headers['access-control-expose-headers'] =
-          existing ? `${existing}, X-Embed-URL` : 'X-Embed-URL';
+      let exposed = (proxyRes.headers['access-control-expose-headers'] as string) || '';
+      for (const h of ['X-Embed-URL', 'Retry-After']) {
+        if (!exposed.toLowerCase().includes(h.toLowerCase())) exposed = exposed ? `${exposed}, ${h}` : h;
       }
+      proxyRes.headers['access-control-expose-headers'] = exposed;
     },
   },
 });
@@ -134,7 +137,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
 
     const {
       owner, frontend_app, short = false, gated = false, allowlist,
-      allowed_origins = [], max_file_size, ttl, defer_encode = false,
+      allowed_origins = [], max_file_size, ttl, defer_encode = false, replaces,
     } = req.body;
 
     if (!owner || typeof owner !== 'string') {
@@ -184,6 +187,24 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       }
     }
 
+    // Daily upload limit for owners without Pro. Checked here so a client is
+    // refused before any bytes move; checked again when the upload is created
+    // (validateUploadAuth), which also covers X-API-Key uploads that never come
+    // through this route. `owner` is not verified here (the API key is public),
+    // so the limit is per owner name.
+    // Replacing the media of one of the owner's existing videos is free. The
+    // target is verified against the database (exists, same owner) before the
+    // limit is skipped, signed into the token, and verified again at upload.
+    // A target lookup that failed (null) skips the limit here (fail open) but
+    // is not signed into the token, so the upload is checked again on creation.
+    const replacesVerdict = replaces !== undefined ? await verifyReplacementTarget(database, owner, replaces) : false;
+    const replacesTarget = replacesVerdict === true ? String(replaces).trim() : null;
+    const refusal = replacesVerdict !== false ? null : await getUploadLimiter(database, config).check(owner, short ? 'short' : 'video');
+    if (refusal) {
+      res.set(refusal.headers);
+      return res.status(refusal.status).json(refusal.body);
+    }
+
     const tokenTtl = Math.min(
       typeof ttl === 'number' && ttl > 0 ? ttl : config.uploadTokenDefaultTtl,
       config.uploadTokenMaxTtl
@@ -210,6 +231,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       short: !!short,
       gated: !!gated,
       ...(defer_encode ? { deferEncode: true } : {}),
+      ...(replacesTarget ? { replaces: replacesTarget } : {}),
       ...(gated && Array.isArray(allowlist) && allowlist.length
         ? { allowlist: [...new Set(allowlist.map((u: string) => String(u).trim().toLowerCase().replace(/^@/, '')))] }
         : {}),
@@ -264,11 +286,31 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       // both fields, so a client that needs the gated decision to happen after
       // the upload can detect it instead of quietly losing the choice.
       defer_encode: !!defer_encode,
+      // The verified replacement target (free under the daily limit), or null
+      // when none was asked for or it is not this owner's video.
+      replaces: replacesTarget,
       ...(finalizeToken ? { finalize_token: finalizeToken } : {}),
     });
   } catch (error) {
     console.error('Error creating upload token:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /uploads/quota?owner=<name>: an owner's daily upload allowance, so a
+// frontend can say "1 video left today" before the user picks a file. Must stay
+// registered before the app.all('/uploads/*') tusd proxy, like /uploads/token.
+app.get('/uploads/quota', requireApiKey, async (req: Request, res: Response) => {
+  const owner = typeof req.query.owner === 'string' ? req.query.owner.trim() : '';
+  if (!owner) {
+    return res.status(422).json({ error: 'owner (string) is required' });
+  }
+  try {
+    res.set('Cache-Control', 'no-store');
+    res.json(await getUploadLimiter(database, config).quota(owner));
+  } catch (error) {
+    console.error(`Error reading upload quota for ${owner}:`, error);
+    res.status(503).json({ error: 'Upload quota is unavailable right now' });
   }
 });
 
@@ -305,11 +347,12 @@ app.post('/upload/simple', (req: Request, res: Response) => {
   let filePromise: Promise<void> = Promise.resolve();
 
   const cleanup = () => { if (tempPath) { try { unlinkSync(tempPath); } catch {} } };
-  const fail = (status: number, error: string) => {
+  const fail = (status: number, error: string, body?: Record<string, unknown>, headers?: Record<string, string>) => {
     if (responded) return;
     responded = true;
     cleanup();
-    res.status(status).json({ error });
+    if (headers) res.set(headers);
+    res.status(status).json(body ?? { error });
   };
 
   bb.on('field', (name, val) => { fields[name] = val; });
@@ -349,26 +392,30 @@ app.post('/upload/simple', (req: Request, res: Response) => {
 
     const metadata: Record<string, string> = { filename: fields.filename || '' };
     // token claims override owner/short/permlink; these are only fallbacks.
-    for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration'] as const) {
+    for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration', 'replaces'] as const) {
       if (fields[k]) metadata[k] = fields[k];
     }
 
     const auth = await validateUploadAuth(synthHeaders, metadata, receivedSize, database, config, false);
-    if (!auth.ok) return fail(auth.status, auth.error);
+    if (!auth.ok) return fail(auth.status, auth.error, auth.body, auth.headers);
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration } = auth;
+    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
 
     await database.createVideoEntry({
       owner, permlink, frontend_app,
       status: 'uploading',
       input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
       short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: receivedSize,
+      ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
+      ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
       encodingProgress: 0,
       originalFilename,
       hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
       embed_url: null, embed_title: null,
       ...ipHashes(clientIpFrom(req.headers)),
-      listed_on_3speak: frontend_app === '3speak-tv',
+      // A replacement is a media carrier, not a video of its own: kept out of
+      // listings from the start (POST /video/:permlink/replaces does the same).
+      listed_on_3speak: !replacesExisting && frontend_app === '3speak-tv',
       processed: false, processedAt: null, views: 0,
       createdAt: new Date(), updatedAt: new Date(),
     });
@@ -521,25 +568,32 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
   if (req.headers.origin) synthHeaders['origin'] = [String(req.headers.origin)];
 
   const metadata: Record<string, string> = { filename: fields.filename || '' };
-  for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration'] as const) {
+  for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration', 'replaces'] as const) {
     if (fields[k]) metadata[k] = fields[k];
   }
 
   const auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
-  if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
-  const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration } = auth;
+  if (!auth.ok) {
+    if (auth.headers) res.set(auth.headers);
+    return res.status(auth.status).json(auth.body ?? { error: auth.error });
+  }
+  const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
 
   await database.createVideoEntry({
     owner, permlink, frontend_app,
     status: 'uploading',
     input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
     short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: totalSize,
+    ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
+    ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
     encodingProgress: 0,
     originalFilename,
     hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
     embed_url: null, embed_title: null,
     ...ipHashes(clientIpFrom(req.headers)),
-    listed_on_3speak: frontend_app === '3speak-tv',
+    // A replacement is a media carrier, not a video of its own: kept out of
+    // listings from the start (POST /video/:permlink/replaces does the same).
+    listed_on_3speak: !replacesExisting && frontend_app === '3speak-tv',
     processed: false, processedAt: null, views: 0,
     createdAt: new Date(), updatedAt: new Date(),
   });
@@ -717,12 +771,17 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
     );
 
     if (!authResult.ok) {
+      // tusd v2 reads the rejection's headers from `Header` (its Go field
+      // name); `Headers` is ignored. Both are sent so the Content-Type and the
+      // daily-limit Retry-After reach the tus client.
+      const header = { 'Content-Type': 'application/json', ...(authResult.headers || {}) };
       return res.json({
         RejectUpload: true,
         HTTPResponse: {
           StatusCode: authResult.status,
-          Body: JSON.stringify({ error: authResult.error }),
-          Headers: { 'Content-Type': 'application/json' },
+          Body: JSON.stringify(authResult.body ?? { error: authResult.error }),
+          Header: header,
+          Headers: header,
         },
       });
     }
@@ -732,7 +791,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       return res.json({});
     }
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size } = authResult;
+    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod, replacesExisting } = authResult;
 
     // Hard size cap, enforced for every upload regardless of auth method.
     // For parallel/Concatenation uploads this fires on the final concat, whose
@@ -768,6 +827,8 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       gate_video_id: gated ? permlink : null,
       allowlist,
       defer_encode: deferEncode,
+      ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
+      ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
       duration,
       size,
       encodingProgress: 0,
@@ -781,7 +842,9 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
       embed_title: null,
       // tusd hands over the original request headers; X-Real-IP comes from nginx.
       ...ipHashes(clientIpFrom(HTTPRequest?.Header)),
-      listed_on_3speak: frontend_app === '3speak-tv',
+      // A replacement is a media carrier, not a video of its own: kept out of
+      // listings from the start (POST /video/:permlink/replaces does the same).
+      listed_on_3speak: !replacesExisting && frontend_app === '3speak-tv',
       processed: false,
       processedAt: null,
       views: 0,
