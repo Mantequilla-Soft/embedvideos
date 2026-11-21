@@ -488,8 +488,8 @@ const CHUNK_PROBE_MAX = 512 * 1024;                 // hard bound on a /upload/p
 const CHUNK_MAX_COUNT = 100_000;                    // sanity cap on totalChunks
 const CHUNK_SESSION_TTL_MS = 2 * 60 * 60 * 1000;    // idle-session lifetime before reap
 
-const chunkReaper = setInterval(() => {
-  const now = Date.now();
+/** Drops chunked sessions idle for longer than CHUNK_SESSION_TTL_MS (and their temp files). */
+export function reapChunkSessions(now = Date.now()): void {
   for (const [id, s] of chunkSessions) {
     if (now - s.updatedAt > CHUNK_SESSION_TTL_MS) {
       chunkSessions.delete(id);
@@ -498,7 +498,8 @@ const chunkReaper = setInterval(() => {
       console.warn(`Chunked session reaped (idle): ${s.owner}/${s.permlink} at ${s.receivedBytes}/${s.totalSize}`);
     }
   }
-}, 10 * 60 * 1000);
+}
+const chunkReaper = setInterval(() => reapChunkSessions(), 10 * 60 * 1000);
 if (typeof chunkReaper.unref === 'function') chunkReaper.unref();
 
 // Parse a small multipart request: all fields, plus (optionally) ONE file part
@@ -1811,7 +1812,7 @@ async function applyPendingReplacement(newPermlink: string): Promise<void> {
 // sweeper closes that gap: it works off the shared database, so it does not care
 // which host published the asset, and it also recovers a webhook that was lost.
 const REPLACEMENT_SWEEP_MS = 30_000;
-setInterval(async () => {
+export async function sweepReplacements(): Promise<void> {
   try {
     const pending = await database.getPendingReplacements();
     for (const v of pending) {
@@ -1825,7 +1826,8 @@ setInterval(async () => {
     // Never let a sweep failure take the process down.
     console.error('Replacement sweep failed:', err);
   }
-}, REPLACEMENT_SWEEP_MS).unref?.();
+}
+setInterval(sweepReplacements, REPLACEMENT_SWEEP_MS).unref?.();
 
 // Abandon deferred uploads whose publish never came.
 //
@@ -1834,7 +1836,7 @@ setInterval(async () => {
 // accumulate pinned storage forever. Marking them failed also unpins the input,
 // which matters most for the gated case — that input is the plaintext original.
 const DEFERRED_SWEEP_MS = 15 * 60_000;
-setInterval(async () => {
+export async function sweepAbandonedDeferred(): Promise<void> {
   try {
     const abandoned = await database.getAbandonedDeferred(DEFERRED_ENCODE_ABANDON_HOURS);
     for (const v of abandoned) {
@@ -1861,7 +1863,8 @@ setInterval(async () => {
   } catch (err) {
     console.error('Deferred sweep failed:', err);
   }
-}, DEFERRED_SWEEP_MS).unref?.();
+}
+setInterval(sweepAbandonedDeferred, DEFERRED_SWEEP_MS).unref?.();
 
 // Heal deferred uploads whose finalize call (POST /video/:permlink/encode)
 // never arrived despite the owner having actually published — proof being a
@@ -1881,7 +1884,7 @@ setInterval(async () => {
 // resolve on its own.
 const DEFER_HEAL_GRACE_MINUTES = 20;
 const DEFER_HEAL_SWEEP_MS = 5 * 60_000;
-setInterval(async () => {
+export async function sweepHealableDeferred(): Promise<void> {
   try {
     const healable = await database.getHealableDeferred(DEFER_HEAL_GRACE_MINUTES);
     for (const v of healable) {
@@ -1910,7 +1913,8 @@ setInterval(async () => {
   } catch (err) {
     console.error('Heal sweep failed:', err);
   }
-}, DEFER_HEAL_SWEEP_MS).unref?.();
+}
+setInterval(sweepHealableDeferred, DEFER_HEAL_SWEEP_MS).unref?.();
 
 // Register a freshly-uploaded asset as the replacement for an existing video.
 //
@@ -2682,25 +2686,31 @@ async function start() {
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  if (tusdProcess) tusdProcess.kill('SIGTERM');
-  if (dispatcher) dispatcher.stop();
-  cleanupService.stop();
-  await database.close();
-  process.exit(0);
-});
+// Run directly (node dist/index.js): start the server and shut down cleanly.
+// Imported (the tests): only the app is set up, nothing listens or connects.
+if (require.main === module) {
+  // Graceful shutdown
+  process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    if (tusdProcess) tusdProcess.kill('SIGTERM');
+    if (dispatcher) dispatcher.stop();
+    cleanupService.stop();
+    await database.close();
+    process.exit(0);
+  });
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  if (tusdProcess) tusdProcess.kill('SIGTERM');
-  if (dispatcher) {
-    dispatcher.stop();
-  }
-  cleanupService.stop();
-  await database.close();
-  process.exit(0);
-});
+  process.on('SIGINT', async () => {
+    console.log('SIGINT received, shutting down gracefully...');
+    if (tusdProcess) tusdProcess.kill('SIGTERM');
+    if (dispatcher) {
+      dispatcher.stop();
+    }
+    cleanupService.stop();
+    await database.close();
+    process.exit(0);
+  });
 
-start();
+  start();
+}
+
+export { app, database, config, chunkSessions, start };

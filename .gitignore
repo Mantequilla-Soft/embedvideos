@@ -6,7 +6,10 @@ dist.bak*/
 # above, so an unqualified `git add -A` would commit them.
 .env.bak*
 uploads/
+# ...but not the upload tests
+!test/uploads/
 bin/
 *.log
 .DS_Store
 internal-docs/
+coverage/

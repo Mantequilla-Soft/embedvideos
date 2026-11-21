@@ -11,7 +11,14 @@ npm start         # Run compiled output (production)
 npm run watch     # Watch mode TypeScript compile
 ```
 
-No test runner. The `scripts/test-*.ts` files are standalone checks (run each with `npx ts-node --transpile-only`); everything else is validated by running `dev` and exercising endpoints manually.
+```bash
+npm test              # Vitest suite (test/**/*.test.ts)
+npm run test:coverage # same, with coverage; fails below 75% lines (vitest.config.ts)
+```
+
+Tests run against a real MongoDB from `mongodb-memory-server` (started once in `test/globalSetup.ts`; each test file gets its own database in `test/setup.ts`). `src/index.ts` only connects, listens and starts tusd, the dispatcher and the cleanup service when run directly (its sweeps are exported functions; their timers are `unref`'d), so tests import the app (`test/helpers/app.ts`) and drive it with supertest; IPFS, tusd, encoders, the gate and webhooks are stubbed per test. CI (`.github/workflows/tests.yml`) runs the type check and the suite with coverage on every pull request.
+
+The `scripts/test-*.ts` files are older standalone checks (run each with `npx ts-node --transpile-only`).
 
 ## Architecture
 
