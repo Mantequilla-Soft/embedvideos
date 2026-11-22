@@ -194,7 +194,7 @@ describe('daily upload limit', () => {
     expect(await auth({ 'x-api-key': [key] }, { owner: who })).toMatchObject({ ok: true });
   });
 
-  it('exempts Pro, listed and warm-up owners, but not graduated ones', async () => {
+  it('exempts Pro and listed owners, gives warm-up owners their own limit, not graduated ones', async () => {
     const pro = owner();
     await seedVideo(database, pro);
     // Refused while free (the user row is created on the way)...

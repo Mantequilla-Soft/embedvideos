@@ -58,6 +58,10 @@ export interface UploadLimitsConfig {
   videosPerDay: number;
   /** Shorts per rolling 24 hours. */
   shortsPerDay: number;
+  /** Regular videos per rolling 24 hours for a warm-up account (no Hive account yet). */
+  warmupVideosPerDay: number;
+  /** Shorts per rolling 24 hours for a warm-up account. */
+  warmupShortsPerDay: number;
   /** Owners never limited (lowercased). */
   exempt: string[];
   /** Checker endpoint that says whether a handle is a warm-up (incubating) account. */
@@ -86,6 +90,8 @@ export function loadUploadLimitsConfig(env: NodeJS.ProcessEnv = process.env): Up
     enabled: env.UPLOAD_DAILY_LIMITS_ENABLED !== 'false',
     videosPerDay: parseCount(env.UPLOAD_LIMIT_VIDEOS_PER_DAY, 1),
     shortsPerDay: parseCount(env.UPLOAD_LIMIT_SHORTS_PER_DAY, 3),
+    warmupVideosPerDay: parseCount(env.UPLOAD_LIMIT_WARMUP_VIDEOS_PER_DAY, 3),
+    warmupShortsPerDay: parseCount(env.UPLOAD_LIMIT_WARMUP_SHORTS_PER_DAY, 3),
     exempt: parseList(env.UPLOAD_LIMIT_EXEMPT),
     warmupLookupUrl: env.UPLOAD_LIMIT_WARMUP_LOOKUP_URL || 'https://checker.3speak.tv/incubation/authors',
     hiveApiNodes: hiveNodes.length ? hiveNodes : ['https://api.hive.blog', 'https://api.deathwing.me', 'https://anyx.io'],

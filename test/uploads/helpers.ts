@@ -14,9 +14,15 @@ export function rawDb(database: Database): any {
  * Anything else is an unexpected outside call and fails the request.
  * Must be installed before the app builds its upload limiter (first request).
  */
-export function installFetchStub(opts: { incubating?: string[]; hiveAccounts?: string[] } = {}) {
+/**
+ * Stubs global fetch for the warm-up registry and Hive. `hiveCreated` gives an
+ * account a `created` time (Hive's format, UTC without a zone); accounts
+ * without one answer no `created`.
+ */
+export function installFetchStub(opts: { incubating?: string[]; hiveAccounts?: string[]; hiveCreated?: Record<string, string> } = {}) {
   const incubating = new Set(opts.incubating ?? []);
-  const hive = new Set(opts.hiveAccounts ?? []);
+  const created = opts.hiveCreated ?? {};
+  const hive = new Set([...(opts.hiveAccounts ?? []), ...Object.keys(created)]);
   const fn = vi.fn(async (url: any, init?: any) => {
     const u = String(url);
     const body = init?.body ? JSON.parse(String(init.body)) : {};
@@ -27,7 +33,7 @@ export function installFetchStub(opts: { incubating?: string[]; hiveAccounts?: s
       return json({ authors });
     }
     if (body.method === 'condenser_api.get_accounts') {
-      return json({ result: (body.params?.[0] ?? []).filter((n: string) => hive.has(n)).map((name: string) => ({ name })) });
+      return json({ result: (body.params?.[0] ?? []).filter((n: string) => hive.has(n)).map((name: string) => (created[name] ? { name, created: created[name] } : { name })) });
     }
     throw new Error(`unexpected outside call in test: ${u}`);
   });

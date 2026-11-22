@@ -46,6 +46,8 @@ export interface CountedUploadRow {
   stream_vod?: boolean;
   replaces_existing?: boolean;
   replacesPermlink?: string | null;
+  /** Set by the checker's claim-assets when a warm-up handle's upload moved to its new Hive account. */
+  owner_claimed_from?: string;
   createdAt: Date;
 }
 
@@ -907,7 +909,7 @@ export class Database {
     return this.collection
       .find(
         { owner, createdAt: { $gte: since }, status: { $in: COUNTED_UPLOAD_STATUSES } },
-        { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, replaces_existing: 1, replacesPermlink: 1, createdAt: 1 } }
+        { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, replaces_existing: 1, replacesPermlink: 1, owner_claimed_from: 1, createdAt: 1 } }
       )
       .sort({ createdAt: 1 })
       .toArray() as unknown as Promise<CountedUploadRow[]>;

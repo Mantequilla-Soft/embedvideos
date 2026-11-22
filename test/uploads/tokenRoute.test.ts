@@ -11,7 +11,9 @@ process.env.GATE_INTERNAL_API_KEY = 'gate-key';
 process.env.UPLOAD_LIMIT_EXEMPT = 'vipowner';
 process.env.UPLOAD_TOKEN_MAX_TTL = '1800';
 process.env.UPLOAD_TOKEN_MAX_FILE_SIZE = String(500 * 1024 * 1024);
-installFetchStub({ incubating: ['warmupkid'] });
+// `gradkid` got its Hive account two hours ago (same name as its warm-up handle).
+const hiveTime = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, '');
+installFetchStub({ incubating: ['warmupkid', 'warmupfull'], hiveCreated: { gradkid: hiveTime(Date.now() - 2 * 3600 * 1000) } });
 
 let database: Database;
 let config: any;
@@ -192,15 +194,40 @@ describe('POST /uploads/token', () => {
       expect((await token({ owner: who })).status).toBe(201);
     });
 
-    it('exempts Pro, listed and warm-up owners', async () => {
+    it('exempts Pro and listed owners', async () => {
       const pro = owner('pro');
       await makePro(pro);
       await seedVideo(database, pro);
       expect((await token({ owner: pro })).status).toBe(201);
       await seedVideo(database, 'vipowner');
       expect((await token({ owner: 'vipowner' })).status).toBe(201);
+    });
+
+    it('holds warm-up owners to 3 videos and 3 shorts a day', async () => {
+      await seedVideo(database, 'warmupkid');
       await seedVideo(database, 'warmupkid');
       expect((await token({ owner: 'warmupkid' })).status).toBe(201);
+      for (let i = 0; i < 3; i++) await seedVideo(database, 'warmupfull');
+      const res = await token({ owner: 'warmupfull' });
+      expect(res.status).toBe(429);
+      expect(res.body).toMatchObject({ code: 'daily_upload_limit', plan: 'warmup', kind: 'video', limit: 3, used: 3 });
+      expect(res.body.message).not.toContain('Pro');
+      expect((await token({ owner: 'warmupfull', short: true })).status).toBe(201);
+      for (let i = 0; i < 3; i++) await seedVideo(database, 'warmupfull', { short: true });
+      expect((await token({ owner: 'warmupfull', short: true })).body).toMatchObject({ plan: 'warmup', kind: 'short', limit: 3 });
+    });
+
+    it('does not count the warm-up backlog against the new Hive account', async () => {
+      // Uploaded while still a warm-up: under the same name before the account existed...
+      for (let i = 0; i < 3; i++) await seedVideo(database, 'gradkid', { agoMs: (5 + i) * 3600 * 1000 });
+      // ...and claimed from another handle by the checker at graduation.
+      const moved = owner('moved');
+      for (let i = 0; i < 3; i++) await seedVideo(database, moved, { owner_claimed_from: 'oldhandle' });
+      expect((await token({ owner: 'gradkid' })).status).toBe(201);
+      expect((await token({ owner: moved })).status).toBe(201);
+      // Their own uploads since then count as usual.
+      await seedVideo(database, 'gradkid');
+      expect((await token({ owner: 'gradkid' })).body).toMatchObject({ plan: 'free', limit: 1, used: 1 });
     });
 
     it('lets a verified replacement through and signs the target', async () => {
@@ -259,7 +286,7 @@ describe('GET /uploads/quota', () => {
     expect(res.status).toBe(200);
     expect(res.headers['cache-control']).toBe('no-store');
     expect(res.body).toMatchObject({
-      enabled: true, exempt: false, reason: null,
+      enabled: true, exempt: false, reason: null, plan: 'free',
       video: { limit: 1, used: 1, remaining: 0 },
       short: { limit: 3, used: 1, remaining: 2, next_at: null },
     });
@@ -271,7 +298,12 @@ describe('GET /uploads/quota', () => {
     await makePro(pro);
     expect((await quota(`?owner=${pro}`)).body).toMatchObject({ exempt: true, reason: 'pro', video: { limit: null } });
     expect((await quota('?owner=vipowner')).body.reason).toBe('listed');
-    expect((await quota('?owner=warmupkid')).body.reason).toBe('warmup');
+  });
+
+  it('reports a warm-up owner\'s own allowance', async () => {
+    expect((await quota('?owner=warmupkid')).body).toMatchObject({
+      exempt: false, reason: null, plan: 'warmup', video: { limit: 3 }, short: { limit: 3 },
+    });
   });
 
   it('reports unlimited when limits are switched off', async () => {

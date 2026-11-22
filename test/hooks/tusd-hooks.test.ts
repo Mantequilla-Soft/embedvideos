@@ -296,9 +296,14 @@ describe('pre-create', () => {
   });
 
   it('passes the daily-limit 429 and its Retry-After through to tusd', async () => {
-    // One counted upload already today, and the warm-up registry says "not incubating".
+    // One counted upload already today, the warm-up registry says "not incubating",
+    // and Hive has an account `ivan` from long before it (so the upload counts).
     await insertVideo(database, { owner: 'ivan', status: 'published', createdAt: new Date() });
-    fetchMock.mockResolvedValue(new Response(JSON.stringify({ authors: { ivan: { status: 'graduated' } } }), { status: 200 }));
+    fetchMock.mockImplementation(async (url: unknown) => new Response(JSON.stringify(
+      String(url).includes('/incubation/authors')
+        ? { authors: { ivan: { status: 'graduated' } } }
+        : { result: [{ name: 'ivan', created: '2020-01-01T00:00:00' }] },
+    ), { status: 200 }));
     const permlink = uid('lim');
     const res = await preCreate({ headers: { 'X-Api-Key': [apiKey] }, meta: { owner: 'ivan', permlink } });
     expect(res.body.RejectUpload).toBe(true);
