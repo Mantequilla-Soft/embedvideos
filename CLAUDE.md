@@ -11,7 +11,14 @@ npm start         # Run compiled output (production)
 npm run watch     # Watch mode TypeScript compile
 ```
 
-No test runner. The `scripts/test-*.ts` files are standalone checks (run each with `npx ts-node --transpile-only`); everything else is validated by running `dev` and exercising endpoints manually.
+```bash
+npm test              # Vitest suite (test/**/*.test.ts)
+npm run test:coverage # same, with coverage; fails below 75% lines (vitest.config.ts)
+```
+
+Tests run against a real MongoDB from `mongodb-memory-server` (started once in `test/globalSetup.ts`; each test file gets its own database in `test/setup.ts`). `src/index.ts` only connects, listens and starts tusd, the dispatcher and the cleanup service when run directly (its sweeps are exported functions; their timers are `unref`'d), so tests import the app (`test/helpers/app.ts`) and drive it with supertest; IPFS, tusd, encoders, the gate and webhooks are stubbed per test. CI (`.github/workflows/tests.yml`) runs the type check and the suite with coverage on every pull request.
+
+The `scripts/test-*.ts` files are older standalone checks (run each with `npx ts-node --transpile-only`).
 
 ## Architecture
 
@@ -49,6 +56,8 @@ Encoders have `tier` (`performance` | `standard` | `lite`) and `access` (`manage
 ### Retrying on a different encoder
 
 A job that fails (failure webhook), stalls, or can't be sent (dispatch error) goes back to `pending`, and the encoder involved is `$addToSet` into `failedWorkers` on the job. `getNextEncoder` drops those encoders from the pool right after the trusted filter, and only if the tier rules can't place the job without them does it try again with the full pool. So a job is never stuck just because its only suitable encoder failed it once. Like the trusted filter, this only narrows the pool: a gated job can't reach an untrusted encoder through it.
+
+A dispatch error is recorded after the cycle's claim loop, so a job gets at most one dispatch attempt per poll cycle (30 s), and the third failed attempt (`attemptCount` reaching 3, shared with the failure webhook) fails the job and its video.
 
 Community pull uses `failedWorkers: { $ne: encoderName }`, which also matches jobs without the field. `resetJob` (admin retry) clears the list along with `attemptCount`.
 

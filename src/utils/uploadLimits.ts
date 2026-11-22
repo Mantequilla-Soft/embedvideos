@@ -3,6 +3,9 @@
  *
  * Rule (owner, 2026-11-20): at most `videosPerDay` regular videos and
  * `shortsPerDay` shorts per ROLLING 24 hours (defaults 1 and 3).
+ * Warm-up accounts (owner, 2026-11-22): their own limit, `warmupVideosPerDay`
+ * and `warmupShortsPerDay` (defaults 3 and 3). Each answer says which `plan`
+ * applied ('free' or 'warmup').
  *
  * What counts: rows in embed-video created in the last 24 hours whose status
  * says the bytes landed (COUNTED_UPLOAD_STATUSES in database/mongodb.ts). An
@@ -12,9 +15,17 @@
  * existing video of the same owner (verified against the database, see
  * verifyReplacementTarget), as long as it is then registered as one.
  *
- * Who is exempt: owners listed in UPLOAD_LIMIT_EXEMPT, 3Speak Pro owners
- * (embed-users `premium`), and warm-up accounts (incubating users with no Hive
- * account yet, who upload under their bare handle as `owner`).
+ * Who is exempt: owners listed in UPLOAD_LIMIT_EXEMPT and 3Speak Pro owners
+ * (embed-users `premium`).
+ *
+ * The warm-up backlog never counts for a Hive account (owner, 2026-11-22). A
+ * warm-up user (incubating, no Hive account yet) uploads under the bare handle
+ * as `owner`. At graduation those uploads become the new Hive account's: either
+ * the checker's claim-assets rewrites `owner` and stamps `owner_claimed_from`,
+ * or the handle IS the Hive name and the rows stay as they are. Neither kind
+ * uses a slot of the Hive account: rows with `owner_claimed_from` are dropped,
+ * and so are rows created before the Hive account itself (nobody could have
+ * uploaded as that Hive account before it existed).
  *
  * Enforced server side for every app on this API: at POST /uploads/token and
  * again when an upload is created (TUS pre-create, /upload/simple,
@@ -38,7 +49,9 @@ import type { CountedUploadRow, Database } from '../database/mongodb';
 import type { Config, UploadLimitsConfig } from '../config/config';
 
 export type UploadKind = 'video' | 'short';
-export type ExemptReason = 'pro' | 'warmup' | 'listed';
+export type ExemptReason = 'pro' | 'listed';
+/** Which limit applied: the free plan of a Hive account, or a warm-up account's. */
+export type UploadPlan = 'free' | 'warmup';
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 /** `frontend_app` the hangouts server stamps on the stream recordings it publishes. */
@@ -93,8 +106,14 @@ export interface LimiterDeps {
   getRecentCountedUploads(owner: string, since: Date): Promise<CountedUploadRow[]>;
   isUserPremium(owner: string): Promise<boolean>;
   streamRecordExists(host: string, roomName: string): Promise<boolean>;
-  /** true = warm-up, false = not, null = could not tell (treated as exempt by check()). */
+  /** true = warm-up, false = not, null = could not tell (check() lets the upload through). */
   isWarmup(owner: string): Promise<boolean | null>;
+  /**
+   * When the Hive account `owner` was created (ms; 0 = exists, time unknown),
+   * or null when there is no such account. Throws when the lookup fails.
+   * Missing = never known: no row is dropped for its age.
+   */
+  hiveAccountCreatedAt?(owner: string): Promise<number | null>;
   now?: () => number;
 }
 
@@ -102,6 +121,7 @@ export interface LimitRefusalBody {
   error: string;
   code: typeof LIMIT_ERROR_CODE;
   kind: UploadKind;
+  plan: UploadPlan;
   limit: number;
   used: number;
   next_at: string | null;
@@ -130,8 +150,19 @@ export interface QuotaResponse {
   enabled: boolean;
   exempt: boolean;
   reason: ExemptReason | null;
+  /** The limit that applies; null when exempt or the limits are off. */
+  plan: UploadPlan | null;
   video: KindQuota;
   short: KindQuota;
+}
+
+/**
+ * Hive account names are lowercase, so `Alice`, ` alice` and `@alice` are the
+ * same owner. Rows are written and counted under this form; without it each
+ * spelling had its own daily allowance.
+ */
+export function normalizeOwner(name: unknown): string {
+  return String(name ?? '').trim().replace(/^@/, '').toLowerCase();
 }
 
 /** ISO 8601 without milliseconds, e.g. 2026-11-21T14:32:00Z. */
@@ -156,7 +187,8 @@ export class UploadLimiter {
     return this.deps.now ? this.deps.now() : Date.now();
   }
 
-  limitFor(kind: UploadKind): number {
+  limitFor(kind: UploadKind, plan: UploadPlan = 'free'): number {
+    if (plan === 'warmup') return kind === 'short' ? this.cfg!.warmupShortsPerDay : this.cfg!.warmupVideosPerDay;
     return kind === 'short' ? this.cfg!.shortsPerDay : this.cfg!.videosPerDay;
   }
 
@@ -199,14 +231,21 @@ export class UploadLimiter {
     return this.now() - createdMs < REPLACEMENT_REGISTER_GRACE_MS;
   }
 
-  /** Creation times (ms, oldest first) of this owner's counted uploads in the window, per kind. */
-  async usage(owner: string): Promise<Record<UploadKind, number[]>> {
+  /**
+   * Creation times (ms, oldest first) of this owner's counted uploads in the
+   * window, per kind. Warm-up uploads claimed onto this account never count;
+   * `notBefore` (the Hive account's creation) also drops older rows, which were
+   * uploaded under the same name while it was still a warm-up handle.
+   */
+  async usage(owner: string, notBefore: number | null = null): Promise<Record<UploadKind, number[]>> {
     const since = new Date(this.now() - DAY_MS);
     const rows = await this.deps.getRecentCountedUploads(owner, since);
     const out: Record<UploadKind, number[]> = { video: [], short: [] };
     for (const row of rows) {
       const t = new Date(row.createdAt).getTime();
       if (!Number.isFinite(t) || t < since.getTime()) continue;
+      if (row.owner_claimed_from) continue;
+      if (notBefore != null && t < notBefore) continue;
       if (this.isFreeReplacement(row, t)) continue;
       if (await this.isVodRow(owner, row)) continue;
       out[row.short === true ? 'short' : 'video'].push(t);
@@ -222,20 +261,25 @@ export class UploadLimiter {
     return times[times.length - limit] + DAY_MS;
   }
 
-  refusal(owner: string, kind: UploadKind, limit: number, times: number[]): LimitRefusal {
+  refusal(owner: string, kind: UploadKind, limit: number, times: number[], plan: UploadPlan = 'free'): LimitRefusal {
     const nextMs = this.nextSlotAt(times, limit);
     const nextAt = nextMs != null ? isoSeconds(nextMs) : null;
     const retryAfter = nextMs != null ? Math.max(1, Math.ceil((nextMs - this.now()) / 1000)) : null;
+    // A warm-up account cannot buy Pro (that needs a Hive account), so its
+    // message names no way out but time.
+    const who = plan === 'warmup' ? 'Warm-up accounts' : 'Free accounts';
+    const pro = plan === 'warmup' ? '' : ' 3Speak Pro removes this limit.';
     const message = limit > 0
-      ? `Free accounts can upload ${limit} ${noun(kind, limit)} per 24 hours. ` +
-        `Your next ${kind} upload is possible at ${nextAt}. 3Speak Pro removes this limit.`
-      : `Free accounts cannot upload ${noun(kind, 2)} at the moment. 3Speak Pro removes this limit.`;
+      ? `${who} can upload ${limit} ${noun(kind, limit)} per 24 hours. ` +
+        `Your next ${kind} upload is possible at ${nextAt}.${pro}`
+      : `${who} cannot upload ${noun(kind, 2)} at the moment.${pro}`;
     return {
       status: 429,
       body: {
         error: `Daily ${kind} upload limit reached`,
         code: LIMIT_ERROR_CODE,
         kind,
+        plan,
         limit,
         used: times.length,
         next_at: nextAt,
@@ -248,51 +292,81 @@ export class UploadLimiter {
   }
 
   /**
+   * Which plan's limit applies to a non-exempt owner, and from when its rows
+   * count. null = a lookup could not answer.
+   */
+  private async planFor(owner: string): Promise<{ plan: UploadPlan; notBefore: number | null } | null> {
+    const warmup = await this.deps.isWarmup(owner);
+    if (warmup === null) return null;
+    if (warmup) return { plan: 'warmup', notBefore: null };
+    if (!this.deps.hiveAccountCreatedAt) return { plan: 'free', notBefore: null };
+    try {
+      return { plan: 'free', notBefore: await this.deps.hiveAccountCreatedAt(owner) };
+    } catch (err) {
+      console.warn(`[uploadLimits] Hive account age lookup failed for ${owner}:`, (err as Error)?.message || err);
+      return null;
+    }
+  }
+
+  /**
    * May `owner` upload one more `kind`? Returns null to allow, or the refusal.
    *
    * Cheapest first: the count needs one indexed query, and only an owner who
-   * is already at the limit pays for the Pro and warm-up lookups.
+   * has used as many slots as the smaller of the two limits pays for the Pro,
+   * warm-up and Hive account lookups.
    */
-  async check(owner: string, kind: UploadKind): Promise<LimitRefusal | null> {
+  async check(rawOwner: string, kind: UploadKind): Promise<LimitRefusal | null> {
     if (!this.enabled) return null;
+    const owner = normalizeOwner(rawOwner);
     try {
       if (this.isListed(owner)) return null;
-      const limit = this.limitFor(kind);
-      const times = (await this.usage(owner))[kind];
-      if (times.length < limit) return null;
+      const all = (await this.usage(owner))[kind];
+      if (all.length < Math.min(this.limitFor(kind, 'free'), this.limitFor(kind, 'warmup'))) return null;
       if (await this.deps.isUserPremium(owner)) return null;
-      // null = the warm-up lookup could not answer: fail open.
-      if ((await this.deps.isWarmup(owner)) !== false) return null;
-      console.warn(`[uploadLimits] refused ${kind} for ${owner}: ${times.length}/${limit} in 24h`);
-      return this.refusal(owner, kind, limit, times);
+      // null = a lookup could not answer: fail open.
+      const p = await this.planFor(owner);
+      if (!p) return null;
+      const limit = this.limitFor(kind, p.plan);
+      const times = p.notBefore != null ? all.filter((t) => t >= p.notBefore!) : all;
+      if (times.length < limit) return null;
+      console.warn(`[uploadLimits] refused ${kind} for ${owner} (${p.plan}): ${times.length}/${limit} in 24h`);
+      return this.refusal(owner, kind, limit, times, p.plan);
     } catch (err) {
       console.error(`[uploadLimits] check failed for ${owner}, allowing:`, (err as Error)?.message || err);
       return null;
     }
   }
 
-  /** Why `owner` is exempt, or null. A warm-up lookup that cannot answer reports not exempt. */
+  /** Why `owner` is exempt, or null. Warm-up accounts are not exempt: they have their own limit. */
   async exemptReason(owner: string): Promise<ExemptReason | null> {
     if (this.isListed(owner)) return 'listed';
     if (await this.deps.isUserPremium(owner)) return 'pro';
-    if ((await this.deps.isWarmup(owner)) === true) return 'warmup';
     return null;
   }
 
   /** Body of GET /uploads/quota. Throws when the count cannot be read. */
-  async quota(owner: string): Promise<QuotaResponse> {
+  async quota(rawOwner: string): Promise<QuotaResponse> {
+    const owner = normalizeOwner(rawOwner);
     if (!this.enabled) {
-      return { enabled: false, exempt: true, reason: null, video: { ...UNLIMITED }, short: { ...UNLIMITED } };
+      return { enabled: false, exempt: true, reason: null, plan: null, video: { ...UNLIMITED }, short: { ...UNLIMITED } };
     }
-    const [reason, usage] = await Promise.all([this.exemptReason(owner), this.usage(owner)]);
+    const reason = await this.exemptReason(owner);
+    if (reason) {
+      const usage = await this.usage(owner);
+      const unlimited = (kind: UploadKind): KindQuota => ({ limit: null, used: usage[kind].length, remaining: null, next_at: null });
+      return { enabled: true, exempt: true, reason, plan: null, video: unlimited('video'), short: unlimited('short') };
+    }
+    // A lookup that cannot answer reports the free plan over every row: the
+    // upload itself is let through then (check() fails open).
+    const p = (await this.planFor(owner)) ?? { plan: 'free' as UploadPlan, notBefore: null };
+    const usage = await this.usage(owner, p.notBefore);
     const kindQuota = (kind: UploadKind): KindQuota => {
       const used = usage[kind].length;
-      if (reason) return { limit: null, used, remaining: null, next_at: null };
-      const limit = this.limitFor(kind);
+      const limit = this.limitFor(kind, p.plan);
       const next = this.nextSlotAt(usage[kind], limit);
       return { limit, used, remaining: Math.max(0, limit - used), next_at: next != null ? isoSeconds(next) : null };
     };
-    return { enabled: true, exempt: reason !== null, reason, video: kindQuota('video'), short: kindQuota('short') };
+    return { enabled: true, exempt: false, reason: null, plan: p.plan, video: kindQuota('video'), short: kindQuota('short') };
   }
 }
 
@@ -320,6 +394,50 @@ async function postJson(fetchImpl: FetchLike, url: string, body: unknown, timeou
   }
 }
 
+/** Hive `created` ("2026-11-20T10:00:00", UTC without a zone) as ms; 0 when unreadable. */
+function hiveCreatedMs(created: unknown): number {
+  if (typeof created !== 'string' || !created) return 0;
+  const ms = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(created) ? created : `${created}Z`);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * When was the Hive account `name` created? ms (0 = exists, time unreadable),
+ * or null when there is no such account. Throws when every node fails. Answers
+ * are cached for `ttlMs`; failures are not.
+ */
+export function createHiveAccountLookup(
+  cfg: Pick<UploadLimitsConfig, 'hiveApiNodes'>,
+  fetchImpl: FetchLike = (globalThis as any).fetch,
+  ttlMs = 5 * 60 * 1000,
+  timeoutMs = 4000,
+): (name: string) => Promise<number | null> {
+  const cache = new Map<string, { value: number | null; until: number }>();
+  return async (name: string): Promise<number | null> => {
+    const h = String(name || '').trim().toLowerCase();
+    if (!h) return null;
+    const hit = cache.get(h);
+    if (hit && hit.until > Date.now()) return hit.value;
+    let lastErr: unknown = new Error('no Hive API nodes configured');
+    for (const node of cfg.hiveApiNodes) {
+      try {
+        const res = await postJson(fetchImpl, node, {
+          jsonrpc: '2.0', id: 1, method: 'condenser_api.get_accounts', params: [[h]],
+        }, timeoutMs);
+        if (!Array.isArray(res?.result)) throw new Error(`bad get_accounts answer from ${node}`);
+        const acct = res.result.find((a: any) => a?.name === h);
+        const value = acct ? hiveCreatedMs(acct.created) : null;
+        if (cache.size > 5000) cache.clear();
+        cache.set(h, { value, until: Date.now() + ttlMs });
+        return value;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr;
+  };
+}
+
 /**
  * Is `owner` a warm-up account?
  *
@@ -342,6 +460,7 @@ export function createWarmupLookup(
   fetchImpl: FetchLike = (globalThis as any).fetch,
   ttlMs = 5 * 60 * 1000,
   timeoutMs = 4000,
+  hiveAccount: (name: string) => Promise<number | null> = createHiveAccountLookup(cfg, fetchImpl, ttlMs, timeoutMs),
 ): (owner: string) => Promise<boolean | null> {
   const cache = new Map<string, { value: boolean; until: number }>();
 
@@ -351,21 +470,7 @@ export function createWarmupLookup(
     return value;
   };
 
-  const hiveAccountExists = async (h: string): Promise<boolean> => {
-    let lastErr: unknown = new Error('no Hive API nodes configured');
-    for (const node of cfg.hiveApiNodes) {
-      try {
-        const res = await postJson(fetchImpl, node, {
-          jsonrpc: '2.0', id: 1, method: 'condenser_api.get_accounts', params: [[h]],
-        }, timeoutMs);
-        if (!Array.isArray(res?.result)) throw new Error(`bad get_accounts answer from ${node}`);
-        return res.result.some((a: any) => a?.name === h);
-      } catch (err) {
-        lastErr = err;
-      }
-    }
-    throw lastErr;
-  };
+  const hiveAccountExists = async (h: string): Promise<boolean> => (await hiveAccount(h)) !== null;
 
   return async (owner: string): Promise<boolean | null> => {
     const h = String(owner || '').trim().toLowerCase();
@@ -405,12 +510,15 @@ export function getUploadLimiter(database: Database, config: Config): UploadLimi
   const cached = limiters.get(database);
   let limiter = cached && cached.cfg === cfg ? cached.limiter : undefined;
   if (!limiter) {
-    const isWarmup = cfg ? createWarmupLookup(cfg) : async () => null;
+    // One Hive account cache for both questions (is it a warm-up, how old is it).
+    const hiveAccount = cfg ? createHiveAccountLookup(cfg) : undefined;
+    const isWarmup = cfg ? createWarmupLookup(cfg, undefined, undefined, undefined, hiveAccount) : async () => null;
     limiter = new UploadLimiter(cfg, {
       getRecentCountedUploads: (owner, since) => database.getRecentCountedUploads(owner, since),
       isUserPremium: (owner) => database.isUserPremium(owner),
       streamRecordExists: (host, room) => database.streamRecordExists(host, room),
       isWarmup,
+      ...(hiveAccount ? { hiveAccountCreatedAt: hiveAccount } : {}),
     });
     limiters.set(database, { cfg, limiter });
   }

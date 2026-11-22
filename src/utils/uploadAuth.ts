@@ -2,7 +2,7 @@ import { Database } from '../database/mongodb';
 import { Config } from '../config/config';
 import { verifyUploadToken, UploadTokenClaims } from './uploadToken';
 import { generateVideoId } from './videoId';
-import { getUploadLimiter, STREAM_VOD_APP, UploadLimiter, verifyReplacementTarget } from './uploadLimits';
+import { getUploadLimiter, normalizeOwner, STREAM_VOD_APP, UploadLimiter, verifyReplacementTarget } from './uploadLimits';
 
 export interface AuthSuccess {
   ok: true;
@@ -107,7 +107,9 @@ export async function validateUploadAuth(
     return { ok: false, status: 401, error: 'API key or upload token required' };
   }
 
-  const owner = tokenClaims?.owner || metadata?.owner || metadata?.username || 'unknown';
+  // Lowercased like every Hive name, so the row, the daily count and the ban
+  // lookup all see one owner however the client spelled it.
+  const owner = normalizeOwner(tokenClaims?.owner || metadata?.owner || metadata?.username) || 'unknown';
   // Prefer the permlink bound to the upload token so the video row matches the
   // embed URL the client was handed at token issuance. Falls back to a
   // client-supplied metadata permlink, then a freshly generated id (API-key /
@@ -161,6 +163,15 @@ export async function validateUploadAuth(
     } else if (user.banned) {
       return { ok: false, status: 403, error: 'User is banned from uploading' };
     }
+  }
+
+  // The permlink names the video row (unique index). A client-chosen one that
+  // is taken would make the insert after this check throw; refuse it here with
+  // a 409 instead. A token-bound permlink was minted fresh with its token, so
+  // a clash there means the token is being reused: the consume below answers
+  // that, with the clearer 403.
+  if (!isPartial && !tokenClaims?.permlink && await database.videoExists(permlink)) {
+    return { ok: false, status: 409, error: 'A video with this permlink already exists' };
   }
 
   // Stream recordings (VODs) are published by the hangouts server: X-API-Key,

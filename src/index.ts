@@ -22,9 +22,14 @@ import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims 
 import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
 import { clientIpFrom, ipHashes } from './utils/ipHash';
 import { parseReportedVersion, buildRegistrationVersionUpdate, buildHeartbeatVersionUpdate } from './utils/encoderVersion';
-import { getUploadLimiter, verifyReplacementTarget } from './utils/uploadLimits';
+import { getUploadLimiter, normalizeOwner, verifyReplacementTarget } from './utils/uploadLimits';
 
 dotenv.config();
+
+// MongoDB's duplicate key error (11000): the permlink unique index refused the
+// row. uploadAuth checks the permlink first; this covers two uploads racing.
+const isDuplicateKey = (err: unknown): boolean => (err as { code?: unknown } | null)?.code === 11000;
+const PERMLINK_TAKEN = 'A video with this permlink already exists';
 
 const app = express();
 const config = loadConfig();
@@ -136,13 +141,16 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     }
 
     const {
-      owner, frontend_app, short = false, gated = false, allowlist,
+      owner: rawOwner, frontend_app, short = false, gated = false, allowlist,
       allowed_origins = [], max_file_size, ttl, defer_encode = false, replaces,
     } = req.body;
 
-    if (!owner || typeof owner !== 'string') {
+    if (!rawOwner || typeof rawOwner !== 'string' || !normalizeOwner(rawOwner)) {
       return res.status(422).json({ error: 'owner (string) is required' });
     }
+    // One spelling per account (see normalizeOwner): the token, the row and the
+    // daily count all use it.
+    const owner = normalizeOwner(rawOwner);
 
     // 🔐 Gated (paid) uploads are a 3Speak Pro capability. This is the ONLY
     // place the gated flag can be granted, because it is the only place with a
@@ -355,26 +363,65 @@ app.post('/upload/simple', (req: Request, res: Response) => {
     res.status(status).json(body ?? { error });
   };
 
+  // Build tusd-style headers so validateUploadAuth is reused UNCHANGED.
+  const authHeaders = () => {
+    const synthHeaders: Record<string, string[]> = {};
+    if (req.headers['x-api-key']) synthHeaders['x-api-key'] = [String(req.headers['x-api-key'])];
+    if (fields.token) synthHeaders['authorization'] = [`Bearer ${fields.token}`];
+    if (req.headers.origin) synthHeaders['origin'] = [String(req.headers.origin)];
+    return synthHeaders;
+  };
+  const authMetadata = () => {
+    const metadata: Record<string, string> = { filename: fields.filename || '' };
+    // token claims override owner/short/permlink; these are only fallbacks.
+    for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration', 'replaces'] as const) {
+      if (fields[k]) metadata[k] = fields[k];
+    }
+    return metadata;
+  };
+
   bb.on('field', (name, val) => { fields[name] = val; });
 
   bb.on('file', (_name, stream, info) => {
-    tempPath = path.join(path.resolve(config.uploadDir), `simple-${generateVideoId()}`);
-    const ws = createWriteStream(tempPath);
     if (!fields.filename && info.filename) fields.filename = info.filename;
-    filePromise = new Promise<void>((resolve, reject) => {
-      stream.on('data', (c: Buffer) => { receivedSize += c.length; });
-      stream.on('limit', () => { tooBig = true; });   // busboy truncates at fileSize
-      stream.on('error', reject);
-      ws.on('error', reject);
-      ws.on('finish', () => resolve());
-      stream.pipe(ws);
-    });
+    // busboy fills the stream while it waits below and flags the size limit
+    // when it is hit, so this listener has to be in place from the start.
+    stream.on('limit', () => { tooBig = true; });   // busboy truncates at fileSize
+    // The fields arrive before the file, so the credentials are checked before
+    // a byte is written, not after the whole file is on disk. Credentials only
+    // (partial mode: no token use, no database writes); the full check at the
+    // end still decides. The file stream waits (busboy holds the body) until
+    // this answers; a bad key or token is answered at once and the rest of the
+    // body drained.
+    filePromise = (async () => {
+      const early = await validateUploadAuth(authHeaders(), authMetadata(), null, database, config, true)
+        .catch(() => null); // lookup failed: the full check at the end answers
+      if (early && !early.ok) {
+        stream.resume();
+        fail(early.status, early.error, early.body, early.headers);
+        return;
+      }
+      if (responded) { stream.resume(); return; }
+
+      tempPath = path.join(path.resolve(config.uploadDir), `simple-${generateVideoId()}`);
+      const ws = createWriteStream(tempPath);
+      await new Promise<void>((resolve, reject) => {
+        stream.on('data', (c: Buffer) => { receivedSize += c.length; });
+        stream.on('error', reject);
+        ws.on('error', reject);
+        ws.on('finish', () => resolve());
+        stream.pipe(ws);
+      });
+    })();
   });
 
   bb.on('error', (err: unknown) =>
     fail(400, `Upload parse error: ${err instanceof Error ? err.message : String(err)}`));
 
-  bb.on('close', async () => {
+  // Everything after the body is in runs here. Its errors are answered, never
+  // left as an unhandled rejection: on Node 22 that ends the process, so one
+  // bad request (e.g. a database hiccup) would take every upload down with it.
+  const finishUpload = async () => {
     if (responded) return;
     try { await filePromise; } catch { return fail(400, 'File write failed'); }
 
@@ -384,19 +431,7 @@ app.post('/upload/simple', (req: Request, res: Response) => {
     }
     if (!tempPath || receivedSize === 0) return fail(400, 'No file part in request');
 
-    // Build tusd-style headers so validateUploadAuth is reused UNCHANGED.
-    const synthHeaders: Record<string, string[]> = {};
-    if (req.headers['x-api-key']) synthHeaders['x-api-key'] = [String(req.headers['x-api-key'])];
-    if (fields.token) synthHeaders['authorization'] = [`Bearer ${fields.token}`];
-    if (req.headers.origin) synthHeaders['origin'] = [String(req.headers.origin)];
-
-    const metadata: Record<string, string> = { filename: fields.filename || '' };
-    // token claims override owner/short/permlink; these are only fallbacks.
-    for (const k of ['owner', 'short', 'permlink', 'frontend_app', 'duration', 'replaces'] as const) {
-      if (fields[k]) metadata[k] = fields[k];
-    }
-
-    const auth = await validateUploadAuth(synthHeaders, metadata, receivedSize, database, config, false);
+    const auth = await validateUploadAuth(authHeaders(), authMetadata(), receivedSize, database, config, false);
     if (!auth.ok) return fail(auth.status, auth.error, auth.body, auth.headers);
 
     const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
@@ -434,6 +469,13 @@ app.post('/upload/simple', (req: Request, res: Response) => {
 
     responded = true;
     res.status(201).json({ success: true, embed_url: embedUrl, permlink, owner });
+  };
+  bb.on('close', () => {
+    finishUpload().catch((err) => {
+      if (isDuplicateKey(err)) return fail(409, PERMLINK_TAKEN);
+      console.error('Simple upload failed:', err);
+      fail(500, 'Internal server error');
+    });
   });
 
   req.on('aborted', () => fail(499, 'client aborted'));
@@ -488,8 +530,8 @@ const CHUNK_PROBE_MAX = 512 * 1024;                 // hard bound on a /upload/p
 const CHUNK_MAX_COUNT = 100_000;                    // sanity cap on totalChunks
 const CHUNK_SESSION_TTL_MS = 2 * 60 * 60 * 1000;    // idle-session lifetime before reap
 
-const chunkReaper = setInterval(() => {
-  const now = Date.now();
+/** Drops chunked sessions idle for longer than CHUNK_SESSION_TTL_MS (and their temp files). */
+export function reapChunkSessions(now = Date.now()): void {
   for (const [id, s] of chunkSessions) {
     if (now - s.updatedAt > CHUNK_SESSION_TTL_MS) {
       chunkSessions.delete(id);
@@ -498,7 +540,8 @@ const chunkReaper = setInterval(() => {
       console.warn(`Chunked session reaped (idle): ${s.owner}/${s.permlink} at ${s.receivedBytes}/${s.totalSize}`);
     }
   }
-}, 10 * 60 * 1000);
+}
+const chunkReaper = setInterval(() => reapChunkSessions(), 10 * 60 * 1000);
 if (typeof chunkReaper.unref === 'function') chunkReaper.unref();
 
 // Parse a small multipart request: all fields, plus (optionally) ONE file part
@@ -572,40 +615,60 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
     if (fields[k]) metadata[k] = fields[k];
   }
 
-  const auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
+  // Pre-size the file (sparse) so out-of-order positioned writes always land in
+  // range. Done before the auth check, which consumes the token: a disk that
+  // cannot take the file is answered with the token still usable and no row
+  // left behind at 'uploading'. Sparse, so this costs no space up front.
+  const tempPath = path.join(path.resolve(config.uploadDir), `chunked-${generateVideoId()}`);
+  try {
+    const fd = await fsp.open(tempPath, 'w');
+    try { await fd.truncate(totalSize); } finally { await fd.close(); }
+  } catch (err) {
+    console.error(`Failed to allocate chunked temp file (${totalSize} bytes):`, err);
+    try { unlinkSync(tempPath); } catch { /* never created */ }
+    return res.status(500).json({ error: 'Failed to allocate upload storage' });
+  }
+  const dropTempFile = () => { try { unlinkSync(tempPath); } catch { /* already gone */ } };
+
+  let auth: Awaited<ReturnType<typeof validateUploadAuth>>;
+  try {
+    auth = await validateUploadAuth(synthHeaders, metadata, totalSize, database, config, false);
+  } catch (err) {
+    dropTempFile();
+    console.error('Chunked upload: auth check failed:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
   if (!auth.ok) {
+    dropTempFile();
     if (auth.headers) res.set(auth.headers);
     return res.status(auth.status).json(auth.body ?? { error: auth.error });
   }
   const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
 
-  await database.createVideoEntry({
-    owner, permlink, frontend_app,
-    status: 'uploading',
-    input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-    short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: totalSize,
-    ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
-    ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
-    encodingProgress: 0,
-    originalFilename,
-    hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
-    embed_url: null, embed_title: null,
-    ...ipHashes(clientIpFrom(req.headers)),
-    // A replacement is a media carrier, not a video of its own: kept out of
-    // listings from the start (POST /video/:permlink/replaces does the same).
-    listed_on_3speak: !replacesExisting && frontend_app === '3speak-tv',
-    processed: false, processedAt: null, views: 0,
-    createdAt: new Date(), updatedAt: new Date(),
-  });
-
-  const tempPath = path.join(path.resolve(config.uploadDir), `chunked-${generateVideoId()}`);
-  // Pre-size the file (sparse) so out-of-order positioned writes always land in range.
   try {
-    const fd = await fsp.open(tempPath, 'w');
-    try { await fd.truncate(totalSize); } finally { await fd.close(); }
+    await database.createVideoEntry({
+      owner, permlink, frontend_app,
+      status: 'uploading',
+      input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
+      short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: totalSize,
+      ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
+      ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
+      encodingProgress: 0,
+      originalFilename,
+      hive_author: null, hive_permlink: null, hive_title: null, hive_body: null, hive_tags: null,
+      embed_url: null, embed_title: null,
+      ...ipHashes(clientIpFrom(req.headers)),
+      // A replacement is a media carrier, not a video of its own: kept out of
+      // listings from the start (POST /video/:permlink/replaces does the same).
+      listed_on_3speak: !replacesExisting && frontend_app === '3speak-tv',
+      processed: false, processedAt: null, views: 0,
+      createdAt: new Date(), updatedAt: new Date(),
+    });
   } catch (err) {
-    console.error(`Failed to allocate chunked temp file for ${owner}/${permlink}:`, err);
-    return res.status(500).json({ error: 'Failed to allocate upload storage' });
+    dropTempFile();
+    if (isDuplicateKey(err)) return res.status(409).json({ error: PERMLINK_TAKEN });
+    console.error(`Chunked upload: failed to create the video row for ${owner}/${permlink}:`, err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 
   const sessionId = randomBytes(24).toString('hex');
@@ -750,7 +813,33 @@ app.all('/uploads/*', countUpload, tusProxy);
 
 // Hook endpoint called by tusd for pre-create and post-finish events.
 // Bound to 127.0.0.1 in tusd config — but guard here as defence-in-depth.
+// tusd's answer for a refused upload. tusd v2 reads the rejection's headers
+// from `Header` (its Go field name); `Headers` is ignored. Both are sent so
+// the Content-Type and the daily-limit Retry-After reach the tus client.
+function tusdReject(status: number, body: Record<string, unknown>, headers: Record<string, string> = {}) {
+  const header = { 'Content-Type': 'application/json', ...headers };
+  return {
+    RejectUpload: true,
+    HTTPResponse: { StatusCode: status, Body: JSON.stringify(body), Header: header, Headers: header },
+  };
+}
+
 app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res: Response) => {
+  try {
+    await handleTusdHook(req, res);
+  } catch (err) {
+    // An awaited failure must be answered, not left as an unhandled rejection
+    // (that ends the process on Node 22). A pre-create gets a refusal tusd
+    // passes on; any other hook gets a 500, which tusd only logs.
+    if (isDuplicateKey(err)) return res.json(tusdReject(409, { error: PERMLINK_TAKEN }));
+    console.error(`tusd ${req.body?.Type} hook failed:`, err);
+    if (res.headersSent) return;
+    if (req.body?.Type === 'pre-create') return res.json(tusdReject(500, { error: 'Internal server error' }));
+    res.status(500).json({});
+  }
+});
+
+async function handleTusdHook(req: Request, res: Response) {
   const remoteAddr = req.socket.remoteAddress;
   if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1' && remoteAddr !== '::ffff:127.0.0.1') {
     return res.status(403).json({});
@@ -771,19 +860,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
     );
 
     if (!authResult.ok) {
-      // tusd v2 reads the rejection's headers from `Header` (its Go field
-      // name); `Headers` is ignored. Both are sent so the Content-Type and the
-      // daily-limit Retry-After reach the tus client.
-      const header = { 'Content-Type': 'application/json', ...(authResult.headers || {}) };
-      return res.json({
-        RejectUpload: true,
-        HTTPResponse: {
-          StatusCode: authResult.status,
-          Body: JSON.stringify(authResult.body ?? { error: authResult.error }),
-          Header: header,
-          Headers: header,
-        },
-      });
+      return res.json(tusdReject(authResult.status, authResult.body ?? { error: authResult.error }, authResult.headers));
     }
 
     // Partial uploads are just chunk pieces — allow through without a DB record or embed URL.
@@ -798,16 +875,9 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
     // Size is the sum of the already-uploaded parts.
     if (size != null && size > config.maxUploadSize) {
       console.warn(`Upload rejected: ${owner}/${permlink} size ${size} bytes exceeds cap ${config.maxUploadSize}`);
-      return res.json({
-        RejectUpload: true,
-        HTTPResponse: {
-          StatusCode: 413,
-          Body: JSON.stringify({
-            error: `Video exceeds the maximum allowed size of ${Math.round(config.maxUploadSize / (1024 * 1024 * 1024))}GB`,
-          }),
-          Headers: { 'Content-Type': 'application/json' },
-        },
-      });
+      return res.json(tusdReject(413, {
+        error: `Video exceeds the maximum allowed size of ${Math.round(config.maxUploadSize / (1024 * 1024 * 1024))}GB`,
+      }));
     }
 
     console.log(`Upload metadata - short flag: "${Upload?.MetaData?.short}" -> parsed as: ${short}`);
@@ -904,7 +974,7 @@ app.post('/tusd-hooks', express.json({ limit: '1mb' }), async (req: Request, res
   }
 
   return res.json({});
-});
+}
 
 // Process completed upload: pin to IPFS, create encoding job, clean up temp file.
 // Called asynchronously after tusd sends 204 to client — client does NOT wait for this.
@@ -969,16 +1039,33 @@ async function commissionEncode(
     allowlist,
   });
 
-  const premium = await db.isUserPremium(video.owner);
-  await createEncodeJob(db, {
-    owner: video.owner,
-    permlink: video.permlink,
-    premium,
-    short: video.short === true,
-    fileSize: video.size ?? null,
-    gated,
-    gateVideoId: video.permlink,
-  });
+  try {
+    const premium = await db.isUserPremium(video.owner);
+    await createEncodeJob(db, {
+      owner: video.owner,
+      permlink: video.permlink,
+      premium,
+      short: video.short === true,
+      fileSize: video.size ?? null,
+      gated,
+      gateVideoId: video.permlink,
+    });
+  } catch (err) {
+    // A job with this key already exists (a concurrent finalize got there
+    // first): 'processing' is right. Otherwise no job was made, so put the
+    // video back as it was. Left at 'processing' with no job, nothing would
+    // ever encode it and every retried finalize would answer 409.
+    if (!isDuplicateKey(err)) {
+      await db.updateVideoStatus(video.permlink, video.status, {
+        gated: video.gated,
+        gate_video_id: video.gate_video_id ?? null,
+        allowlist: video.allowlist,
+        // Kept, so the deferred-heal sweep (which waits for idle rows) retries it.
+        updatedAt: video.updatedAt,
+      }).catch((revertErr) => console.error(`Failed to revert ${video.owner}/${video.permlink} after a job insert error:`, revertErr));
+    }
+    throw err;
+  }
 
   console.log(
     `${gated ? '🔐 Gated job' : 'Job'} commissioned for ${video.owner}/${video.permlink}` +
@@ -1086,10 +1173,8 @@ async function processUploadAsync(
 
 // Create uploads directory if it doesn't exist
 const uploadPath = path.resolve(config.uploadDir);
-// Demo page endpoint
-app.get('/', (req: Request, res: Response) => {
-  res.redirect('/demo.html');
-});
+// `/` is public/index.html, served by express.static above (the demo is at
+// /demo.html). A redirect route here never ran, so there is none.
 
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
@@ -1309,14 +1394,13 @@ app.post('/webhook/progress', async (req: Request, res: Response) => {
       }
     }
 
-    await database.updateJobStatus(owner, permlink, 'encoding', {
-      encodingProgress: progress,
-      encodingStage: stage ?? null,
-    });
-
-    await database.updateVideoStatus(permlink, 'processing', {
-      encodingProgress: progress,
-    });
+    const recorded = await database.recordEncodingProgress(owner, permlink, progress, stage ?? null);
+    if (!recorded) {
+      // The job already finished, failed or went back to the queue. Answer
+      // 200 so the encoder does not retry; the ping is simply too late.
+      console.warn(`Ignoring late progress ping for ${owner}/${permlink} (job is ${job.status})`);
+      return res.json({ success: true, ignored: true });
+    }
 
     console.log(`Progress update: ${owner}/${permlink} - ${progress}%${stage ? ` (${stage})` : ''}`);
     res.json({ success: true });
@@ -1438,14 +1522,21 @@ app.post('/api/v0/gateway/myJob', async (req: Request, res: Response) => {
 // Heartbeat
 app.post('/api/v0/gateway/heartbeat', async (req: Request, res: Response) => {
   try {
-    const { did } = await unwrapJWS(req.body.jws);
+    const { payload, did } = await unwrapJWS(req.body.jws);
 
     const encoder = await database.getEncoderByDid(did);
     if (!encoder) {
       return res.status(404).json({ error: 'Encoder not registered' });
     }
 
-    await database.updateEncoderLastSeen(did);
+    // Same payload shapes as registration (node_info wrapper or flat). A
+    // heartbeat only adds what it reports; see buildHeartbeatVersionUpdate.
+    const version = buildHeartbeatVersionUpdate(
+      parseReportedVersion(payload?.node_info || payload),
+      encoder.encoderCommit,
+      new Date()
+    );
+    await database.updateEncoderLastSeen(did, version);
     res.json({ success: true });
   } catch (error) {
     console.error('Community heartbeat error:', error);
@@ -1765,6 +1856,14 @@ async function applyPendingReplacement(newPermlink: string): Promise<void> {
   const incoming = await database.getVideo(newPermlink);
   if (!incoming?.replacesPermlink || incoming.replacementApplied) return;
   if (!incoming.manifest_cid) return; // not encoded yet — nothing to copy
+  // 🔐 Only a published carrier hands its media over. The completion webhook
+  // sets a gated upload whose output failed the encryption check (or whose gate
+  // registration failed) to 'failed'; swapping its manifest onto the original
+  // would publish unencrypted media under a paid video.
+  if (incoming.status !== 'published') {
+    console.warn(`Replacement ${newPermlink} is ${incoming.status}, not published: its media is not swapped in`);
+    return;
+  }
 
   if (incoming.replacesLegacy) {
     await applyLegacyReplacement(incoming);
@@ -1811,7 +1910,7 @@ async function applyPendingReplacement(newPermlink: string): Promise<void> {
 // sweeper closes that gap: it works off the shared database, so it does not care
 // which host published the asset, and it also recovers a webhook that was lost.
 const REPLACEMENT_SWEEP_MS = 30_000;
-setInterval(async () => {
+export async function sweepReplacements(): Promise<void> {
   try {
     const pending = await database.getPendingReplacements();
     for (const v of pending) {
@@ -1825,7 +1924,8 @@ setInterval(async () => {
     // Never let a sweep failure take the process down.
     console.error('Replacement sweep failed:', err);
   }
-}, REPLACEMENT_SWEEP_MS).unref?.();
+}
+setInterval(sweepReplacements, REPLACEMENT_SWEEP_MS).unref?.();
 
 // Abandon deferred uploads whose publish never came.
 //
@@ -1834,7 +1934,7 @@ setInterval(async () => {
 // accumulate pinned storage forever. Marking them failed also unpins the input,
 // which matters most for the gated case — that input is the plaintext original.
 const DEFERRED_SWEEP_MS = 15 * 60_000;
-setInterval(async () => {
+export async function sweepAbandonedDeferred(): Promise<void> {
   try {
     const abandoned = await database.getAbandonedDeferred(DEFERRED_ENCODE_ABANDON_HOURS);
     for (const v of abandoned) {
@@ -1861,7 +1961,8 @@ setInterval(async () => {
   } catch (err) {
     console.error('Deferred sweep failed:', err);
   }
-}, DEFERRED_SWEEP_MS).unref?.();
+}
+setInterval(sweepAbandonedDeferred, DEFERRED_SWEEP_MS).unref?.();
 
 // Heal deferred uploads whose finalize call (POST /video/:permlink/encode)
 // never arrived despite the owner having actually published — proof being a
@@ -1881,7 +1982,7 @@ setInterval(async () => {
 // resolve on its own.
 const DEFER_HEAL_GRACE_MINUTES = 20;
 const DEFER_HEAL_SWEEP_MS = 5 * 60_000;
-setInterval(async () => {
+export async function sweepHealableDeferred(): Promise<void> {
   try {
     const healable = await database.getHealableDeferred(DEFER_HEAL_GRACE_MINUTES);
     for (const v of healable) {
@@ -1910,7 +2011,8 @@ setInterval(async () => {
   } catch (err) {
     console.error('Heal sweep failed:', err);
   }
-}, DEFER_HEAL_SWEEP_MS).unref?.();
+}
+setInterval(sweepHealableDeferred, DEFER_HEAL_SWEEP_MS).unref?.();
 
 // Register a freshly-uploaded asset as the replacement for an existing video.
 //
@@ -2682,25 +2784,31 @@ async function start() {
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  if (tusdProcess) tusdProcess.kill('SIGTERM');
-  if (dispatcher) dispatcher.stop();
-  cleanupService.stop();
-  await database.close();
-  process.exit(0);
-});
+// Run directly (node dist/index.js): start the server and shut down cleanly.
+// Imported (the tests): only the app is set up, nothing listens or connects.
+if (require.main === module) {
+  // Graceful shutdown
+  process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    if (tusdProcess) tusdProcess.kill('SIGTERM');
+    if (dispatcher) dispatcher.stop();
+    cleanupService.stop();
+    await database.close();
+    process.exit(0);
+  });
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  if (tusdProcess) tusdProcess.kill('SIGTERM');
-  if (dispatcher) {
-    dispatcher.stop();
-  }
-  cleanupService.stop();
-  await database.close();
-  process.exit(0);
-});
+  process.on('SIGINT', async () => {
+    console.log('SIGINT received, shutting down gracefully...');
+    if (tusdProcess) tusdProcess.kill('SIGTERM');
+    if (dispatcher) {
+      dispatcher.stop();
+    }
+    cleanupService.stop();
+    await database.close();
+    process.exit(0);
+  });
 
-start();
+  start();
+}
+
+export { app, database, config, chunkSessions, start };

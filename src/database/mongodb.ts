@@ -46,6 +46,8 @@ export interface CountedUploadRow {
   stream_vod?: boolean;
   replaces_existing?: boolean;
   replacesPermlink?: string | null;
+  /** Set by the checker's claim-assets when a warm-up handle's upload moved to its new Hive account. */
+  owner_claimed_from?: string;
   createdAt: Date;
 }
 
@@ -366,7 +368,10 @@ export class Database {
     await this.ensureIndex(this.collection, { owner: 1, createdAt: -1 });
 
     const encodersCollection = this.db.collection<Encoder>('embed-encoders');
-    await this.ensureIndex(encodersCollection, { name: 1 }, { unique: true });
+    // Names are unique regardless of case, the way the shared production
+    // index already is (en, strength 2). Created like that on a fresh
+    // database too, so `Encoder-One` and `encoder-one` cannot both exist.
+    await this.ensureIndex(encodersCollection, { name: 1 }, { unique: true, collation: { locale: 'en', strength: 2 } });
     await this.ensureIndex(encodersCollection, { did: 1 }, { unique: true, sparse: true });
 
     // Index for community job claiming (findOneAndUpdate filter)
@@ -381,6 +386,13 @@ export class Database {
       throw new Error('Database not connected');
     }
     await this.collection.insertOne(metadata);
+  }
+
+  async videoExists(permlink: string): Promise<boolean> {
+    if (!this.collection) {
+      throw new Error('Database not connected');
+    }
+    return (await this.collection.countDocuments({ permlink }, { limit: 1 })) > 0;
   }
 
   async updateVideoStatus(
@@ -682,6 +694,29 @@ export class Database {
     );
   }
 
+  /**
+   * Record an encoder's progress ping, but only while the job is still being
+   * encoded and its video is still processing. A ping can arrive after the
+   * completion (or failure) webhook; writing it unconditionally put a
+   * published video back to 'processing'. Returns false when the ping was late.
+   */
+  async recordEncodingProgress(owner: string, permlink: string, progress: number, stage: string | null): Promise<boolean> {
+    if (!this.db || !this.collection) {
+      throw new Error('Database not connected');
+    }
+    const now = new Date();
+    const job = await this.db.collection<EncodingJob>('embed-jobs').updateOne(
+      { owner, permlink, status: 'encoding' },
+      { $set: { encodingProgress: progress, encodingStage: stage, updatedAt: now } }
+    );
+    if (job.matchedCount === 0) return false;
+    await this.collection.updateOne(
+      { permlink, status: 'processing' },
+      { $set: { encodingProgress: progress, updatedAt: now } }
+    );
+    return true;
+  }
+
   async incrementJobAttempt(owner: string, permlink: string, failedWorker: string | null = null): Promise<void> {
     if (!this.db) {
       throw new Error('Database not connected');
@@ -874,7 +909,7 @@ export class Database {
     return this.collection
       .find(
         { owner, createdAt: { $gte: since }, status: { $in: COUNTED_UPLOAD_STATUSES } },
-        { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, replaces_existing: 1, replacesPermlink: 1, createdAt: 1 } }
+        { projection: { _id: 0, permlink: 1, short: 1, frontend_app: 1, stream_vod: 1, replaces_existing: 1, replacesPermlink: 1, owner_claimed_from: 1, createdAt: 1 } }
       )
       .sort({ createdAt: 1 })
       .toArray() as unknown as Promise<CountedUploadRow[]>;
