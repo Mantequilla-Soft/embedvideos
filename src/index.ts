@@ -206,9 +206,14 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     // limit is skipped, signed into the token, and verified again at upload.
     // A target lookup that failed (null) skips the limit here (fail open) but
     // is not signed into the token, so the upload is checked again on creation.
+    // Through another app's key (its `app_name`, not the client's
+    // `frontend_app`) the publish limit is checked too; see uploadLimits.ts.
+    const apiKeyData = (req as any).apiKey;
+    const issuedByKey: string = apiKeyData?.app_name || 'unknown';
     const replacesVerdict = replaces !== undefined ? await verifyReplacementTarget(database, owner, replaces) : false;
     const replacesTarget = replacesVerdict === true ? String(replaces).trim() : null;
-    const refusal = replacesVerdict !== false ? null : await getUploadLimiter(database, config).check(owner, short ? 'short' : 'video');
+    const refusal = replacesVerdict !== false ? null
+      : await getUploadLimiter(database, config).check(owner, short ? 'short' : 'video', { app: issuedByKey });
     if (refusal) {
       res.set(refusal.headers);
       return res.status(refusal.status).json(refusal.body);
@@ -224,7 +229,6 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       : config.uploadTokenMaxFileSize;
 
     const now = Math.floor(Date.now() / 1000);
-    const apiKeyData = (req as any).apiKey;
 
     // Assign the permlink here, at token issuance, and bind it to the token.
     // The client receives it in the response (permlink/embed_url below) and can
@@ -236,7 +240,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       jti: generateTokenId(),
       owner,
       app: frontend_app || apiKeyData?.app_name || 'unknown',
-      issuedByKey: apiKeyData?.app_name || 'unknown',
+      issuedByKey,
       short: !!short,
       gated: !!gated,
       ...(defer_encode ? { deferEncode: true } : {}),
@@ -309,8 +313,9 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
 // GET /uploads/quota?owner=<name>: an owner's daily upload allowance, so a
 // frontend can say "1 video left today" before the user picks a file. A free
 // Hive account answers exempt (reason 'publish_limit') while its uploads are
-// not capped. Must stay registered before the app.all('/uploads/*') tusd
-// proxy, like /uploads/token.
+// not capped, except through another app's key (UPLOAD_PUBLISH_CHECK_SKIP_APPS),
+// which gets the free plan's publish quota from the checker. Must stay
+// registered before the app.all('/uploads/*') tusd proxy, like /uploads/token.
 app.get('/uploads/quota', requireApiKey, async (req: Request, res: Response) => {
   const owner = typeof req.query.owner === 'string' ? req.query.owner.trim() : '';
   if (!owner) {
@@ -318,7 +323,8 @@ app.get('/uploads/quota', requireApiKey, async (req: Request, res: Response) => 
   }
   try {
     res.set('Cache-Control', 'no-store');
-    res.json(await getUploadLimiter(database, config).quota(owner));
+    const app = (req as any).apiKey?.app_name || 'unknown';
+    res.json(await getUploadLimiter(database, config).quota(owner, { app }));
   } catch (error) {
     console.error(`Error reading upload quota for ${owner}:`, error);
     res.status(503).json({ error: 'Upload quota is unavailable right now' });

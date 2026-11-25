@@ -314,6 +314,34 @@ describe('pre-create', () => {
     expect(res.body.HTTPResponse.Headers['Retry-After']).toBe(res.body.HTTPResponse.Header['Retry-After']);
     expect(await database.getVideo(permlink)).toBeNull();
   });
+
+  it('passes the publish-limit 429 through for another app\'s key, not for the 3speak key', async () => {
+    const next = new Date(Date.now() + 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    fetchMock.mockImplementation(async (url: unknown) => new Response(JSON.stringify(
+      String(url).includes('/publish-quota/')
+        ? { success: true, enabled: true, exempt: false, limit: 1, window_hours: 24, allowed: false, conflicts: [{ permlink: 'p' }], next_free_at: next }
+        : String(url).includes('/incubation/authors') ? { authors: {} } : { result: [] },
+    ), { status: 200 }));
+    config.uploadLimits.publishCheckEnabled = true;
+    try {
+      const who = uid('pub');
+      const permlink = uid('pub');
+      const res = await preCreate({ headers: { 'X-Api-Key': [apiKey] }, meta: { owner: who, permlink } });
+      expect(res.body.HTTPResponse.StatusCode).toBe(429);
+      expect(JSON.parse(res.body.HTTPResponse.Body)).toMatchObject({ code: 'daily_upload_limit', plan: 'free', next_at: next });
+      expect(Number(res.body.HTTPResponse.Header['Retry-After'])).toBeGreaterThan(0);
+      expect(await database.getVideo(permlink)).toBeNull();
+      // Same owner through the 3speak key (or a token it issued): let through.
+      const speakKey = await makeApiKey(database, { app_name: '3speak' });
+      expect((await preCreate({ headers: { 'X-Api-Key': [speakKey] }, meta: { owner: who, permlink: uid('pub') } })).body.RejectUpload).toBeFalsy();
+      const viaSpeak = makeToken({ owner: who, issuedByKey: '3speak' });
+      expect((await preCreate({ headers: { Authorization: [`Bearer ${viaSpeak}`] } })).body.RejectUpload).toBeFalsy();
+      const viaOther = makeToken({ owner: who, app: '3speak', issuedByKey: 'ecency' });
+      expect((await preCreate({ headers: { Authorization: [`Bearer ${viaOther}`] } })).body.HTTPResponse.StatusCode).toBe(429);
+    } finally {
+      config.uploadLimits.publishCheckEnabled = false;
+    }
+  });
 });
 
 describe('pre-finish', () => {

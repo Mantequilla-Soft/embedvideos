@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { existsSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { randomBytes } from 'crypto';
-import { installFetchStub, mintToken, owner, rawDb, seedVideo } from './helpers';
+import { installFetchStub, mintToken, owner, publishBody, rawDb, seedVideo } from './helpers';
 import { api, loadApp, makeApiKey } from '../helpers/app';
 import type { Database } from '../../src/database/mongodb';
 
@@ -24,7 +24,14 @@ vi.mock('../../src/utils/ipfs', async () => {
 const GB = 1024 * 1024 * 1024;
 process.env.MAX_UPLOAD_SIZE = String(30 * GB);
 // `chunkwarm` is a warm-up account (3 videos a day); free Hive accounts have no upload cap.
-installFetchStub({ incubating: ['chunkwarm'] });
+// The checker refuses a publish to every owner in `publishRefused` (videos).
+const NEXT_PUBLISH = new Date(Date.now() + 5 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const publishRefused = new Set<string>();
+installFetchStub({
+  incubating: ['chunkwarm'],
+  publish: (o, kind) => (kind === 'video' && publishRefused.has(o)
+    ? publishBody({ allowed: false, conflicts: [{ permlink: 'p' }], next_free_at: NEXT_PUBLISH }) : undefined),
+});
 
 let database: Database;
 let config: any;
@@ -105,6 +112,24 @@ describe('POST /upload/chunk/create', () => {
     expect(res.status).toBe(429);
     expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', plan: 'warmup', used: 3 });
     expect(Number(res.headers['retry-after'])).toBeGreaterThan(0);
+  });
+
+  it('refuses a free account over the publish limit through another app\'s key, not through 3speak\'s', async () => {
+    const who = owner();
+    publishRefused.add(who);
+    config.uploadLimits.publishCheckEnabled = true;
+    try {
+      const before = readdirSync(config.uploadDir).filter((f) => f.startsWith('chunked-')).length;
+      const res = await create({ owner: who, size: String(SIZE), chunkSize: String(MIN) });
+      expect(res.status).toBe(429);
+      expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', plan: 'free', next_at: NEXT_PUBLISH });
+      expect(Number(res.headers['retry-after'])).toBeGreaterThan(4 * 3600);
+      expect(readdirSync(config.uploadDir).filter((f) => f.startsWith('chunked-')).length).toBe(before);
+      const speakKey = await makeApiKey(database, { app_name: '3speak' });
+      expect((await create({ owner: who, size: String(SIZE), chunkSize: String(MIN) }, { 'X-API-Key': speakKey })).status).toBe(201);
+    } finally {
+      config.uploadLimits.publishCheckEnabled = false;
+    }
   });
 
   it('clamps an unprobed chunk size and pre-sizes the temp file', async () => {

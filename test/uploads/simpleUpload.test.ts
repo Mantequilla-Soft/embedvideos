@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { readdirSync, readFileSync } from 'fs';
-import { installFetchStub, mintToken, owner, rawDb, seedVideo } from './helpers';
+import { installFetchStub, mintToken, owner, publishBody, rawDb, seedVideo } from './helpers';
 import { api, loadApp, makeApiKey } from '../helpers/app';
 import type { Database } from '../../src/database/mongodb';
 
@@ -28,7 +28,14 @@ vi.mock('../../src/utils/ipfs', async () => {
 
 process.env.MAX_UPLOAD_SIZE = '4096';
 // `simplewarm` is a warm-up account (3 videos a day); free Hive accounts have no upload cap.
-installFetchStub({ incubating: ['simplewarm'] });
+// The checker refuses a publish to every owner in `publishRefused` (videos).
+const NEXT_PUBLISH = new Date(Date.now() + 5 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const publishRefused = new Set<string>();
+installFetchStub({
+  incubating: ['simplewarm'],
+  publish: (o, kind) => (kind === 'video' && publishRefused.has(o)
+    ? publishBody({ allowed: false, conflicts: [{ permlink: 'p' }], next_free_at: NEXT_PUBLISH }) : undefined),
+});
 
 let database: Database;
 let config: any;
@@ -143,6 +150,25 @@ describe('POST /upload/simple', () => {
     expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', plan: 'warmup' });
     expect(Number(res.headers['retry-after'])).toBeGreaterThan(0);
     expect(leftovers()).toEqual([]);
+  });
+
+  it('refuses a free account over the publish limit through another app\'s key, not through 3speak\'s', async () => {
+    const who = owner();
+    publishRefused.add(who);
+    config.uploadLimits.publishCheckEnabled = true;
+    try {
+      const send = async (k: string) => (await api()).post('/upload/simple').set('X-API-Key', k).field('owner', who).attach('file', FILE, 'a.mp4');
+      const res = await send(key);
+      expect(res.status).toBe(429);
+      expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', plan: 'free', limit: 1, used: 1, next_at: NEXT_PUBLISH });
+      expect(Number(res.headers['retry-after'])).toBeGreaterThan(4 * 3600);
+      expect(leftovers()).toEqual([]);
+      const ok = await send(await makeApiKey(database, { app_name: '3speak' }));
+      expect(ok.status).toBe(201);
+      await waitStatus(ok.body.permlink, 'processing');
+    } finally {
+      config.uploadLimits.publishCheckEnabled = false;
+    }
   });
 
   it('a verified replacement skips the limit and stays unlisted', async () => {

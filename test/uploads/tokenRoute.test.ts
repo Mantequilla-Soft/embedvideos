@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { installFetchStub, owner, rawDb, seedVideo } from './helpers';
+import { installFetchStub, owner, publishBody, rawDb, seedVideo } from './helpers';
 import { api, loadApp, makeApiKey } from '../helpers/app';
 import { verifyUploadToken } from '../../src/utils/uploadToken';
 import type { Database } from '../../src/database/mongodb';
@@ -13,15 +13,27 @@ process.env.UPLOAD_TOKEN_MAX_TTL = '1800';
 process.env.UPLOAD_TOKEN_MAX_FILE_SIZE = String(500 * 1024 * 1024);
 // `gradkid` got its Hive account two hours ago (same name as its warm-up handle).
 const hiveTime = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, '');
-installFetchStub({ incubating: ['warmupkid', 'warmupfull'], hiveCreated: { gradkid: hiveTime(Date.now() - 2 * 3600 * 1000) } });
+// The publish limit for other apps: the checker refuses every `kind:owner` in
+// `publishRefused` and allows everyone else.
+process.env.UPLOAD_PUBLISH_CHECK_ENABLED = 'true';
+const NEXT_PUBLISH = new Date(Date.now() + 5 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const publishRefused = new Set<string>();
+installFetchStub({
+  incubating: ['warmupkid', 'warmupfull'], hiveCreated: { gradkid: hiveTime(Date.now() - 2 * 3600 * 1000) },
+  publish: (o, kind) => (publishRefused.has(`${kind}:${o}`)
+    ? publishBody({ allowed: false, limit: kind === 'short' ? 3 : 1, conflicts: [{ permlink: 'p', title: 't', at: NEXT_PUBLISH, scheduled: true }], next_free_at: NEXT_PUBLISH })
+    : publishBody({ limit: kind === 'short' ? 3 : 1, conflicts: kind === 'short' ? [{ permlink: 's', title: 't', at: NEXT_PUBLISH, scheduled: false }] : [] })),
+});
 
 let database: Database;
 let config: any;
 let key: string;
+let speakKey: string;
 
 beforeAll(async () => {
   ({ database, config } = await loadApp());
   key = await makeApiKey(database, { app_name: 'key-app' });
+  speakKey = await makeApiKey(database, { app_name: '3speak' });
 });
 
 const token = async (body: Record<string, unknown>, k: string | null = key) => {
@@ -194,6 +206,26 @@ describe('POST /uploads/token', () => {
       expect((await token({ owner: 'warmupfull', short: true })).body).toMatchObject({ plan: 'warmup', kind: 'short', limit: 3 });
     });
 
+    it('refuses a free Hive account over the publish limit through another app, not through 3speak', async () => {
+      const who = owner();
+      publishRefused.add(`video:${who}`);
+      const res = await token({ owner: who, frontend_app: '3speak' });
+      expect(res.status).toBe(429);
+      expect(res.body).toMatchObject({
+        code: 'daily_upload_limit', error: 'Daily video publish limit reached', kind: 'video', plan: 'free',
+        limit: 1, used: 1, next_at: NEXT_PUBLISH, upgrade_url: `https://3speak.tv/wallet/${who}#pro`,
+      });
+      expect(Number(res.headers['retry-after'])).toBe(res.body.retry_after_seconds);
+      expect((await token({ owner: who, short: true })).status).toBe(201);
+      // 3speak.tv checks the publish limit itself and lets people schedule.
+      const ok = await token({ owner: who }, speakKey);
+      expect(ok.status).toBe(201);
+      expect(claimsOf(ok.body.token).issuedByKey).toBe('3speak');
+      // A verified replacement stays free.
+      const target = await seedVideo(database, who);
+      expect((await token({ owner: who, replaces: target })).status).toBe(201);
+    });
+
     describe('with free uploads capped (UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true)', () => {
       beforeAll(() => { config.uploadLimits.freeUploadsCapped = true; });
       afterAll(() => { config.uploadLimits.freeUploadsCapped = false; });
@@ -291,11 +323,11 @@ describe('GET /uploads/quota', () => {
     expect((await quota('?owner=%20%20')).body).toEqual({ error: 'owner (string) is required' });
   });
 
-  it('reports a free Hive account exempt (publish_limit) by default', async () => {
+  it('reports a free Hive account exempt (publish_limit) by default through 3speak', async () => {
     const who = owner();
     await seedVideo(database, who, { agoMs: 60 * 60 * 1000 });
     await seedVideo(database, who, { short: true });
-    const res = await quota(`?owner=${who}`);
+    const res = await quota(`?owner=${who}`, speakKey);
     expect(res.status).toBe(200);
     expect(res.headers['cache-control']).toBe('no-store');
     expect(res.body).toEqual({
@@ -303,6 +335,24 @@ describe('GET /uploads/quota', () => {
       video: { limit: null, used: 1, remaining: null, next_at: null },
       short: { limit: null, used: 1, remaining: null, next_at: null },
     });
+  });
+
+  it('reports the free plan\'s publish quota through another app', async () => {
+    const who = owner();
+    publishRefused.add(`video:${who}`);
+    const res = await quota(`?owner=${who}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      enabled: true, exempt: false, reason: null, plan: 'free',
+      video: { limit: 1, used: 1, remaining: 0, next_at: NEXT_PUBLISH },
+      short: { limit: 3, used: 1, remaining: 2, next_at: null },
+    });
+    // Pro and warm-up owners keep their own answers.
+    const pro = owner('pro');
+    await makePro(pro);
+    publishRefused.add(`video:${pro}`);
+    expect((await quota(`?owner=${pro}`)).body).toMatchObject({ exempt: true, reason: 'pro' });
+    expect((await quota('?owner=warmupkid')).body).toMatchObject({ plan: 'warmup', video: { limit: 3 } });
   });
 
   it('reports a free owner\'s allowance while free uploads are capped', async () => {
@@ -352,7 +402,7 @@ describe('GET /uploads/quota', () => {
 
   it('answers 503 when the count cannot be read', async () => {
     const spy = vi.spyOn(database, 'getRecentCountedUploads').mockRejectedValueOnce(new Error('down'));
-    const res = await quota(`?owner=${owner()}`);
+    const res = await quota(`?owner=${owner()}`, speakKey);
     spy.mockRestore();
     expect(res.status).toBe(503);
     expect(res.body.error).toBe('Upload quota is unavailable right now');

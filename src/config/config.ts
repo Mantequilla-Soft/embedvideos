@@ -49,7 +49,8 @@ export interface Config {
   gateCdnBase: string;
   /**
    * Daily upload limits: warm-up accounts always, free Hive accounts only when
-   * UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true. See src/utils/uploadLimits.ts.
+   * UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true, or through other apps by the
+   * checker's publish limit. See src/utils/uploadLimits.ts.
    */
   uploadLimits: UploadLimitsConfig;
 }
@@ -80,11 +81,33 @@ export interface UploadLimitsConfig {
   hiveApiNodes: string[];
   /** UPLOAD_UPGRADE_URL: where a refused uploader can get Pro. `{owner}` (or `{user}`) is replaced. */
   upgradeUrl: string;
+  /**
+   * UPLOAD_PUBLISH_CHECK_ENABLED. On unless set to exactly "false". While free
+   * uploads are not capped, an upload by a free Hive account through an app
+   * outside `publishCheckSkipApps` is refused when the checker says that owner
+   * cannot publish one more of its kind right now (those apps publish to Hive
+   * straight after the upload, with no scheduling).
+   */
+  publishCheckEnabled: boolean;
+  /** UPLOAD_PUBLISH_CHECK_URL: checker base URL that answers GET /publish-quota/:owner. No trailing slash. */
+  publishCheckUrl: string;
+  /**
+   * UPLOAD_PUBLISH_CHECK_SKIP_APPS: API key `app_name`s (lowercased) whose
+   * uploads skip the publish check, because the app checks the publish limit
+   * itself and lets people schedule (3speak.tv's studio and editor).
+   */
+  publishCheckSkipApps: string[];
 }
 
 function parseCount(raw: string | undefined, fallback: number): number {
   const n = parseInt(raw ?? '', 10);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** API key app names: trimmed and lowercased, compared case-insensitively. Empty or unset = the default. */
+function parseAppList(raw: string | undefined, fallback: string): string[] {
+  const list = (raw || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return list.length ? list : fallback.split(',');
 }
 
 function parseList(raw: string | undefined): string[] {
@@ -107,6 +130,9 @@ export function loadUploadLimitsConfig(env: NodeJS.ProcessEnv = process.env): Up
     warmupLookupUrl: env.UPLOAD_LIMIT_WARMUP_LOOKUP_URL || 'https://checker.3speak.tv/incubation/authors',
     hiveApiNodes: hiveNodes.length ? hiveNodes : ['https://api.hive.blog', 'https://api.deathwing.me', 'https://anyx.io'],
     upgradeUrl: env.UPLOAD_UPGRADE_URL || 'https://3speak.tv/wallet/{owner}#pro',
+    publishCheckEnabled: env.UPLOAD_PUBLISH_CHECK_ENABLED !== 'false',
+    publishCheckUrl: (env.UPLOAD_PUBLISH_CHECK_URL || '').trim().replace(/\/+$/, '') || 'https://checker.3speak.tv',
+    publishCheckSkipApps: parseAppList(env.UPLOAD_PUBLISH_CHECK_SKIP_APPS, '3speak,3speak-editor'),
   };
 }
 

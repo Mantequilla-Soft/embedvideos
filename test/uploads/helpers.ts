@@ -7,6 +7,13 @@ export function rawDb(database: Database): any {
   return (database as any).db;
 }
 
+/** A checker GET /publish-quota body ("allowed" unless `over` says otherwise). */
+export function publishBody(over: Record<string, unknown> = {}) {
+  return { success: true, enabled: true, exempt: false, reason: null, limit: 1, window_hours: 24, allowed: true, conflicts: [], next_free_at: null, ...over };
+}
+
+export type PublishStub = (owner: string, kind: string) => unknown;
+
 /**
  * Replaces global fetch with a stub that answers the warm-up lookups only:
  * the checker's /incubation/authors says every handle in `incubating` is
@@ -18,8 +25,12 @@ export function rawDb(database: Database): any {
  * Stubs global fetch for the warm-up registry and Hive. `hiveCreated` gives an
  * account a `created` time (Hive's format, UTC without a zone); accounts
  * without one answer no `created`.
+ *
+ * The checker's GET /publish-quota/:owner answers with `publish(owner, kind)`
+ * (a body, or `{ status }` for an HTTP error; throwing = unreachable), or
+ * "allowed" when that returns undefined or is not given.
  */
-export function installFetchStub(opts: { incubating?: string[]; hiveAccounts?: string[]; hiveCreated?: Record<string, string> } = {}) {
+export function installFetchStub(opts: { incubating?: string[]; hiveAccounts?: string[]; hiveCreated?: Record<string, string>; publish?: PublishStub } = {}) {
   const incubating = new Set(opts.incubating ?? []);
   const created = opts.hiveCreated ?? {};
   const hive = new Set([...(opts.hiveAccounts ?? []), ...Object.keys(created)]);
@@ -27,6 +38,13 @@ export function installFetchStub(opts: { incubating?: string[]; hiveAccounts?: s
     const u = String(url);
     const body = init?.body ? JSON.parse(String(init.body)) : {};
     const json = (data: unknown) => ({ ok: true, status: 200, json: async () => data });
+    const pq = u.match(/\/publish-quota\/([^?]+)\?kind=(\w+)/);
+    if (pq) {
+      const owner = decodeURIComponent(pq[1]);
+      const out: any = opts.publish?.(owner, pq[2]);
+      if (out && typeof out.status === 'number') return { ok: false, status: out.status, json: async () => ({}) };
+      return json(out ?? publishBody({ kind: pq[2], limit: pq[2] === 'short' ? 3 : 1 }));
+    }
     if (u.includes('/incubation/authors')) {
       const authors: Record<string, unknown> = {};
       for (const h of body.handles ?? []) if (incubating.has(h)) authors[h] = { status: 'incubating' };

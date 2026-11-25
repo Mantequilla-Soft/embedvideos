@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
-import { installFetchStub, mintToken, owner, rawDb, seedVideo } from './helpers';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { installFetchStub, mintToken, owner, publishBody, rawDb, seedVideo } from './helpers';
 import { loadApp, makeApiKey } from '../helpers/app';
 import { validateUploadAuth } from '../../src/utils/uploadAuth';
 import { UploadLimiter } from '../../src/utils/uploadLimits';
@@ -13,17 +13,31 @@ process.env.UPLOAD_LIMIT_EXEMPT = 'listedowner';
 // free plan's 1 video a day, so this file caps free uploads; the default (free
 // Hive accounts uncapped) has its own test below.
 process.env.UPLOAD_LIMIT_FREE_UPLOADS_CAPPED = 'true';
-const fetchStub = installFetchStub({ incubating: ['warmupkid', 'graduated'], hiveAccounts: ['graduated'] });
+// The publish limit for other apps (only while uncapped, see its tests): the
+// checker refuses every `kind:owner` in `publishRefused`, answers `publishOdd`
+// owners with whatever is set there, and allows everyone else.
+process.env.UPLOAD_PUBLISH_CHECK_ENABLED = 'true';
+const NEXT_PUBLISH = new Date(Date.now() + 5 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const publishRefused = new Set<string>();
+const publishOdd = new Map<string, () => unknown>();
+const fetchStub = installFetchStub({
+  incubating: ['warmupkid', 'graduated'], hiveAccounts: ['graduated'],
+  publish: (o, kind) => publishOdd.get(o)?.() ?? (publishRefused.has(`${kind}:${o}`)
+    ? publishBody({ allowed: false, limit: kind === 'short' ? 3 : 1, conflicts: [{ permlink: 'p', title: 't', at: NEXT_PUBLISH, scheduled: false }], next_free_at: NEXT_PUBLISH })
+    : undefined),
+});
 
 let database: Database;
 let config: any;
 let key: string;
 let inactiveKey: string;
+let speakKey: string;
 
 beforeAll(async () => {
   ({ database, config } = await loadApp());
   key = await makeApiKey(database);
   inactiveKey = await makeApiKey(database, { active: false });
+  speakKey = await makeApiKey(database, { app_name: '3speak' });
 });
 
 const SIZE = 1000;
@@ -241,7 +255,105 @@ describe('daily upload limit', () => {
     const check = vi.fn(async () => null);
     const r = await auth({ 'x-api-key': [key] }, { owner: owner() }, false, SIZE, { check } as any);
     expect(r.ok).toBe(true);
-    expect(check).toHaveBeenCalledWith(expect.any(String), 'video');
+    expect(check).toHaveBeenCalledWith(expect.any(String), 'video', { app: 'test-app' });
+    // A token upload names the key that issued the token, not the app it claims.
+    const t = mintToken(config.uploadTokenSecret, { owner: owner(), app: '3speak', issuedByKey: 'ecency' });
+    expect(await auth(bearer(t.token), {}, false, SIZE, { check } as any)).toMatchObject({ ok: true });
+    expect(check).toHaveBeenLastCalledWith(expect.any(String), 'video', { app: 'ecency' });
+  });
+});
+
+describe('publish limit for other apps', () => {
+  beforeAll(() => { config.uploadLimits.freeUploadsCapped = false; });
+  afterAll(() => { config.uploadLimits.freeUploadsCapped = true; });
+  const refuse = (who: string, kind = 'video') => publishRefused.add(`${kind}:${who}`);
+
+  it('refuses a free Hive account over it through another app\'s key, with next_at from the checker', async () => {
+    const who = owner();
+    refuse(who);
+    const r = await auth({ 'x-api-key': [key] }, { owner: who });
+    expect(r).toMatchObject({ ok: false, status: 429, error: 'Daily video publish limit reached' });
+    if (r.ok) return;
+    expect(r.body).toEqual({
+      error: 'Daily video publish limit reached', code: 'daily_upload_limit', kind: 'video', plan: 'free', limit: 1, used: 1,
+      next_at: NEXT_PUBLISH, retry_after_seconds: expect.any(Number),
+      message: `The free plan publishes 1 video per 24 hours. Your next video can be published at ${NEXT_PUBLISH}. 3Speak Pro removes this limit.`,
+      upgrade_url: `https://3speak.tv/wallet/${who}#pro`,
+    });
+    expect(Number(r.headers!['Retry-After'])).toBeGreaterThan(4.9 * 3600);
+    // Shorts are asked separately.
+    expect(await auth({ 'x-api-key': [key] }, { owner: who, short: 'true' })).toMatchObject({ ok: true });
+  });
+
+  it('identifies the app by the key, never by frontend_app', async () => {
+    const who = owner();
+    refuse(who);
+    // The 3speak key (studio, editor) is skipped: they let people schedule.
+    expect(await auth({ 'x-api-key': [speakKey] }, { owner: who })).toMatchObject({ ok: true });
+    expect(await auth({ 'x-api-key': [key] }, { owner: who, frontend_app: '3speak' })).toMatchObject({ status: 429 });
+    const viaOther = mintToken(config.uploadTokenSecret, { owner: who, app: '3speak', issuedByKey: 'test-app' });
+    expect(await auth(bearer(viaOther.token))).toMatchObject({ status: 429, body: { next_at: NEXT_PUBLISH } });
+    // Refused before consumption: the token still works through the right app later.
+    expect(await database.consumeUploadToken(viaOther.claims.jti, new Date(viaOther.claims.exp * 1000))).toBe(true);
+    const viaSpeak = mintToken(config.uploadTokenSecret, { owner: who, app: 'ecency', issuedByKey: '3speak' });
+    expect(await auth(bearer(viaSpeak.token))).toMatchObject({ ok: true });
+  });
+
+  it('allows an owner under it', async () => {
+    expect(await auth({ 'x-api-key': [key] }, { owner: owner() })).toMatchObject({ ok: true });
+  });
+
+  it('leaves Pro, listed and warm-up owners alone', async () => {
+    const pro = owner();
+    refuse(pro);
+    await database.createUser({ username: pro, premium: true, banned: false } as any);
+    expect(await auth({ 'x-api-key': [key] }, { owner: pro })).toMatchObject({ ok: true });
+    refuse('listedowner');
+    expect(await auth({ 'x-api-key': [key] }, { owner: 'listedowner' })).toMatchObject({ ok: true });
+    const kid = 'warmupkid';
+    refuse(kid, 'short');
+    expect(await auth({ 'x-api-key': [key] }, { owner: kid, short: 'true' })).toMatchObject({ ok: true });
+  });
+
+  it('never limits verified VODs and replacements', async () => {
+    const who = owner();
+    refuse(who);
+    await rawDb(database).collection('stream-stats').insertOne({ host: who, roomName: 'pub-room' });
+    expect(await auth({ 'x-api-key': [key] }, { owner: who, permlink: 'pub-room', frontend_app: '3speak-hangouts' }))
+      .toMatchObject({ ok: true, streamVod: true });
+    const target = await seedVideo(database, who);
+    expect(await auth({ 'x-api-key': [key] }, { owner: who, replaces: target })).toMatchObject({ ok: true, replacesExisting: target });
+    // An unverified VOD claim is an ordinary upload.
+    expect(await auth({ 'x-api-key': [key] }, { owner: who, permlink: 'no-room', frontend_app: '3speak-hangouts' })).toMatchObject({ status: 429 });
+  });
+
+  it('fails open when the checker is down, errors or answers garbage', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cases: Array<() => unknown> = [
+      () => { throw new Error('ECONNREFUSED'); },
+      () => ({ status: 502 }),
+      () => ({ hello: 'world' }),
+    ];
+    for (const answer of cases) {
+      const who = owner();
+      refuse(who);
+      publishOdd.set(who, answer);
+      expect(await auth({ 'x-api-key': [key] }, { owner: who })).toMatchObject({ ok: true });
+    }
+    warn.mockRestore();
+  });
+
+  it('is not checked while free uploads are capped (the upload cap applies instead)', async () => {
+    config.uploadLimits.freeUploadsCapped = true;
+    try {
+      const who = owner();
+      refuse(who);
+      expect(await auth({ 'x-api-key': [key] }, { owner: who })).toMatchObject({ ok: true });
+      await seedVideo(database, who);
+      expect(await auth({ 'x-api-key': [key] }, { owner: who })).toMatchObject({ status: 429, error: 'Daily video upload limit reached' });
+    } finally {
+      config.uploadLimits.freeUploadsCapped = false;
+    }
   });
 });
 
