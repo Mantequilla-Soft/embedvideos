@@ -70,18 +70,24 @@ export async function validateUploadAuth(
   const authHeader = h['authorization']?.[0];
   const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
   let tokenClaims: UploadTokenClaims | null = null;
+  // The app behind this upload, for the publish limit: the API key's
+  // `app_name`, or for a token the key that issued it. Never `frontend_app`,
+  // which the client sets.
+  let keyApp: string;
 
   if (xApiKey) {
     const keyData = await database.getApiKey(xApiKey);
     if (!keyData || !keyData.active) {
       return { ok: false, status: 401, error: 'Invalid or inactive API key' };
     }
+    keyApp = keyData.app_name || 'unknown';
     database.updateApiKeyLastUsed(xApiKey).catch(console.error);
   } else if (bearerToken && config.uploadTokenSecret) {
     tokenClaims = verifyUploadToken(bearerToken, config.uploadTokenSecret);
     if (!tokenClaims) {
       return { ok: false, status: 401, error: 'Invalid or expired upload token' };
     }
+    keyApp = tokenClaims.issuedByKey || 'unknown';
 
     // A finalize token commissions an encode; it is not upload credentials.
     // Checked before the token is consumed so a misdirected one is rejected
@@ -220,10 +226,11 @@ export async function validateUploadAuth(
 
   // Daily upload limit, for every auth method. The token route checks too
   // (better UX: refused before any bytes move), but an X-API-Key upload never
-  // goes through it, and the key is public.
+  // goes through it, and the key is public. Through another app's key the
+  // publish limit is checked as well (see uploadLimits.ts).
   // A VOD claim whose lookup failed (streamVod still undefined) is let through.
   if (!isPartial && !replacesExisting && !replacesUnknown && !(vodClaim && streamVod !== false)) {
-    const refusal = await (limiter ?? getUploadLimiter(database, config)).check(owner, short ? 'short' : 'video');
+    const refusal = await (limiter ?? getUploadLimiter(database, config)).check(owner, short ? 'short' : 'video', { app: keyApp });
     if (refusal) {
       return { ok: false, status: refusal.status, error: refusal.body.error, body: { ...refusal.body }, headers: refusal.headers };
     }

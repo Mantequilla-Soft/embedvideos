@@ -297,6 +297,9 @@ the admin panel and env changes are ignored.
 | `UPLOAD_LIMIT_WARMUP_LOOKUP_URL` | Warm-up account registry | `https://checker.3speak.tv/incubation/authors` |
 | `UPLOAD_LIMIT_HIVE_NODES` | Comma list of Hive API nodes | `api.hive.blog`, `api.deathwing.me`, `anyx.io` |
 | `UPLOAD_UPGRADE_URL` | `upgrade_url` in refusals; `{owner}` or `{user}` is replaced | `https://3speak.tv/wallet/{owner}#pro` |
+| `UPLOAD_PUBLISH_CHECK_ENABLED` | `false` stops checking the publish limit for other apps | on |
+| `UPLOAD_PUBLISH_CHECK_URL` | Checker that answers `GET /publish-quota/:owner?kind=` | `https://checker.3speak.tv` |
+| `UPLOAD_PUBLISH_CHECK_SKIP_APPS` | Comma list of API key `app_name`s whose uploads skip the publish check (case-insensitive) | `3speak,3speak-editor` |
 
 `.env.example` also lists `IPFS_API_ADDR` and `DEMO_API_KEY`; neither is read at the
 moment (the IPFS API address is fixed at `http://127.0.0.1:5001`).
@@ -423,7 +426,8 @@ Enforced by this service for every app and every upload path (`POST /uploads/tok
 | Account | Videos | Shorts |
 |---|---|---|
 | Warm-up account (a 3Speak handle with no Hive account yet) | 3 | 3 |
-| Free Hive account | no upload cap (limited when publishing, by the 3Speak checker) | no upload cap |
+| Free Hive account, through 3speak.tv | no upload cap (limited when publishing, by the 3Speak checker) | no upload cap |
+| Free Hive account, through any other app | refused while the publish limit (1 video per 24 h by publish time) is used up | same (3 shorts) |
 | Free Hive account, with `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true` | 1 | 3 |
 | 3Speak Pro, or listed in `UPLOAD_LIMIT_EXEMPT` | unlimited | unlimited |
 
@@ -432,8 +436,17 @@ Enforced by this service for every app and every upload path (`POST /uploads/tok
 - **Never counts:** verified stream recordings from the 3Speak streaming server, media
   replacements (`replaces`), and uploads a warm-up account made before it got its Hive
   account.
-- **Fails open:** if MongoDB, the warm-up registry or Hive cannot answer, the upload is
-  allowed.
+- **Other apps:** an app that publishes to Hive straight after the upload cannot schedule,
+  so for an upload through an API key whose `app_name` is not in
+  `UPLOAD_PUBLISH_CHECK_SKIP_APPS` (default `3speak`, `3speak-editor`: 3speak.tv checks
+  the publish limit itself and lets people schedule), this service asks the 3Speak checker
+  (`GET /publish-quota/:owner?kind=video|short`) whether a free Hive account may publish
+  one more of that kind now, and refuses the upload when it may not. The app is the API
+  key's (for a token upload, the key that issued the token), never `frontend_app`. Answers
+  are cached 30 seconds per owner and kind. Not checked while
+  `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true` (the upload cap applies then).
+- **Fails open:** if MongoDB, the warm-up registry, Hive or the checker cannot answer
+  (3 second timeout), the upload is allowed.
 
 A refusal is HTTP 429 with a `Retry-After` header (seconds) and this body on every path.
 tus-js-client does not retry a 429; read it with `error.originalResponse.getBody()`.
@@ -455,7 +468,26 @@ tus-js-client does not retry a 429; read it with `error.originalResponse.getBody
 
 Branch on `code`, show `message` as is. `kind` is `video` or `short`; `plan` is `warmup`
 or `free`; `next_at` and `retry_after_seconds` are `null` only when an allowance is set to
-0. `upgrade_url` only matters for `plan: "free"`.
+0 (or the checker gave no time). `upgrade_url` only matters for `plan: "free"`.
+
+The publish limit (other apps) answers the same way, with `"plan": "free"`, `limit` and
+`next_at` (when the next one can be published) from the checker, `used` = the publishes
+holding the window:
+
+```json
+{
+  "error": "Daily video publish limit reached",
+  "code": "daily_upload_limit",
+  "kind": "video",
+  "plan": "free",
+  "limit": 1,
+  "used": 1,
+  "next_at": "2026-11-26T09:15:00Z",
+  "retry_after_seconds": 41400,
+  "message": "The free plan publishes 1 video per 24 hours. Your next video can be published at 2026-11-26T09:15:00Z. 3Speak Pro removes this limit.",
+  "upgrade_url": "https://3speak.tv/wallet/badadib#pro"
+}
+```
 
 **Check the allowance first** with `GET /uploads/quota?owner=<name>` (API key):
 
@@ -471,8 +503,11 @@ or `free`; `next_at` and `retry_after_seconds` are `null` only when an allowance
 ```
 
 For an exempt owner, `exempt` is `true`, `reason` is `pro`, `listed` or `publish_limit`
-(a free Hive account while uploads are not capped), `plan` is `null`, and `limit`,
-`remaining` and `next_at` are `null`. With limits switched off, `enabled` is `false`. 503
+(a free Hive account through 3speak.tv while uploads are not capped), `plan` is `null`,
+and `limit`, `remaining` and `next_at` are `null`. Through any other app's key a free Hive
+account gets `exempt: false`, `plan: "free"` and, per kind, the checker's publish limit
+(`used` = publishes in the window, `next_at` = when the next one can be published while
+`remaining` is 0); if the checker cannot answer, the `publish_limit` answer above. With limits switched off, `enabled` is `false`. 503
 when the count cannot be read (uploads are not blocked then).
 
 ### Service and encoders

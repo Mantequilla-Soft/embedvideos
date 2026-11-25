@@ -12,6 +12,7 @@ const KEYS = [
   'MAX_UPLOAD_SIZE', 'DISPATCHER_ENABLED', 'GATE_URL', 'GATE_INTERNAL_API_KEY', 'GATE_CDN_BASE',
   'UPLOAD_DAILY_LIMITS_ENABLED', 'UPLOAD_LIMIT_FREE_UPLOADS_CAPPED', 'UPLOAD_LIMIT_VIDEOS_PER_DAY', 'UPLOAD_LIMIT_SHORTS_PER_DAY',
   'UPLOAD_LIMIT_EXEMPT', 'UPLOAD_LIMIT_WARMUP_LOOKUP_URL', 'UPLOAD_LIMIT_HIVE_NODES', 'UPLOAD_UPGRADE_URL',
+  'UPLOAD_PUBLISH_CHECK_ENABLED', 'UPLOAD_PUBLISH_CHECK_URL', 'UPLOAD_PUBLISH_CHECK_SKIP_APPS',
 ];
 let saved: Record<string, string | undefined>;
 
@@ -72,6 +73,9 @@ describe('loadConfig defaults', () => {
       warmupLookupUrl: 'https://checker.3speak.tv/incubation/authors',
       hiveApiNodes: ['https://api.hive.blog', 'https://api.deathwing.me', 'https://anyx.io'],
       upgradeUrl: 'https://3speak.tv/wallet/{owner}#pro',
+      publishCheckEnabled: true,
+      publishCheckUrl: 'https://checker.3speak.tv',
+      publishCheckSkipApps: ['3speak', '3speak-editor'],
     });
   });
 });
@@ -163,6 +167,9 @@ describe('loadUploadLimitsConfig', () => {
       UPLOAD_LIMIT_WARMUP_LOOKUP_URL: 'https://w',
       UPLOAD_LIMIT_HIVE_NODES: 'https://h1, https://h2 ,',
       UPLOAD_UPGRADE_URL: 'https://up/{user}',
+      UPLOAD_PUBLISH_CHECK_ENABLED: 'false',
+      UPLOAD_PUBLISH_CHECK_URL: ' https://pq.test/ ',
+      UPLOAD_PUBLISH_CHECK_SKIP_APPS: ' 3Speak , Studio-X,,',
     })).toEqual({
       enabled: false,
       freeUploadsCapped: true,
@@ -174,6 +181,9 @@ describe('loadUploadLimitsConfig', () => {
       warmupLookupUrl: 'https://w',
       hiveApiNodes: ['https://h1', 'https://h2'],
       upgradeUrl: 'https://up/{user}',
+      publishCheckEnabled: false,
+      publishCheckUrl: 'https://pq.test',
+      publishCheckSkipApps: ['3speak', 'studio-x'],
     });
   });
 
@@ -190,5 +200,20 @@ describe('loadUploadLimitsConfig', () => {
       expect(loadUploadLimitsConfig({ UPLOAD_LIMIT_FREE_UPLOADS_CAPPED: v }).freeUploadsCapped).toBe(false);
     }
     expect(loadUploadLimitsConfig({ UPLOAD_LIMIT_FREE_UPLOADS_CAPPED: 'true' }).freeUploadsCapped).toBe(true);
+  });
+
+  it('checks the publish limit for other apps by default, against the public checker', () => {
+    const c = loadUploadLimitsConfig({});
+    expect(c.publishCheckEnabled).toBe(true);
+    expect(c.publishCheckUrl).toBe('https://checker.3speak.tv');
+    expect(c.publishCheckSkipApps).toEqual(['3speak', '3speak-editor']);
+    // Only exactly "false" switches it off; an empty skip list or URL means the default.
+    for (const v of ['0', 'no', 'FALSE', '']) {
+      expect(loadUploadLimitsConfig({ UPLOAD_PUBLISH_CHECK_ENABLED: v }).publishCheckEnabled).toBe(true);
+    }
+    const blank = loadUploadLimitsConfig({ UPLOAD_PUBLISH_CHECK_SKIP_APPS: ' , ', UPLOAD_PUBLISH_CHECK_URL: '  ' });
+    expect(blank.publishCheckSkipApps).toEqual(['3speak', '3speak-editor']);
+    expect(blank.publishCheckUrl).toBe('https://checker.3speak.tv');
+    expect(loadUploadLimitsConfig({ UPLOAD_PUBLISH_CHECK_URL: 'http://localhost:3131///' }).publishCheckUrl).toBe('http://localhost:3131');
   });
 });

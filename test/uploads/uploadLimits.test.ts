@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   UploadLimiter, LimiterDeps, DAY_MS, REPLACEMENT_REGISTER_GRACE_MS, LIMIT_ERROR_CODE, STREAM_VOD_APP,
   isoSeconds, verifyReplacementTarget, createWarmupLookup, createHiveAccountLookup, getUploadLimiter,
+  createPublishQuotaLookup, parsePublishQuota, PublishAnswer,
 } from '../../src/utils/uploadLimits';
 import type { UploadLimitsConfig } from '../../src/config/config';
 import type { CountedUploadRow } from '../../src/database/mongodb';
@@ -17,7 +18,9 @@ function cfg(over: Partial<UploadLimitsConfig> = {}): UploadLimitsConfig {
     enabled: true, freeUploadsCapped: false, videosPerDay: 1, shortsPerDay: 3, warmupVideosPerDay: 3, warmupShortsPerDay: 3, exempt: [],
     warmupLookupUrl: 'http://checker.test/incubation/authors',
     hiveApiNodes: ['http://hive-a.test', 'http://hive-b.test'],
-    upgradeUrl: '', ...over,
+    upgradeUrl: '',
+    publishCheckEnabled: true, publishCheckUrl: 'http://checker.test', publishCheckSkipApps: ['3speak', '3speak-editor'],
+    ...over,
   };
 }
 
@@ -290,6 +293,209 @@ describe('UploadLimiter.quota and exemptReason', () => {
   });
 });
 
+// ---- Publish limit for other apps ----------------------------------------------
+
+const NEXT = '2026-11-22T08:00:00Z';
+const blocked = (over: Partial<PublishAnswer> = {}): PublishAnswer => ({ allowed: false, limit: 1, used: 1, nextMs: Date.parse(NEXT), windowHours: 24, ...over });
+const open = (over: Partial<PublishAnswer> = {}): PublishAnswer => ({ allowed: true, limit: 1, used: 0, nextMs: null, windowHours: 24, ...over });
+
+describe('UploadLimiter publish limit (other apps)', () => {
+  const ECENCY = { app: 'ecency' };
+
+  it('refuses a free Hive account through another app with the 429 body, next_at from the checker', async () => {
+    const publishQuota = vi.fn(async () => blocked());
+    const { l } = limiter([], { publishQuota });
+    const r = await l.check('Alice', 'video', ECENCY);
+    expect(publishQuota).toHaveBeenCalledWith('alice', 'video');
+    expect(r!.status).toBe(429);
+    const retry = (Date.parse(NEXT) - NOW) / 1000;
+    expect(r!.body).toEqual({
+      error: 'Daily video publish limit reached', code: LIMIT_ERROR_CODE, kind: 'video', plan: 'free', limit: 1, used: 1,
+      next_at: NEXT, retry_after_seconds: retry,
+      message: `The free plan publishes 1 video per 24 hours. Your next video can be published at ${NEXT}. 3Speak Pro removes this limit.`,
+      upgrade_url: 'https://3speak.tv/wallet/alice#pro',
+    });
+    expect(r!.headers).toEqual({ 'Retry-After': String(retry) });
+  });
+
+  it('says shorts in the message, and leaves next_at out when the checker has none', async () => {
+    const { l } = limiter([], { publishQuota: async () => blocked({ limit: 3, used: 3, nextMs: null }) });
+    const r = await l.check('alice', 'short', ECENCY);
+    expect(r!.body).toMatchObject({ kind: 'short', limit: 3, used: 3, next_at: null, retry_after_seconds: null });
+    expect(r!.body.message).toBe('The free plan publishes 3 shorts per 24 hours. 3Speak Pro removes this limit.');
+    expect(r!.headers).toEqual({});
+  });
+
+  it('never checks the skip-list apps (case and spaces ignored) or an unknown caller', async () => {
+    const publishQuota = vi.fn(async () => blocked());
+    const { l } = limiter([], { publishQuota });
+    expect(await l.check('alice', 'video', { app: '3speak' })).toBeNull();
+    expect(await l.check('alice', 'video', { app: ' 3Speak-Editor ' })).toBeNull();
+    expect(await l.check('alice', 'video')).toBeNull();
+    expect(await l.check('alice', 'video', { app: null })).toBeNull();
+    expect(publishQuota).not.toHaveBeenCalled();
+    expect(l.checksPublishFor('3SPEAK')).toBe(false);
+    expect(l.checksPublishFor('snapie')).toBe(true);
+  });
+
+  it('allows under the limit, and when the checker cannot answer or does not limit the owner', async () => {
+    expect(await limiter([], { publishQuota: async () => open() }).l.check('alice', 'video', ECENCY)).toBeNull();
+    expect(await limiter([], { publishQuota: async () => null }).l.check('alice', 'video', ECENCY)).toBeNull();
+    expect(await limiter([], { publishQuota: async () => blocked({ limit: null }) }).l.check('alice', 'video', ECENCY)).toBeNull();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await limiter([], { publishQuota: async () => { throw new Error('boom'); } }).l.check('alice', 'video', ECENCY)).toBeNull();
+    err.mockRestore();
+  });
+
+  it('leaves Pro, listed and warm-up owners alone (warm-up keeps its own upload limit)', async () => {
+    const publishQuota = async () => blocked();
+    expect(await limiter([], { publishQuota, isUserPremium: async () => true }).l.check('pro', 'video', ECENCY)).toBeNull();
+    const listed = limiter([], { publishQuota: vi.fn(async () => blocked()) }, cfg({ exempt: ['vip'] }));
+    expect(await listed.l.check('vip', 'video', ECENCY)).toBeNull();
+    expect(listed.deps.publishQuota).not.toHaveBeenCalled();
+    expect(await limiter([], { publishQuota, isWarmup: async () => null }).l.check('who', 'video', ECENCY)).toBeNull();
+    const two = [row({ ago: HOUR }), row({ ago: 2 * HOUR })];
+    expect(await limiter(two, { publishQuota, isWarmup: async () => true }).l.check('kid', 'video', ECENCY)).toBeNull();
+    const three = [...two, row({ ago: 3 * HOUR })];
+    expect((await limiter(three, { publishQuota, isWarmup: async () => true }).l.check('kid', 'video', ECENCY))!.body)
+      .toMatchObject({ plan: 'warmup', limit: 3, error: 'Daily video upload limit reached' });
+  });
+
+  it('is off when the limits or the check are off, and while free uploads are capped (the upload cap applies instead)', async () => {
+    const publishQuota = vi.fn(async () => blocked());
+    expect(await limiter([], { publishQuota }, cfg({ enabled: false })).l.check('alice', 'video', ECENCY)).toBeNull();
+    expect(await limiter([], { publishQuota }, cfg({ publishCheckEnabled: false })).l.check('alice', 'video', ECENCY)).toBeNull();
+    expect(publishQuota).not.toHaveBeenCalled();
+    // Capped: one upload in the window is the free cap, no publish lookup.
+    const { l } = limiter([row({ ago: HOUR })], { publishQuota }, capped());
+    expect((await l.check('alice', 'video', ECENCY))!.body).toMatchObject({ error: 'Daily video upload limit reached', used: 1 });
+    expect(await limiter([], { publishQuota }, capped()).l.check('alice', 'video', ECENCY)).toBeNull();
+    expect(publishQuota).not.toHaveBeenCalled();
+    // No lookup wired: never checked.
+    expect(limiter([]).l.checksPublishFor('ecency')).toBe(false);
+  });
+
+  describe('quota', () => {
+    it('reports the free plan from the checker for each kind through another app', async () => {
+      const publishQuota = vi.fn(async (_o: string, kind: string) => kind === 'video' ? blocked({ used: 1 }) : open({ limit: 3, used: 1 }));
+      const { l } = limiter([row({ ago: HOUR })], { publishQuota });
+      expect(await l.quota('alice', { app: 'peakd' })).toEqual({
+        enabled: true, exempt: false, reason: null, plan: 'free',
+        video: { limit: 1, used: 1, remaining: 0, next_at: NEXT },
+        short: { limit: 3, used: 1, remaining: 2, next_at: null },
+      });
+      // The 3speak key keeps the exempt answer.
+      expect(await l.quota('alice', { app: '3speak' })).toMatchObject({ exempt: true, reason: 'publish_limit' });
+      expect(await l.quota('alice')).toMatchObject({ exempt: true, reason: 'publish_limit' });
+      expect(publishQuota).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the exempt answer when a lookup cannot answer or the checker limits neither kind', async () => {
+      const once = (a: PublishAnswer | null, b: PublishAnswer | null) => async (_o: string, k: string) => (k === 'video' ? a : b);
+      expect(await limiter([], { publishQuota: once(blocked(), null) }).l.quota('a', { app: 'x' })).toMatchObject({ exempt: true, reason: 'publish_limit' });
+      expect(await limiter([], { publishQuota: async () => { throw new Error('x'); } }).l.quota('a', { app: 'x' })).toMatchObject({ reason: 'publish_limit' });
+      expect(await limiter([], { publishQuota: once(open({ limit: null }), open({ limit: null })) }).l.quota('a', { app: 'x' }))
+        .toMatchObject({ reason: 'publish_limit' });
+      // One kind unlimited: that one shows no limit.
+      expect((await limiter([], { publishQuota: once(open({ limit: null, used: 2 }), open({ limit: 3 })) }).l.quota('a', { app: 'x' })).video)
+        .toEqual({ limit: null, used: 2, remaining: null, next_at: null });
+    });
+
+    it('leaves Pro, listed, warm-up and unknown owners on their usual answers', async () => {
+      const publishQuota = async () => blocked();
+      expect((await limiter([], { publishQuota, isUserPremium: async () => true }).l.quota('p', { app: 'x' })).reason).toBe('pro');
+      expect((await limiter([], { publishQuota }, cfg({ exempt: ['v'] })).l.quota('v', { app: 'x' })).reason).toBe('listed');
+      expect((await limiter([], { publishQuota, isWarmup: async () => true }).l.quota('k', { app: 'x' })).plan).toBe('warmup');
+      expect((await limiter([], { publishQuota, isWarmup: async () => null }).l.quota('k', { app: 'x' })).reason).toBe('publish_limit');
+    });
+  });
+});
+
+describe('parsePublishQuota', () => {
+  const base = { success: true, enabled: true, exempt: false, kind: 'video', limit: 1, window_hours: 24, at: NEXT };
+
+  it('reads a refusal and an allowance', () => {
+    expect(parsePublishQuota({ ...base, allowed: false, conflicts: [{ permlink: 'a' }], next_free_at: NEXT }, 9))
+      .toEqual({ allowed: false, limit: 1, used: 1, nextMs: Date.parse(NEXT), windowHours: 24 });
+    expect(parsePublishQuota({ ...base, allowed: true, conflicts: [], next_free_at: null }, 9))
+      .toEqual({ allowed: true, limit: 1, used: 0, nextMs: null, windowHours: 24 });
+  });
+
+  it('fills gaps: no conflicts means a full window, no limit means the fallback', () => {
+    expect(parsePublishQuota({ allowed: false }, 3)).toEqual({ allowed: false, limit: 3, used: 3, nextMs: null, windowHours: 24 });
+    expect(parsePublishQuota({ allowed: false, limit: 2, conflicts: [], window_hours: 12, next_free_at: 'soon' }, 3))
+      .toEqual({ allowed: false, limit: 2, used: 2, nextMs: null, windowHours: 12 });
+  });
+
+  it('treats exempt or switched off as no limit', () => {
+    expect(parsePublishQuota({ ...base, exempt: true, reason: 'pro', allowed: true }, 1)).toMatchObject({ allowed: true, limit: null });
+    expect(parsePublishQuota({ enabled: false, allowed: true }, 1)).toMatchObject({ allowed: true, limit: null });
+  });
+
+  it('rejects anything that is not an answer', () => {
+    for (const b of [null, 'nope', 42, {}, { allowed: 'false' }, { success: false, allowed: false }]) {
+      expect(parsePublishQuota(b, 1)).toBeNull();
+    }
+  });
+});
+
+describe('createPublishQuotaLookup', () => {
+  const c = { publishCheckUrl: 'http://checker.test', videosPerDay: 1, shortsPerDay: 3 };
+  const answer = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
+
+  it('asks the checker per owner and kind and caches answers for the ttl', async () => {
+    let t = 1000;
+    const f = vi.fn(async () => answer({ success: true, enabled: true, exempt: false, limit: 1, allowed: false, conflicts: [{}], next_free_at: NEXT }));
+    const lookup = createPublishQuotaLookup(c, f as any, 30_000, 3000, () => t);
+    expect(await lookup('@Alice', 'video')).toMatchObject({ allowed: false, nextMs: Date.parse(NEXT) });
+    expect(f).toHaveBeenCalledWith('http://checker.test/publish-quota/alice?kind=video', expect.objectContaining({ method: 'GET' }));
+    await lookup('alice', 'video');
+    expect(f).toHaveBeenCalledTimes(1);
+    await lookup('alice', 'short');
+    expect(f).toHaveBeenLastCalledWith('http://checker.test/publish-quota/alice?kind=short', expect.anything());
+    expect(f).toHaveBeenCalledTimes(2);
+    t += 30_001;
+    await lookup('alice', 'video');
+    expect(f).toHaveBeenCalledTimes(3);
+    expect(await lookup('', 'video')).toBeNull();
+    expect(f).toHaveBeenCalledTimes(3);
+  });
+
+  it('fails open on errors, non-200 and garbage, caching the miss and warning at most once a minute', async () => {
+    let t = 0;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const f = vi.fn()
+      .mockRejectedValueOnce(new Error('ECONNREFUSED'))
+      .mockResolvedValueOnce(answer({ error: 'x' }, 503))
+      .mockResolvedValueOnce(answer({ success: true }))
+      .mockResolvedValueOnce(answer({ allowed: true, limit: 1, conflicts: [] }));
+    const lookup = createPublishQuotaLookup(c, f as any, 30_000, 3000, () => t);
+    expect(await lookup('a', 'video')).toBeNull();
+    expect(await lookup('a', 'video')).toBeNull(); // cached miss
+    expect(f).toHaveBeenCalledTimes(1);
+    expect(await lookup('b', 'video')).toBeNull();
+    expect(await lookup('c', 'video')).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    t += 60_000;
+    expect(await lookup('d', 'video')).toMatchObject({ allowed: true });
+    // The cached miss expired: asked again (no answer left), and a minute on it is logged again.
+    expect(await lookup('a', 'video')).toBeNull();
+    expect(f).toHaveBeenCalledTimes(5);
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
+  it('gives up after the timeout', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const f = vi.fn((_u: string, init: any) => new Promise((_r, reject) => {
+      init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+    }));
+    const lookup = createPublishQuotaLookup(c, f as any, 30_000, 20);
+    expect(await lookup('slow', 'video')).toBeNull();
+    warn.mockRestore();
+  });
+});
+
 describe('UploadLimiter.upgradeUrl', () => {
   it('fills {owner} and {user} and encodes the name', () => {
     expect(limiter([]).l.upgradeUrl('a b')).toBe('https://3speak.tv/wallet/a%20b#pro');
@@ -484,6 +690,25 @@ describe('getUploadLimiter', () => {
     const off = getUploadLimiter(database, { uploadLimits: undefined } as any);
     expect(off.enabled).toBe(false);
     expect(await off.exemptReason('quinn')).toBe('pro');
+  });
+
+  it('wires the publish lookup to the configured checker', async () => {
+    const saved = (globalThis as any).fetch;
+    const f = vi.fn(async (url: string) => ({
+      ok: true, status: 200,
+      json: async () => (url.includes('/publish-quota/')
+        ? { success: true, enabled: true, exempt: false, limit: 1, allowed: false, conflicts: [{}], next_free_at: NEXT }
+        : { authors: {} }),
+    }));
+    (globalThis as any).fetch = f;
+    try {
+      const database: any = { getRecentCountedUploads: async () => [], isUserPremium: async () => false, streamRecordExists: async () => false };
+      const l = getUploadLimiter(database, { uploadLimits: cfg({ publishCheckUrl: 'http://pq.test' }) } as any);
+      expect((await l.check('sam', 'video', { app: 'ecency' }))!.body).toMatchObject({ next_at: NEXT, plan: 'free' });
+      expect(f).toHaveBeenCalledWith('http://pq.test/publish-quota/sam?kind=video', expect.anything());
+    } finally {
+      (globalThis as any).fetch = saved;
+    }
   });
 
   it('falls back to "unknown" warm-up status without a config', async () => {

@@ -17,3 +17,6 @@ process.env.BASE_URL ??= 'https://play.test/embed';
 process.env.IPFS_API_ADDR ??= 'http://127.0.0.1:5999';
 process.env.CLEANUP_ENABLED ??= 'false';
 process.env.DISPATCHER_ENABLED ??= 'false';
+// No test asks the real checker for a publish quota. Files that test the
+// publish limit for other apps switch it on and stub the checker.
+process.env.UPLOAD_PUBLISH_CHECK_ENABLED ??= 'false';
