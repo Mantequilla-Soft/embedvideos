@@ -14,11 +14,16 @@ const HOUR = 60 * 60 * 1000;
 
 function cfg(over: Partial<UploadLimitsConfig> = {}): UploadLimitsConfig {
   return {
-    enabled: true, videosPerDay: 1, shortsPerDay: 3, warmupVideosPerDay: 3, warmupShortsPerDay: 3, exempt: [],
+    enabled: true, freeUploadsCapped: false, videosPerDay: 1, shortsPerDay: 3, warmupVideosPerDay: 3, warmupShortsPerDay: 3, exempt: [],
     warmupLookupUrl: 'http://checker.test/incubation/authors',
     hiveApiNodes: ['http://hive-a.test', 'http://hive-b.test'],
     upgradeUrl: '', ...over,
   };
+}
+
+/** UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true: free Hive accounts held to the free plan's upload cap again. */
+function capped(over: Partial<UploadLimitsConfig> = {}): UploadLimitsConfig {
+  return cfg({ freeUploadsCapped: true, ...over });
 }
 
 function row(over: Partial<CountedUploadRow> & { ago: number }): CountedUploadRow {
@@ -57,9 +62,27 @@ describe('UploadLimiter.check', () => {
     expect(deps.getRecentCountedUploads).toHaveBeenCalledWith('alice', new Date(NOW - DAY_MS));
   });
 
-  it('refuses an owner at the limit with the documented 429 body', async () => {
+  it('never caps a free Hive account by default (it is limited when publishing)', async () => {
+    const rows = [1, 2, 3, 4].flatMap((h) => [row({ ago: h * HOUR }), row({ ago: h * HOUR, short: true })]);
+    const hiveAccountCreatedAt = vi.fn(async () => 0);
+    const { l, deps } = limiter(rows, { hiveAccountCreatedAt });
+    expect(l.freeUploadsCapped).toBe(false);
+    expect(await l.check('alice', 'video')).toBeNull();
+    expect(await l.check('alice', 'short')).toBeNull();
+    expect(deps.isWarmup).toHaveBeenCalledWith('alice');
+    // No free row is counted, so the account age is never asked for.
+    expect(hiveAccountCreatedAt).not.toHaveBeenCalled();
+    // Under the warm-up limit nothing is looked up at all.
+    const { l: few, deps: fewDeps } = limiter([row({ ago: HOUR }), row({ ago: 2 * HOUR })]);
+    expect(await few.check('alice', 'video')).toBeNull();
+    expect(fewDeps.isUserPremium).not.toHaveBeenCalled();
+    expect(fewDeps.isWarmup).not.toHaveBeenCalled();
+  });
+
+  it('refuses a free owner at the limit with the documented 429 body while capped', async () => {
     const first = row({ ago: 3 * HOUR });
-    const { l } = limiter([first]);
+    const { l } = limiter([first], {}, capped());
+    expect(l.freeUploadsCapped).toBe(true);
     const r = await l.check('alice', 'video');
     expect(r).not.toBeNull();
     expect(r!.status).toBe(429);
@@ -75,7 +98,7 @@ describe('UploadLimiter.check', () => {
 
   it('computes the next slot from the oldest upload still holding a slot', async () => {
     const times = [20, 10, 2].map((h) => row({ ago: h * HOUR, short: true }));
-    const { l } = limiter(times, {}, cfg({ shortsPerDay: 2 }));
+    const { l } = limiter(times, {}, capped({ shortsPerDay: 2 }));
     const r = await l.check('bob', 'short');
     expect(r!.body.used).toBe(3);
     // Sorted [t-20h, t-10h, t-2h], limit 2: the slot frees when t-10h leaves the window.
@@ -84,7 +107,7 @@ describe('UploadLimiter.check', () => {
   });
 
   it('with a limit of 0 refuses without a next slot time', async () => {
-    const { l } = limiter([], {}, cfg({ videosPerDay: 0 }));
+    const { l } = limiter([], {}, capped({ videosPerDay: 0 }));
     const r = await l.check('carol', 'video');
     expect(r!.body.next_at).toBeNull();
     expect(r!.body.retry_after_seconds).toBeNull();
@@ -94,10 +117,13 @@ describe('UploadLimiter.check', () => {
 
   it('exempts listed owners (case and @ insensitive) and Pro owners', async () => {
     const rows = [row({ ago: HOUR })];
-    expect(await limiter(rows, {}, cfg({ exempt: ['dave'] })).l.check('@Dave ', 'video')).toBeNull();
-    expect(await limiter(rows, { isUserPremium: async () => true }).l.check('erin', 'video')).toBeNull();
+    expect(await limiter(rows, {}, capped({ exempt: ['dave'] })).l.check('@Dave ', 'video')).toBeNull();
+    expect(await limiter(rows, { isUserPremium: async () => true }, capped()).l.check('erin', 'video')).toBeNull();
     // Warm-up lookup that cannot answer: fail open.
-    expect(await limiter(rows, { isWarmup: async () => null }).l.check('gina', 'video')).toBeNull();
+    expect(await limiter(rows, { isWarmup: async () => null }, capped()).l.check('gina', 'video')).toBeNull();
+    const three = [row({ ago: HOUR }), row({ ago: HOUR }), row({ ago: HOUR })];
+    expect(await limiter(three, { isUserPremium: async () => true, isWarmup: async () => true }).l.check('erin', 'video')).toBeNull();
+    expect(await limiter(three, { isWarmup: async () => null }).l.check('gina', 'video')).toBeNull();
   });
 
   it('holds a warm-up account to its own limit (3 videos, 3 shorts) without Pro in the message', async () => {
@@ -119,29 +145,29 @@ describe('UploadLimiter.check', () => {
     const created = NOW - 3 * HOUR;
     // Same name: uploads from before the Hive account existed were the warm-up's.
     const sameName = [row({ ago: 10 * HOUR }), row({ ago: 5 * HOUR }), row({ ago: 4 * HOUR })];
-    const { l, deps } = limiter(sameName, { hiveAccountCreatedAt: vi.fn(async () => created) });
+    const { l, deps } = limiter(sameName, { hiveAccountCreatedAt: vi.fn(async () => created) }, capped());
     expect(await l.check('grad', 'video')).toBeNull();
     expect(deps.hiveAccountCreatedAt).toHaveBeenCalledWith('grad');
     // Its first own upload after that uses the one free slot as usual.
     const after = [...sameName, row({ ago: HOUR })];
-    const r = await limiter(after, { hiveAccountCreatedAt: async () => created }).l.check('grad', 'video');
+    const r = await limiter(after, { hiveAccountCreatedAt: async () => created }, capped()).l.check('grad', 'video');
     expect(r!.body).toMatchObject({ plan: 'free', limit: 1, used: 1, next_at: isoSeconds(NOW - HOUR + DAY_MS) });
     // Claimed from another handle: skipped whatever its age.
     const claimed = [row({ ago: HOUR, owner_claimed_from: 'old-handle' }), row({ ago: HOUR, owner_claimed_from: 'old-handle' })];
-    expect(await limiter(claimed, { hiveAccountCreatedAt: async () => NOW - DAY_MS * 30 }).l.check('grad', 'video')).toBeNull();
+    expect(await limiter(claimed, { hiveAccountCreatedAt: async () => NOW - DAY_MS * 30 }, capped()).l.check('grad', 'video')).toBeNull();
     // No such Hive account (and not a warm-up) or no age lookup: every row counts.
-    expect(await limiter(sameName, { hiveAccountCreatedAt: async () => null }).l.check('grad', 'video')).not.toBeNull();
-    expect(await limiter(sameName).l.check('grad', 'video')).not.toBeNull();
+    expect(await limiter(sameName, { hiveAccountCreatedAt: async () => null }, capped()).l.check('grad', 'video')).not.toBeNull();
+    expect(await limiter(sameName, {}, capped()).l.check('grad', 'video')).not.toBeNull();
     // The age lookup failing: fail open.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    expect(await limiter(sameName, { hiveAccountCreatedAt: async () => { throw new Error('hive down'); } }).l.check('grad', 'video')).toBeNull();
+    expect(await limiter(sameName, { hiveAccountCreatedAt: async () => { throw new Error('hive down'); } }, capped()).l.check('grad', 'video')).toBeNull();
     warn.mockRestore();
   });
 
   it('fails open when a lookup throws', async () => {
     const { l } = limiter([], { getRecentCountedUploads: async () => { throw new Error('mongo down'); } });
     expect(await l.check('hank', 'video')).toBeNull();
-    const { l: l2 } = limiter([row({ ago: HOUR })], { isUserPremium: async () => { throw new Error('boom'); } });
+    const { l: l2 } = limiter([row({ ago: HOUR })], { isUserPremium: async () => { throw new Error('boom'); } }, capped());
     expect(await l2.check('hank', 'video')).toBeNull();
   });
 });
@@ -194,8 +220,21 @@ describe('UploadLimiter.quota and exemptReason', () => {
     });
   });
 
-  it('reports remaining slots and the next slot time', async () => {
-    const { l } = limiter([row({ ago: 4 * HOUR }), row({ ago: HOUR, short: true })]);
+  it('reports a free Hive account exempt (publish_limit) by default, with its uploads counted', async () => {
+    const hiveAccountCreatedAt = vi.fn(async () => 0);
+    const { l } = limiter([row({ ago: 4 * HOUR }), row({ ago: HOUR, short: true })], { hiveAccountCreatedAt });
+    expect(await l.quota('jo')).toEqual({
+      enabled: true, exempt: true, reason: 'publish_limit', plan: null,
+      video: { limit: null, used: 1, remaining: null, next_at: null },
+      short: { limit: null, used: 1, remaining: null, next_at: null },
+    });
+    expect(hiveAccountCreatedAt).not.toHaveBeenCalled();
+    // A warm-up lookup that cannot answer: no limit is shown (the upload is let through then too).
+    expect((await limiter([], { isWarmup: async () => null }).l.quota('jo')).reason).toBe('publish_limit');
+  });
+
+  it('reports remaining slots and the next slot time while capped', async () => {
+    const { l } = limiter([row({ ago: 4 * HOUR }), row({ ago: HOUR, short: true })], {}, capped());
     const q = await l.quota('jo');
     expect(q.enabled).toBe(true);
     expect(q.exempt).toBe(false);
@@ -211,29 +250,37 @@ describe('UploadLimiter.quota and exemptReason', () => {
     const pro = await limiter(rows, { isUserPremium: async () => true }).l.quota('kim');
     expect(pro).toMatchObject({ exempt: true, reason: 'pro', plan: null, video: { limit: null, used: 1, remaining: null, next_at: null } });
     expect(await limiter(rows, { isWarmup: async () => true }).l.exemptReason('kim')).toBeNull();
-    expect(await limiter(rows, { isWarmup: async () => null }).l.exemptReason('kim')).toBeNull();
+    expect(await limiter(rows, { isWarmup: async () => false }).l.exemptReason('kim')).toBe('publish_limit');
+    expect(await limiter(rows, { isWarmup: async () => null }).l.exemptReason('kim')).toBe('publish_limit');
+    // Capped, a free account is not exempt, nor one the warm-up lookup cannot place.
+    expect(await limiter(rows, { isWarmup: async () => false }, capped()).l.exemptReason('kim')).toBeNull();
+    expect(await limiter(rows, { isWarmup: async () => null }, capped()).l.exemptReason('kim')).toBeNull();
   });
 
-  it('reports the warm-up plan with its own limits', async () => {
-    const q = await limiter([row({ ago: 2 * HOUR }), row({ ago: HOUR, short: true })], { isWarmup: async () => true }).l.quota('kid');
-    expect(q).toEqual({
+  it('reports the warm-up plan with its own limits, capped or not', async () => {
+    const rows = [row({ ago: 2 * HOUR }), row({ ago: HOUR, short: true })];
+    const expected = {
       enabled: true, exempt: false, reason: null, plan: 'warmup',
       video: { limit: 3, used: 1, remaining: 2, next_at: null },
       short: { limit: 3, used: 1, remaining: 2, next_at: null },
-    });
+    };
+    const { l, deps } = limiter(rows, { isWarmup: vi.fn(async () => true) });
+    expect(await l.quota('kid')).toEqual(expected);
+    expect(deps.isWarmup).toHaveBeenCalledTimes(1);
+    expect(await limiter(rows, { isWarmup: async () => true }, capped()).l.quota('kid')).toEqual(expected);
   });
 
   it('leaves the warm-up backlog out of a graduate\'s counters', async () => {
     const rows = [row({ ago: 6 * HOUR }), row({ ago: 5 * HOUR, owner_claimed_from: 'kid' }), row({ ago: HOUR, short: true })];
-    const q = await limiter(rows, { hiveAccountCreatedAt: async () => NOW - 2 * HOUR }).l.quota('grad');
+    const q = await limiter(rows, { hiveAccountCreatedAt: async () => NOW - 2 * HOUR }, capped()).l.quota('grad');
     expect(q.plan).toBe('free');
     expect(q.video).toEqual({ limit: 1, used: 0, remaining: 1, next_at: null });
     expect(q.short).toEqual({ limit: 3, used: 1, remaining: 2, next_at: null });
     // Lookups that cannot answer: the free plan over every unclaimed row.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const unknown = await limiter(rows, { hiveAccountCreatedAt: async () => { throw new Error('x'); } }).l.quota('grad');
+    const unknown = await limiter(rows, { hiveAccountCreatedAt: async () => { throw new Error('x'); } }, capped()).l.quota('grad');
     expect(unknown).toMatchObject({ plan: 'free', video: { used: 1 } });
-    expect((await limiter(rows, { isWarmup: async () => null }).l.quota('grad')).video.used).toBe(1);
+    expect((await limiter(rows, { isWarmup: async () => null }, capped()).l.quota('grad')).video.used).toBe(1);
     warn.mockRestore();
   });
 
@@ -421,7 +468,7 @@ describe('getUploadLimiter', () => {
       isUserPremium: vi.fn(async () => true),
       streamRecordExists: vi.fn(async () => false),
     };
-    const config: any = { uploadLimits: cfg({ exempt: [] }) };
+    const config: any = { uploadLimits: capped({ exempt: [] }) };
     const a = getUploadLimiter(database, config);
     expect(getUploadLimiter(database, config)).toBe(a);
     expect(await a.check('quinn', 'video')).toBeNull();
@@ -442,6 +489,8 @@ describe('getUploadLimiter', () => {
   it('falls back to "unknown" warm-up status without a config', async () => {
     const database: any = { isUserPremium: async () => false };
     const l = getUploadLimiter(database, { uploadLimits: undefined } as any);
-    expect(await l.exemptReason('rae')).toBeNull();
+    // Unknown is not a warm-up, and free uploads are not capped without a config.
+    expect(l.freeUploadsCapped).toBe(false);
+    expect(await l.exemptReason('rae')).toBe('publish_limit');
   });
 });

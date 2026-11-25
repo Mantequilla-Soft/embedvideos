@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { installFetchStub, owner, rawDb, seedVideo } from './helpers';
 import { api, loadApp, makeApiKey } from '../helpers/app';
 import { verifyUploadToken } from '../../src/utils/uploadToken';
@@ -172,35 +172,12 @@ describe('POST /uploads/token', () => {
   });
 
   describe('daily upload limit', () => {
-    it('refuses a free owner at the limit with 429 and Retry-After', async () => {
+    it('never caps a free Hive account by default', async () => {
       const who = owner();
-      await seedVideo(database, who, { agoMs: 2 * 60 * 60 * 1000 });
-      const res = await token({ owner: who });
-      expect(res.status).toBe(429);
-      expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', limit: 1, used: 1, error: 'Daily video upload limit reached' });
-      expect(Number(res.headers['retry-after'])).toBe(res.body.retry_after_seconds);
-      expect(res.body.retry_after_seconds).toBeGreaterThan(21 * 3600);
-      expect(res.body.upgrade_url).toBe(`https://3speak.tv/wallet/${who}#pro`);
-      // A short still has its own allowance.
-      expect((await token({ owner: who, short: true })).status).toBe(201);
-    });
-
-    it('counts shorts separately (3 per day)', async () => {
-      const who = owner();
-      for (let i = 0; i < 3; i++) await seedVideo(database, who, { short: true });
-      const res = await token({ owner: who, short: true });
-      expect(res.status).toBe(429);
-      expect(res.body).toMatchObject({ kind: 'short', limit: 3, used: 3 });
+      for (let i = 0; i < 4; i++) await seedVideo(database, who);
+      for (let i = 0; i < 4; i++) await seedVideo(database, who, { short: true });
       expect((await token({ owner: who })).status).toBe(201);
-    });
-
-    it('exempts Pro and listed owners', async () => {
-      const pro = owner('pro');
-      await makePro(pro);
-      await seedVideo(database, pro);
-      expect((await token({ owner: pro })).status).toBe(201);
-      await seedVideo(database, 'vipowner');
-      expect((await token({ owner: 'vipowner' })).status).toBe(201);
+      expect((await token({ owner: who, short: true })).status).toBe(201);
     });
 
     it('holds warm-up owners to 3 videos and 3 shorts a day', async () => {
@@ -217,51 +194,87 @@ describe('POST /uploads/token', () => {
       expect((await token({ owner: 'warmupfull', short: true })).body).toMatchObject({ plan: 'warmup', kind: 'short', limit: 3 });
     });
 
-    it('does not count the warm-up backlog against the new Hive account', async () => {
-      // Uploaded while still a warm-up: under the same name before the account existed...
-      for (let i = 0; i < 3; i++) await seedVideo(database, 'gradkid', { agoMs: (5 + i) * 3600 * 1000 });
-      // ...and claimed from another handle by the checker at graduation.
-      const moved = owner('moved');
-      for (let i = 0; i < 3; i++) await seedVideo(database, moved, { owner_claimed_from: 'oldhandle' });
-      expect((await token({ owner: 'gradkid' })).status).toBe(201);
-      expect((await token({ owner: moved })).status).toBe(201);
-      // Their own uploads since then count as usual.
-      await seedVideo(database, 'gradkid');
-      expect((await token({ owner: 'gradkid' })).body).toMatchObject({ plan: 'free', limit: 1, used: 1 });
-    });
+    describe('with free uploads capped (UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true)', () => {
+      beforeAll(() => { config.uploadLimits.freeUploadsCapped = true; });
+      afterAll(() => { config.uploadLimits.freeUploadsCapped = false; });
 
-    it('lets a verified replacement through and signs the target', async () => {
-      const who = owner();
-      const target = await seedVideo(database, who);
-      const res = await token({ owner: who, replaces: ` ${target} ` });
-      expect(res.status).toBe(201);
-      expect(res.body.replaces).toBe(target);
-      expect(claimsOf(res.body.token).replaces).toBe(target);
-    });
+      it('refuses a free owner at the limit with 429 and Retry-After', async () => {
+        const who = owner();
+        await seedVideo(database, who, { agoMs: 2 * 60 * 60 * 1000 });
+        const res = await token({ owner: who });
+        expect(res.status).toBe(429);
+        expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', limit: 1, used: 1, error: 'Daily video upload limit reached' });
+        expect(Number(res.headers['retry-after'])).toBe(res.body.retry_after_seconds);
+        expect(res.body.retry_after_seconds).toBeGreaterThan(21 * 3600);
+        expect(res.body.upgrade_url).toBe(`https://3speak.tv/wallet/${who}#pro`);
+        // A short still has its own allowance.
+        expect((await token({ owner: who, short: true })).status).toBe(201);
+      });
 
-    it('does not let someone else\'s video skip the limit', async () => {
-      const who = owner();
-      const theirs = await seedVideo(database, owner('other'));
-      await seedVideo(database, who);
-      const res = await token({ owner: who, replaces: theirs });
-      expect(res.status).toBe(429);
-      // Not at the limit: issued, but without a replacement claim.
-      const fresh = owner();
-      const ok = await token({ owner: fresh, replaces: theirs });
-      expect(ok.status).toBe(201);
-      expect(ok.body.replaces).toBeNull();
-      expect(claimsOf(ok.body.token).replaces).toBeUndefined();
-    });
+      it('counts shorts separately (3 per day)', async () => {
+        const who = owner();
+        for (let i = 0; i < 3; i++) await seedVideo(database, who, { short: true });
+        const res = await token({ owner: who, short: true });
+        expect(res.status).toBe(429);
+        expect(res.body).toMatchObject({ kind: 'short', limit: 3, used: 3 });
+        expect((await token({ owner: who })).status).toBe(201);
+      });
 
-    it('fails open on a target lookup error, without signing the claim', async () => {
-      const who = owner();
-      await seedVideo(database, who);
-      const spy = vi.spyOn(database, 'getVideo').mockRejectedValueOnce(new Error('blip'));
-      const res = await token({ owner: who, replaces: 'anything' });
-      spy.mockRestore();
-      expect(res.status).toBe(201);
-      expect(res.body.replaces).toBeNull();
-      expect(claimsOf(res.body.token).replaces).toBeUndefined();
+      it('exempts Pro and listed owners', async () => {
+        const pro = owner('pro');
+        await makePro(pro);
+        await seedVideo(database, pro);
+        expect((await token({ owner: pro })).status).toBe(201);
+        await seedVideo(database, 'vipowner');
+        expect((await token({ owner: 'vipowner' })).status).toBe(201);
+      });
+
+      it('does not count the warm-up backlog against the new Hive account', async () => {
+        // Uploaded while still a warm-up: under the same name before the account existed...
+        for (let i = 0; i < 3; i++) await seedVideo(database, 'gradkid', { agoMs: (5 + i) * 3600 * 1000 });
+        // ...and claimed from another handle by the checker at graduation.
+        const moved = owner('moved');
+        for (let i = 0; i < 3; i++) await seedVideo(database, moved, { owner_claimed_from: 'oldhandle' });
+        expect((await token({ owner: 'gradkid' })).status).toBe(201);
+        expect((await token({ owner: moved })).status).toBe(201);
+        // Their own uploads since then count as usual.
+        await seedVideo(database, 'gradkid');
+        expect((await token({ owner: 'gradkid' })).body).toMatchObject({ plan: 'free', limit: 1, used: 1 });
+      });
+
+      it('lets a verified replacement through and signs the target', async () => {
+        const who = owner();
+        const target = await seedVideo(database, who);
+        const res = await token({ owner: who, replaces: ` ${target} ` });
+        expect(res.status).toBe(201);
+        expect(res.body.replaces).toBe(target);
+        expect(claimsOf(res.body.token).replaces).toBe(target);
+      });
+
+      it('does not let someone else\'s video skip the limit', async () => {
+        const who = owner();
+        const theirs = await seedVideo(database, owner('other'));
+        await seedVideo(database, who);
+        const res = await token({ owner: who, replaces: theirs });
+        expect(res.status).toBe(429);
+        // Not at the limit: issued, but without a replacement claim.
+        const fresh = owner();
+        const ok = await token({ owner: fresh, replaces: theirs });
+        expect(ok.status).toBe(201);
+        expect(ok.body.replaces).toBeNull();
+        expect(claimsOf(ok.body.token).replaces).toBeUndefined();
+      });
+
+      it('fails open on a target lookup error, without signing the claim', async () => {
+        const who = owner();
+        await seedVideo(database, who);
+        const spy = vi.spyOn(database, 'getVideo').mockRejectedValueOnce(new Error('blip'));
+        const res = await token({ owner: who, replaces: 'anything' });
+        spy.mockRestore();
+        expect(res.status).toBe(201);
+        expect(res.body.replaces).toBeNull();
+        expect(claimsOf(res.body.token).replaces).toBeUndefined();
+      });
     });
   });
 });
@@ -278,19 +291,36 @@ describe('GET /uploads/quota', () => {
     expect((await quota('?owner=%20%20')).body).toEqual({ error: 'owner (string) is required' });
   });
 
-  it('reports a free owner\'s allowance', async () => {
+  it('reports a free Hive account exempt (publish_limit) by default', async () => {
     const who = owner();
     await seedVideo(database, who, { agoMs: 60 * 60 * 1000 });
     await seedVideo(database, who, { short: true });
     const res = await quota(`?owner=${who}`);
     expect(res.status).toBe(200);
     expect(res.headers['cache-control']).toBe('no-store');
-    expect(res.body).toMatchObject({
-      enabled: true, exempt: false, reason: null, plan: 'free',
-      video: { limit: 1, used: 1, remaining: 0 },
-      short: { limit: 3, used: 1, remaining: 2, next_at: null },
+    expect(res.body).toEqual({
+      enabled: true, exempt: true, reason: 'publish_limit', plan: null,
+      video: { limit: null, used: 1, remaining: null, next_at: null },
+      short: { limit: null, used: 1, remaining: null, next_at: null },
     });
-    expect(Date.parse(res.body.video.next_at)).toBeGreaterThan(Date.now() + 22 * 3600 * 1000);
+  });
+
+  it('reports a free owner\'s allowance while free uploads are capped', async () => {
+    const who = owner();
+    await seedVideo(database, who, { agoMs: 60 * 60 * 1000 });
+    await seedVideo(database, who, { short: true });
+    config.uploadLimits.freeUploadsCapped = true;
+    try {
+      const res = await quota(`?owner=${who}`);
+      expect(res.body).toMatchObject({
+        enabled: true, exempt: false, reason: null, plan: 'free',
+        video: { limit: 1, used: 1, remaining: 0 },
+        short: { limit: 3, used: 1, remaining: 2, next_at: null },
+      });
+      expect(Date.parse(res.body.video.next_at)).toBeGreaterThan(Date.now() + 22 * 3600 * 1000);
+    } finally {
+      config.uploadLimits.freeUploadsCapped = false;
+    }
   });
 
   it('reports exemptions', async () => {

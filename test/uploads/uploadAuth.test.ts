@@ -9,6 +9,10 @@ import type { Database } from '../../src/database/mongodb';
 // upload path (TUS pre-create, /upload/simple, /upload/chunk/create) goes through.
 
 process.env.UPLOAD_LIMIT_EXEMPT = 'listedowner';
+// The limit wiring here (token reuse, VODs, replacements) is driven through the
+// free plan's 1 video a day, so this file caps free uploads; the default (free
+// Hive accounts uncapped) has its own test below.
+process.env.UPLOAD_LIMIT_FREE_UPLOADS_CAPPED = 'true';
 const fetchStub = installFetchStub({ incubating: ['warmupkid', 'graduated'], hiveAccounts: ['graduated'] });
 
 let database: Database;
@@ -213,6 +217,24 @@ describe('daily upload limit', () => {
     await seedVideo(database, 'graduated');
     expect(await auth({ 'x-api-key': [key] }, { owner: 'graduated' })).toMatchObject({ status: 429 });
     expect(fetchStub).toHaveBeenCalled();
+  });
+
+  it('by default never caps a free Hive account, and still caps a warm-up one', async () => {
+    config.uploadLimits.freeUploadsCapped = false;
+    try {
+      const who = owner();
+      for (let i = 0; i < 4; i++) await seedVideo(database, who);
+      expect(await auth({ 'x-api-key': [key] }, { owner: who })).toMatchObject({ ok: true });
+      const t = mintToken(config.uploadTokenSecret, { owner: who, short: true });
+      for (let i = 0; i < 4; i++) await seedVideo(database, who, { short: true });
+      expect(await auth(bearer(t.token))).toMatchObject({ ok: true });
+      // `graduated` is a Hive account now: a free one, so uncapped too.
+      expect(await auth({ 'x-api-key': [key] }, { owner: 'graduated' })).toMatchObject({ ok: true });
+      for (let i = 0; i < 3; i++) await seedVideo(database, 'warmupkid');
+      expect(await auth({ 'x-api-key': [key] }, { owner: 'warmupkid' })).toMatchObject({ ok: false, status: 429, body: { plan: 'warmup', limit: 3 } });
+    } finally {
+      config.uploadLimits.freeUploadsCapped = true;
+    }
   });
 
   it('uses an injected limiter when given one', async () => {

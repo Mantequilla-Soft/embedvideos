@@ -228,13 +228,13 @@ Generates a short-lived, single-use upload token. Requires `X-API-Key` header. S
 
 ### Upload Limits
 
-Owners without 3Speak Pro may upload **1 regular video** and **3 shorts** per **rolling 24 hours**. Warm-up accounts (3Speak users with no Hive account yet) have their own limit: **3 regular videos** and **3 shorts** per rolling 24 hours. The limit is enforced by this API for every app that uses it, on every upload path: `POST /uploads/token`, TUS `POST /uploads` (token or `X-API-Key`), `POST /upload/simple` and `POST /upload/chunk/create`.
+Warm-up accounts (3Speak users with no Hive account yet) may upload **3 regular videos** and **3 shorts** per **rolling 24 hours**. Free Hive accounts (no 3Speak Pro) have **no upload cap**: their daily limit is on publishing (1 video and 3 shorts per 24 hours, by publish time), which the checker enforces when a post is scheduled, so a video over it is scheduled for a free time instead. An operator can cap their uploads again with `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true`: then they may upload **1 regular video** and **3 shorts** per rolling 24 hours. The limit is enforced by this API for every app that uses it, on every upload path: `POST /uploads/token`, TUS `POST /uploads` (token or `X-API-Key`), `POST /upload/simple` and `POST /upload/chunk/create`.
 
 - **What counts:** uploads whose bytes landed (video status `processing`, `awaiting_encode` or `published`), created in the last 24 hours. Uploads still in flight, failed uploads and deleted videos do not use a slot. Imports (YouTube, TikTok) that arrive here count like any upload.
 - **What never counts:** stream recordings (VODs) published by the 3Speak streaming server, and **media replacements** (see below).
-- **The warm-up backlog never counts for the Hive account:** when a warm-up user gets a Hive account, the uploads made under the warm-up handle become that account's (the checker's claim-assets moves them and stamps `owner_claimed_from`, or the handle already is the Hive name). Neither uses a slot of the Hive account: claimed rows are skipped, and so is every row created before the Hive account itself. Publishing the backlog to Hive afterwards uploads nothing, so it is never refused.
-- **Who is exempt:** 3Speak Pro owners and owners an operator lists in `UPLOAD_LIMIT_EXEMPT`.
-- Shorts and regular videos have separate allowances: using the 1 video does not touch the 3 shorts.
+- **The warm-up backlog never counts for the Hive account** (only matters while free uploads are capped): when a warm-up user gets a Hive account, the uploads made under the warm-up handle become that account's (the checker's claim-assets moves them and stamps `owner_claimed_from`, or the handle already is the Hive name). Neither uses a slot of the Hive account: claimed rows are skipped, and so is every row created before the Hive account itself. Publishing the backlog to Hive afterwards uploads nothing, so it is never refused.
+- **Who is exempt:** 3Speak Pro owners and owners an operator lists in `UPLOAD_LIMIT_EXEMPT`, and free Hive accounts while their uploads are not capped (the default).
+- Shorts and regular videos have separate allowances: using the videos does not touch the shorts.
 - `owner` is the name the limit is kept for (lowercased, so spelling it differently does not give a new allowance); it is not verified by this API.
 
 #### Replacing a video's media is free
@@ -255,12 +255,12 @@ Every refusal has the same body and a standard `Retry-After` header (seconds), o
   "error": "Daily video upload limit reached",
   "code": "daily_upload_limit",
   "kind": "video",
-  "plan": "free",
-  "limit": 1,
-  "used": 1,
+  "plan": "warmup",
+  "limit": 3,
+  "used": 3,
   "next_at": "2026-11-21T14:32:00Z",
   "retry_after_seconds": 68400,
-  "message": "Free accounts can upload 1 video per 24 hours. Your next video upload is possible at 2026-11-21T14:32:00Z. 3Speak Pro removes this limit.",
+  "message": "Warm-up accounts can upload 3 videos per 24 hours. Your next video upload is possible at 2026-11-21T14:32:00Z.",
   "upgrade_url": "https://3speak.tv/wallet/alice#pro"
 }
 ```
@@ -271,7 +271,7 @@ Every refusal has the same body and a standard `Retry-After` header (seconds), o
 | `error` | Short text, stable. |
 | `message` | Full English sentence, safe to show to the user as is. |
 | `kind` | `video` or `short`: which allowance is used up. |
-| `plan` | `free` (a Hive account without Pro) or `warmup` (a warm-up account). A warm-up refusal's `message` does not mention Pro: Pro needs a Hive account. |
+| `plan` | `warmup` (a warm-up account) or `free` (a Hive account without Pro, only while free uploads are capped). A warm-up refusal's `message` does not mention Pro: Pro needs a Hive account; a free one ends with "3Speak Pro removes this limit." |
 | `limit` / `used` | The allowance and how many counted uploads are in the window. |
 | `next_at` | ISO 8601 (UTC, no milliseconds): when the next slot frees, i.e. when the oldest counted upload turns 24 hours old. |
 | `retry_after_seconds` | Seconds until `next_at`; same value as the `Retry-After` header. |
@@ -294,14 +294,27 @@ Requires `X-API-Key`. Lets a frontend show "1 short left today" before the user 
   "enabled": true,
   "exempt": false,
   "reason": null,
-  "plan": "free",
-  "video": { "limit": 1, "used": 1, "remaining": 0, "next_at": "2026-11-21T14:32:00Z" },
+  "plan": "warmup",
+  "video": { "limit": 3, "used": 3, "remaining": 0, "next_at": "2026-11-21T14:32:00Z" },
   "short": { "limit": 3, "used": 1, "remaining": 2, "next_at": null }
 }
 ```
 
-- `reason`: `"pro"` or `"listed"` when `exempt` is true, else `null`.
-- `plan`: `"free"` or `"warmup"` (3 videos + 3 shorts by default) when not exempt, else `null`. If the warm-up registry cannot answer, `"free"` is reported, but uploads are let through.
+A free Hive account (uploads not capped, the default):
+
+```json
+{
+  "enabled": true,
+  "exempt": true,
+  "reason": "publish_limit",
+  "plan": null,
+  "video": { "limit": null, "used": 1, "remaining": null, "next_at": null },
+  "short": { "limit": null, "used": 0, "remaining": null, "next_at": null }
+}
+```
+
+- `reason`: `"pro"`, `"listed"` or `"publish_limit"` (a free Hive account, limited when publishing instead) when `exempt` is true, else `null`. If the warm-up registry cannot answer, `"publish_limit"` is reported and uploads are let through.
+- `plan`: `"warmup"` (3 videos + 3 shorts by default), or `"free"` while free uploads are capped, when not exempt, else `null`. While capped, if the warm-up registry cannot answer, `"free"` is reported, but uploads are let through.
 - For an exempt owner `limit`, `remaining` and `next_at` are `null` (unlimited); `used` is still reported.
 - `next_at` is `null` while `remaining` is above 0.
 - When limits are switched off: `{ "enabled": false, "exempt": true, "reason": null, "plan": null, ... }` with `null` limits.
@@ -312,8 +325,9 @@ Requires `X-API-Key`. Lets a frontend show "1 short left today" before the user 
 | Env | Default | |
 |---|---|---|
 | `UPLOAD_DAILY_LIMITS_ENABLED` | on | Set to `false` to switch the limits off. |
-| `UPLOAD_LIMIT_VIDEOS_PER_DAY` | `1` | Regular videos per rolling 24 hours. |
-| `UPLOAD_LIMIT_SHORTS_PER_DAY` | `3` | Shorts per rolling 24 hours. |
+| `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED` | off | Set to `true` to cap free Hive accounts' uploads again (the two limits below). Off: they are only limited when publishing (checker). |
+| `UPLOAD_LIMIT_VIDEOS_PER_DAY` | `1` | Regular videos per rolling 24 hours for a free Hive account, while capped. |
+| `UPLOAD_LIMIT_SHORTS_PER_DAY` | `3` | Shorts per rolling 24 hours for a free Hive account, while capped. |
 | `UPLOAD_LIMIT_WARMUP_VIDEOS_PER_DAY` | `3` | Regular videos per rolling 24 hours for a warm-up account. |
 | `UPLOAD_LIMIT_WARMUP_SHORTS_PER_DAY` | `3` | Shorts per rolling 24 hours for a warm-up account. |
 | `UPLOAD_LIMIT_EXEMPT` | empty | Comma list of owners who are never limited. |
