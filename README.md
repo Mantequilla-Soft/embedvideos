@@ -1,254 +1,442 @@
-# 3Speak Embed Video Upload Service
+<h1 align="center">3Speak Embed Video Upload</h1>
 
-A modern, scalable video upload and encoding service with TUS resumable uploads, IPFS storage, multi-encoder support, and MongoDB job tracking. Built for the 3Speak decentralized video platform.
+<p align="center">
+  <strong>Resumable video uploads, encoding and an embeddable player for any Hive frontend or website.</strong><br>
+  Upload with tus, get the embed URL before the first byte moves, and let the encoders do the rest.
+</p>
 
-## Features
+<p align="center">
+  <img alt="TypeScript 5.3" src="https://img.shields.io/badge/TypeScript-5.3-3178C6">
+  <img alt="Node.js 20+" src="https://img.shields.io/badge/Node.js-20%2B-339933">
+  <img alt="Express 4.18" src="https://img.shields.io/badge/Express-4.18-000000">
+  <img alt="MongoDB driver 6" src="https://img.shields.io/badge/MongoDB-6-47A248">
+  <img alt="tusd 2.9.2" src="https://img.shields.io/badge/tusd-2.9.2-0F7DC2">
+  <img alt="Vitest 3.2" src="https://img.shields.io/badge/Vitest-3.2-6E9F18">
+  <a href="https://github.com/Mantequilla-Soft/embedvideos/actions/workflows/tests.yml"><img alt="tests" src="https://github.com/Mantequilla-Soft/embedvideos/actions/workflows/tests.yml/badge.svg"></a>
+  <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-blue">
+</p>
 
-- **TUS Resumable Uploads**: Robust video uploads with pause/resume support
-- **Instant Embed URLs**: Get playable embed URLs immediately upon upload start
-- **IPFS Storage**: Automatic pinning to IPFS (local daemon)
-- **Multi-Encoder Support**: Round-robin load balancing across multiple encoder nodes
-- **Encoder Management**: Add, update, enable/disable encoders via admin panel or API
-- **Job Dispatcher**: Automatic job queuing and distribution to available encoders
-- **Webhook Callbacks**: Secure encoder-to-service communication for status updates
-- **MongoDB Integration**: Tracks videos, jobs, and API keys
-- **Upload Tokens**: Short-lived, signed tokens for secure client-side uploads without exposing API keys
-- **Encoding Progress**: Real-time encoding progress tracking via polling
-- **API Key Management**: Secure admin panel for managing application access
-- **RESTful API**: Simple endpoints for video metadata and management
+---
 
-## Prerequisites
+This is the upload and encoding service behind 3Speak videos. Any app (a Hive frontend, a
+mobile app, a plain website) can hand a video file to it and get back a player URL such as
+`https://play.3speak.tv/embed?v=badadib/yn77aj9g` that works the moment the upload starts:
+the player shows an uploading or processing state until the encoded HLS stream is ready.
 
-- Node.js v20 or higher
-- MongoDB 6.0+
-- IPFS daemon (for local pinning) or access to IPFS gateway
-- npm or yarn
-- One or more encoder nodes (see [3speak-encoder](https://github.com/Mantequilla-Soft/3speakencoder))
+The hard parts stay on this side. Uploads are resumable ([tus](https://tus.io), with
+parallel chunks), and there are single-request and chunked fallbacks for networks that
+block tus. Finished files are pinned to IPFS and queued for encoding on a pool of encoder
+nodes, from 3Speak-run machines to community encoders that pull work on their own. Your
+app needs one API key, kept on your server, and never has to run ffmpeg, IPFS or a job
+queue.
 
-## Installation
+## Contents
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd 3speakembed
+- [How it works](#how-it-works)
+- [Use it in your app](#use-it-in-your-app): [token](#1-get-an-upload-token-server-side) · [upload](#2-upload-from-the-browser) · [poll](#3-track-progress) · [embed](#4-embed-the-video) · [link the post](#5-link-the-hive-post-optional)
+- [Quick start](#quick-start) (run your own instance)
+- [Configuration](#configuration)
+- [Reference](#reference): [auth](#authentication) · [uploads](#uploads) · [videos](#videos) · [upload limits](#daily-upload-limits) · [service](#service-and-encoders) · [admin](#admin)
+- [Development and tests](#development-and-tests)
+- [Repository layout](#repository-layout)
+- [Security notes](#security-notes)
+- [Contributing](#contributing)
+
+## How it works
+
+```
+ your backend ── POST /uploads/token (X-API-Key) ──▶ embedvideos ──▶ MongoDB (video row: uploading)
+      │ token, permlink, embed_url                       │
+      ▼                                                  │ /uploads is proxied to tusd on 127.0.0.1
+ browser ── tus upload (Bearer token) ──────────────────▶│ tusd hooks: pre-create (auth, limits)
+                                                         │             post-finish (async)
+                                                         ▼
+                                         pin to local IPFS, announce, create job (processing)
+                                                         │
+                     job dispatcher, every 30 s ─────────┤
+                       managed encoders: POST {url}/encode (push)
+                       community encoders: poll /api/v0/gateway/myJob (pull)
+                                                         │
+                     encoder ── POST /webhook (manifest_cid) ──▶ video row: published
+                                                         │
+ viewer ◀── https://play.3speak.tv/embed?v=owner/permlink (player, separate project)
 ```
 
-2. Install dependencies:
-```bash
-npm install
+1. **Upload starts.** The `pre-create` hook checks the API key or upload token, the owner's
+   ban flag and the daily upload limit, then creates the video row (`uploading`). The embed
+   URL is known at this point, so the client can show or post it right away.
+2. **Upload finishes.** tusd answers the client first. Then, in the background, the file is
+   pinned to the local IPFS daemon, its CID is announced to the DHT, an encoding job is
+   created (`pending`) and the temp file is removed. The video row moves to `processing`.
+3. **Encoding.** The dispatcher picks an encoder by tier (premium jobs prefer
+   `performance` encoders, free jobs `standard`, shorts any managed encoder). Community
+   encoders only pull free, non-short jobs. A job that fails, stalls or cannot be sent goes
+   back to `pending` and avoids the encoder that failed it; the third failed attempt fails
+   the job. Encoders report progress to `/webhook/progress` and the result to `/webhook`.
+4. **Published.** The row gets its `manifest_cid` and turns `published`; the embed URL now
+   plays the HLS stream.
+
+Paid ("gated") videos are AES-128 encrypted at encode time and only go to encoders marked
+`trusted`. See [CLAUDE.md](CLAUDE.md) for the design notes on gating, deferred encoding,
+encoder tiers and retries, and [ENCODERS.md](ENCODERS.md) for the `ENCODERS` seed format.
+
+## Use it in your app
+
+The flow below is the recommended one for web apps: the API key stays on your server and
+the browser only ever sees a short-lived, single-use upload token. The hosted instance is
+`https://embed.3speak.tv`; API keys are issued by whoever runs the instance (for
+embed.3speak.tv, ask the 3Speak team on [Discord](https://discord.gg/NSFS2VGj83)).
+
+> **This service does not verify `owner`.** Whoever holds an API key can upload under any
+> owner name. Authenticate your user (Hive Keychain, HiveSigner, your own login) on your
+> backend before you ask for a token in their name.
+
+### 1. Get an upload token (server side)
+
+```js
+// Your backend. EMBED_API_KEY never reaches the browser.
+const res = await fetch('https://embed.3speak.tv/uploads/token', {
+  method: 'POST',
+  headers: { 'X-API-Key': process.env.EMBED_API_KEY, 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    owner: 'badadib',                         // the Hive account the video belongs to
+    frontend_app: 'my-video-app',
+    short: false,                             // true for a Short (encoded at 480p)
+    allowed_origins: ['https://my-video-app.com'],
+    ttl: 600,                                 // seconds, capped by UPLOAD_TOKEN_MAX_TTL
+  }),
+});
+if (res.status === 429) { /* daily upload limit: show body.message, see below */ }
+const { token, upload_url, permlink, embed_url, expires_at } = await res.json();
+// Hand token, upload_url and embed_url to the browser.
 ```
 
-3. Create a `.env` file based on `.env.example`:
-```bash
-cp .env.example .env
+The `permlink` and `embed_url` are fixed at issuance and bound to the token, so you have
+the final embed URL before the upload starts. Full body and response:
+[POST /uploads/token](#post-uploadstoken).
+
+### 2. Upload from the browser
+
+```js
+import * as tus from 'tus-js-client';
+
+const upload = new tus.Upload(file, {
+  endpoint: upload_url,                          // from step 1
+  headers: { Authorization: `Bearer ${token}` }, // from step 1
+  metadata: { filename: file.name, filetype: file.type }, // owner/short come from the token
+  chunkSize: 10 * 1024 * 1024,
+  parallelUploads: 3,                            // tus Concatenation is enabled
+  retryDelays: [0, 1000, 3000, 5000],
+  onProgress: (sent, total) => console.log(`${((sent / total) * 100).toFixed(1)}%`),
+  onError: (err) => console.error(err),          // 429/401/403/413 carry a JSON body
+  onSuccess: () => console.log('Uploaded, now encoding:', embed_url),
+});
+upload.start();
 ```
 
-4. Configure your environment variables in `.env` (see `.env.example` for full details):
-```env
-PORT=3001
-MONGODB_URI=mongodb://user:pass@host:27017/threespeak
-ENCODERS=[{"name":"encoder1","url":"https://encoder.example.com","apiKey":"key","enabled":true}]
-WEBHOOK_API_KEY=your-secure-webhook-key
-WEBHOOK_URL=https://embed.3speak.tv/webhook
-# Optional: enable upload tokens for secure client-side uploads
-UPLOAD_TOKEN_SECRET=your-random-secret-here
-```
+With `parallelUploads`, always use the token's `embed_url`: the `X-Embed-URL` response
+header is still sent for older clients, but it can be missed on the final concatenation
+request. If tus `PATCH` requests are blocked on the user's network, fall back to
+[`/upload/simple` or the chunked endpoints](#fallback-uploads) with the same token.
 
-See [.env.example](./.env.example) for complete configuration options.
+### 3. Track progress
 
-## Usage
+`GET /video/:permlink` is public and returns the video row. Poll it every few seconds:
 
-### Development Mode
-
-```bash
-npm run dev
-```
-
-### Production Mode
-
-1. Build the project:
-```bash
-npm run build
-```
-
-2. Start the server:
-```bash
-npm start
-```
-
-## Authentication
-
-The service supports two authentication methods for uploads. Both are fully supported — choose the one that fits your architecture.
-
-### Option 1: Direct API Key (Server-to-Server / Mobile Apps)
-
-Pass the API key directly in the `X-API-Key` header. This is the simplest integration and is appropriate when:
-- Your uploads happen server-side (your backend uploads on behalf of users)
-- You're building a mobile app where the key is bundled in the binary (not exposed in browser DevTools)
-
-### Option 2: Upload Tokens (Web Apps / Client-Side Uploads)
-
-For web applications where JavaScript runs in the browser, exposing the API key in network requests is a security risk. Upload tokens solve this:
-
-1. **Your backend** (which holds the API key) requests a short-lived token from the embed service
-2. **Your frontend** uses that token to upload directly — the API key never reaches the browser
-
-Tokens are HMAC-SHA256 signed, single-use, and time-limited (default 10 min, max 30 min).
-
-**Requesting a token (server-side):**
-```bash
-curl -X POST https://embed.3speak.tv/uploads/token \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "owner": "username",
-    "frontend_app": "your-app-name",
-    "short": false,
-    "allowed_origins": ["https://your-app.com"],
-    "max_file_size": 1073741824,
-    "ttl": 600
-  }'
-```
-
-**Response:**
-```json
-{
-  "token": "eyJ...",
-  "upload_url": "https://embed.3speak.tv/uploads",
-  "permlink": "yn77aj9g",
-  "embed_url": "https://play.3speak.tv/embed?v=username/yn77aj9g",
-  "expires_at": "2026-03-17T12:10:00.000Z"
+```js
+async function waitForVideo(permlink) {
+  const video = await (await fetch(`https://embed.3speak.tv/video/${permlink}`)).json();
+  if (video.status === 'published') return video;            // video.manifest_cid is set
+  if (video.status === 'failed') throw new Error('Encoding failed');
+  console.log(video.status, `${video.encodingProgress}%`);   // uploading / processing, 0 to 100
+  await new Promise((r) => setTimeout(r, 5000));
+  return waitForVideo(permlink);
 }
 ```
 
-The `permlink` and `embed_url` are assigned at issuance and bound to the token, so
-the client knows the canonical embed URL **before** uploading. This is the
-recommended way to obtain the embed URL: it is reliable for parallel
-(Concatenation) uploads, where the per-response `X-Embed-URL` header can be
-missed. The `X-Embed-URL` header is still emitted for backward compatibility.
+```text
+uploading ──▶ processing ──▶ published
+    │              └──────▶ failed
+    └──▶ awaiting_encode (only with defer_encode, until POST /video/:permlink/encode)
+```
 
-**Token parameters:**
+Polling is optional: the player already shows the uploading and processing states.
+
+### 4. Embed the video
+
+```html
+<iframe src="https://play.3speak.tv/embed?v=badadib/yn77aj9g"
+        width="100%" height="500" frameborder="0" allowfullscreen></iframe>
+```
+
+For Hive post bodies (PeakD, Ecency and other composers), the landing page in
+[`public/index.html`](public/index.html) uses the plain video tag form:
+
+```html
+<video src="play.3speak.tv/watch?v=badadib/yn77aj9g" controls></video>
+```
+
+The player itself is a separate project; this service only builds the URL
+(`BASE_URL?v={owner}/{permlink}`).
+
+### 5. Link the Hive post (optional)
+
+After you broadcast the Hive post that carries the video, tell the service which post it
+belongs to:
+
+```bash
+curl -X POST https://embed.3speak.tv/video/yn77aj9g/hive \
+  -H "X-API-Key: <your-api-key>" -H "Content-Type: application/json" \
+  -d '{"hive_author": "badadib", "hive_permlink": "my-first-video", "hive_title": "My first video", "hive_tags": ["3speak"]}'
+```
+
+The first link wins: a later call naming a different post is a no-op that returns
+`relinked: false` with the existing link, while repeating the same post is idempotent.
+
+Server-to-server apps and mobile apps can skip step 1 and upload with the `X-API-Key`
+header directly, passing `owner`, `frontend_app` and `short` as tus metadata
+([details](#authentication)).
+
+## Quick start
+
+Run your own instance. You need Node.js 20 or newer, MongoDB, a local IPFS daemon
+(Kubo, API on `127.0.0.1:5001`) and at least one encoder node such as
+[3speakencoder](https://github.com/Mantequilla-Soft/3speakencoder).
+
+```bash
+git clone https://github.com/Mantequilla-Soft/embedvideos.git
+cd embedvideos
+npm install
+bash scripts/install-tusd.sh   # downloads tusd v2.9.2 (linux_amd64) to ./bin/tusd
+cp .env.example .env           # then set MONGODB_URI, ADMIN_PASSWORD, UPLOAD_TOKEN_SECRET,
+                               # WEBHOOK_API_KEY, WEBHOOK_URL and ENCODERS
+npm run dev                    # ts-node; or: npm run build && npm start
+```
+
+The server starts tusd as a child process once Express is listening, so there is nothing
+else to launch. Then:
+
+1. Open `http://localhost:3000/admin.html` (default `PORT` is 3000), sign in with
+   `ADMIN_PASSWORD` and create an API key for your app.
+2. Try an upload in `http://localhost:3000/demo.html`, or follow
+   [Use it in your app](#use-it-in-your-app) against `http://localhost:3000`.
+3. `GET /health` reports `status`, `activeUploads` and `freeDiskPct`.
+
+Put a reverse proxy with TLS in front for production; the app trusts `X-Forwarded-*`
+headers (`trust proxy` is on) and builds `upload_url` from them.
+
+## Configuration
+
+Set in `.env` (template: [.env.example](.env.example)). Names and defaults only; never
+commit real values.
+
+**Core**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PORT` | HTTP port | `3000` |
+| `MONGODB_URI` | MongoDB connection string | none (required) |
+| `MONGODB_DATABASE` | Database name | `threespeak` |
+| `MONGODB_COLLECTION_VIDEOS` | Videos collection | `embed-video` |
+| `MONGODB_COLLECTION_USERS` | Users collection | `embed-users` |
+| `MONGODB_COLLECTION_KEYS` | API keys collection | `embed-api-keys` |
+| `MONGODB_COLLECTION_JOBS` | Encoding jobs collection | `embed-jobs` |
+| `LEGACY_VIDEOS_COLLECTION` | Pre-embed 3Speak videos, used for media replacement | `videos` |
+| `UPLOAD_DIR` | Temp storage for uploads in flight | `./uploads` |
+| `TUSD_PORT` | Port tusd listens on (127.0.0.1 only) | `1080` |
+| `TUSD_BINARY_PATH` | Path to the tusd binary | `./bin/tusd` |
+| `MAX_UPLOAD_SIZE` | Hard cap per video in bytes, every upload path | 5 GiB |
+| `BASE_URL` | Player base for embed URLs | `https://play.3speak.tv/embed` |
+| `ADMIN_PASSWORD` | Admin panel and `/admin/*` password | `change-me-in-production` (change it) |
+| `IP_HASH_SECRET` | Key for the keyed uploader address hashes; empty records nothing | empty |
+
+**Upload tokens**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `UPLOAD_TOKEN_SECRET` | HMAC key for upload tokens; empty disables `POST /uploads/token` (503) | empty |
+| `UPLOAD_TOKEN_DEFAULT_TTL` | Token lifetime when the request names none (s) | `600` |
+| `UPLOAD_TOKEN_MAX_TTL` | Longest token lifetime allowed (s) | `1800` |
+| `UPLOAD_TOKEN_MAX_FILE_SIZE` | Largest file a token allows (bytes) | 1 GiB |
+
+**Encoding**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `ENCODERS` | JSON array that seeds the encoder registry on first start (see [ENCODERS.md](ENCODERS.md)) | empty |
+| `ENCODER_API_URL`, `ENCODER_API_KEY` | Legacy single-encoder seed, used when `ENCODERS` is empty | empty |
+| `WEBHOOK_URL` | Callback URL sent to encoders with each job | empty |
+| `WEBHOOK_API_KEY` | Key managed encoders send to `/webhook` and `/webhook/progress` | empty (set it) |
+| `DISPATCHER_ENABLED` | `false` on a secondary instance sharing the jobs collection, so only one dispatches | on |
+| `CLEANUP_ENABLED` | Periodic removal of stale temp upload files | on |
+| `CLEANUP_INTERVAL_HOURS` | Cleanup interval | `24` |
+| `CLEANUP_RETENTION_DAYS` | Age after which temp files are removed | `7` |
+
+`ENCODERS` only seeds an empty registry; after the first start, encoders are managed in
+the admin panel and env changes are ignored.
+
+**Gated (paid) content**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GATE_URL` | 3speak-gate service; empty refuses gated uploads (503 `gate_not_configured`) | empty |
+| `GATE_INTERNAL_API_KEY` | Key for the gate service | empty |
+| `GATE_CDN_BASE` | Base the gate fetches encrypted manifests from | `https://ipfs.3speak.tv/ipfs` |
+
+**Daily upload limits** (see [Daily upload limits](#daily-upload-limits))
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `UPLOAD_DAILY_LIMITS_ENABLED` | `false` switches the limits off | on |
+| `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED` | `true` caps free Hive accounts' uploads too | off |
+| `UPLOAD_LIMIT_VIDEOS_PER_DAY` | Videos per 24 h, free Hive account, while capped | `1` |
+| `UPLOAD_LIMIT_SHORTS_PER_DAY` | Shorts per 24 h, free Hive account, while capped | `3` |
+| `UPLOAD_LIMIT_WARMUP_VIDEOS_PER_DAY` | Videos per 24 h, warm-up account | `3` |
+| `UPLOAD_LIMIT_WARMUP_SHORTS_PER_DAY` | Shorts per 24 h, warm-up account | `3` |
+| `UPLOAD_LIMIT_EXEMPT` | Comma list of owners never limited | empty |
+| `UPLOAD_LIMIT_WARMUP_LOOKUP_URL` | Warm-up account registry | `https://checker.3speak.tv/incubation/authors` |
+| `UPLOAD_LIMIT_HIVE_NODES` | Comma list of Hive API nodes | `api.hive.blog`, `api.deathwing.me`, `anyx.io` |
+| `UPLOAD_UPGRADE_URL` | `upgrade_url` in refusals; `{owner}` or `{user}` is replaced | `https://3speak.tv/wallet/{owner}#pro` |
+
+`.env.example` also lists `IPFS_API_ADDR` and `DEMO_API_KEY`; neither is read at the
+moment (the IPFS API address is fixed at `http://127.0.0.1:5001`).
+
+## Reference
+
+Unless noted, request and response bodies are JSON, and errors are `{"error": "..."}`
+with an HTTP status. Owner names are stored lowercased with any leading `@` removed, so
+`Badadib`, `@badadib` and `badadib` are one owner.
+
+### Authentication
+
+| Method | Header | Use it for |
+|---|---|---|
+| API key | `X-API-Key: <your-api-key>` | Your backend; server-to-server and mobile uploads |
+| Upload token | `Authorization: Bearer <token>` (or a `token` form field on the fallback endpoints) | Browser uploads |
+
+Upload tokens are HMAC-SHA256 signed, time-limited and single-use. A token is used up
+only when an upload is accepted: a refused upload (daily limit, size, ban) leaves it
+valid for a retry until it expires. With a token, `owner`, `frontend_app`, `short` and the
+permlink come from the token and any metadata values are ignored. Tokens with
+`allowed_origins` are refused (403) from any other `Origin`.
+
+### Uploads
+
+#### `POST /uploads/token`
+
+API key required. Returns 201.
 
 | Field | Type | Description |
-|-------|------|-------------|
-| `owner` | string | **Required.** Username of the video owner |
-| `frontend_app` | string | **Required.** Your application identifier |
-| `short` | boolean | **Required.** `true` for short-form videos (≤60s, 480p) |
-| `allowed_origins` | string[] | CORS origins allowed to use this token (recommended for web) |
-| `max_file_size` | number | Max upload size in bytes (capped by server config, default 1GB) |
-| `ttl` | number | Token lifetime in seconds (capped by server config, default 600s) |
-
-## API Endpoints
-
-### Health Check
-
-```http
-GET /health
-```
-
-Returns the service status.
-
-### Community Encoder Status
-
-```http
-GET /api/v0/encoders/community
-```
-
-Public endpoint (no auth required). Returns all registered community encoders and their liveness status. An encoder is considered **alive** if it has polled within the last 5 minutes.
-
-**Response:**
+|---|---|---|
+| `owner` | string | **Required.** Hive account the video belongs to |
+| `frontend_app` | string | Your app id; defaults to the API key's app name |
+| `short` | boolean | `true` for a Short (encoded at 480p). Default `false` |
+| `allowed_origins` | string[] | Origins allowed to use the token (recommended for web) |
+| `max_file_size` | number | Bytes, capped by `UPLOAD_TOKEN_MAX_FILE_SIZE` |
+| `ttl` | number | Seconds, capped by `UPLOAD_TOKEN_MAX_TTL` |
+| `replaces` | string | Permlink of the owner's existing video whose media this upload replaces (free under the daily limit) |
+| `defer_encode` | boolean | Upload now, start the encode later with `POST /video/:permlink/encode` |
+| `gated` | boolean | Paid video, encrypted at encode time. Requires 3Speak Pro and a configured gate |
+| `allowlist` | string[] | Gated only: up to 500 Hive accounts that may watch without Pro |
 
 ```json
 {
   "success": true,
-  "encoders": [
-    {
-      "name": "community-abc123def456",
-      "enabled": true,
-      "banned": false,
-      "lastSeenAt": "2026-06-04T12:34:56.000Z",
-      "alive": true
-    }
-  ]
+  "token": "<upload-token>",
+  "upload_url": "https://embed.3speak.tv/uploads",
+  "permlink": "yn77aj9g",
+  "embed_url": "https://play.3speak.tv/embed?v=badadib/yn77aj9g",
+  "expires_at": "2026-11-25T12:10:00.000Z",
+  "gated": false,
+  "defer_encode": false,
+  "replaces": null
 }
 ```
 
-Use this endpoint in monitoring dashboards to track which community encoders are actively polling for work.
+`gated`, `defer_encode` and `replaces` are echoed so a client can confirm what was
+honoured (`replaces` is `null` when the target did not check out). With
+`defer_encode: true` the response also carries a `finalize_token` (valid 12 hours).
+Errors: 422 (bad `owner`, `gated` or `allowlist`), 403 `pro_required`, 503 (tokens or gate
+not configured), 429 [`daily_upload_limit`](#daily-upload-limits).
 
-### Get Video Metadata
+#### `POST /uploads` (tus)
 
-```http
-GET /video/:permlink
-```
-Retrieves metadata for a specific video, including encoding progress. This endpoint is **public** (no auth required) and can be polled to track upload and encoding status. See [Tracking Progress](#tracking-progress) below.
+The tus endpoint (tus 1.0 with the Creation and Concatenation extensions, served by tusd).
+Send a Bearer token or `X-API-Key`.
 
-### Check User Premium Status
+| Metadata | Description |
+|---|---|
+| `filename` | Original file name (optional) |
+| `owner` (or `username`) | Owner, API key uploads only |
+| `frontend_app` | App id, API key uploads only |
+| `short` | `"true"` or `"false"`, API key uploads only |
+| `permlink` | Choose the permlink, API key uploads only; a taken one is refused with 409 |
+| `duration` | Seconds (optional) |
+| `replaces` | Permlink of the video being replaced, API key uploads only |
 
-```http
-GET /users/:username/premium
-```
+The creation response carries `X-Embed-URL` (also on the final 204 for mobile SDKs) and,
+on a daily-limit refusal, `Retry-After`; both are exposed to browsers via CORS. Refusals
+are JSON: 401 (bad key or token), 403 (token used, wrong origin, banned owner), 409
+(permlink taken), 413 (over the token's size or `MAX_UPLOAD_SIZE`), 429
+(`daily_upload_limit`).
 
-Returns whether a user has premium status (multi-resolution encoding). Requires `X-API-Key` header. Returns 404 if the user does not exist.
+#### Fallback uploads
 
-**Response:**
+For clients where tus is blocked (some mobile carriers and WebViews). All take
+`multipart/form-data`, a `token` form field or the `X-API-Key` header, and the same
+optional fields as the tus metadata (`filename`, `owner`, `short`, `permlink`,
+`frontend_app`, `duration`, `replaces`). Put text fields **before** the file part.
 
-```json
-{
-  "username": "coolmole",
-  "premium": false
-}
-```
+| Endpoint | Purpose |
+|---|---|
+| `POST /upload/simple` | Whole file in one request (`file` as the last part), no resume. 201 `{success, embed_url, permlink, owner}` |
+| `POST /upload/probe` | Unauthenticated throughput probe (body up to 512 KiB), returns `{ok, bytes}`, to size chunks |
+| `POST /upload/chunk/create` | Fields `size` (total bytes), `chunkSize` (256 KiB to 64 MiB) and `probed=1` if you measured; without `probed` the chunk size is clamped to 256 KiB. 201 `{success, sessionId, chunkSize, totalChunks, received, permlink, owner, embed_url}`: slice to the returned `chunkSize` |
+| `POST /upload/chunk` | Fields `sessionId`, `index`, and the chunk as a file part. Chunks may arrive in any order and in parallel; a repeated index is a no-op |
+| `POST /upload/chunk/status` | `sessionId` → `{chunkSize, totalChunks, receivedBytes, size, received, finished}`, to resume |
+| `POST /upload/chunk/finish` | `sessionId` → 201 `{success, embed_url, permlink, owner}` once every chunk is in |
 
-Frontends use this to adjust upload size limits in the UI before requesting an upload token.
+Chunk sessions live in the memory of the instance that created them and expire after 2
+hours idle, so send every request of one session to the same server.
 
-### TUS Upload Endpoint
+### Videos
 
-```http
-POST /uploads
-```
-TUS protocol endpoint for video uploads. Requires either `X-API-Key` header or `Authorization: Bearer <upload-token>`.
+| Endpoint | Auth | Description |
+|---|---|---|
+| `GET /video/:permlink` | public | The video row: `status`, `encodingProgress`, `manifest_cid`, `thumbnail_url`, `duration`, `short`, `hive_*`, timestamps. 404 if unknown |
+| `POST /video/:permlink/hive` | API key | Link the Hive post: `{hive_author, hive_permlink, hive_title?, hive_body?, hive_tags?}`. First link wins (see [step 5](#5-link-the-hive-post-optional)) |
+| `POST /video/:permlink/thumbnail` | API key | Set a custom thumbnail: `{thumbnail_url}` |
+| `POST /video/:permlink/encode` | finalize token | Deferred uploads: `{gated, allowlist?}` writes the gating choice and queues the encode in one step. Idempotent (`already_queued: true`); 409 `not_awaiting_encode` / `not_pinned` |
+| `GET /video/:permlink/replace-target` | API key | Can this video's media be replaced? `{found, kind: "embed" \| "legacy", owner, status}` |
+| `POST /video/:permlink/replaces` | API key | Register `:permlink` (the new upload) as the replacement for `{replaces}` (the original, same owner). When the new upload finishes encoding, its media moves onto the original row, which keeps its permlink, views and Hive post |
+| `GET /users/:username/premium` | API key | `{username, premium}`; premium (3Speak Pro) owners get multi-resolution encodes. 404 if the user has never uploaded |
 
-**Required Metadata:**
-- `owner` or `username`: The username for the video owner (ignored when using upload tokens — the token carries this)
-- `frontend_app`: Frontend application identifier (ignored when using upload tokens)
-- `short`: String `"true"` or `"false"` - whether this is a short-form video (ignored when using upload tokens)
-- `filename`: (optional) Original filename
+Deferred uploads that never get their `POST /video/:permlink/encode` are unpinned and
+marked `failed` after 12 hours (one whose Hive post was already linked is queued instead). A replacement upload must be registered with
+`POST /video/:permlink/replaces` within 6 hours to stay free under the daily limit.
 
-**Response Headers:**
-- `X-Embed-URL`: The embed URL for the video (format: `https://play.3speak.tv/embed?v={owner}/{permlink}`)
+### Daily upload limits
 
-**Owner and permlink:** owner names are stored lowercased (`Alice`, `@alice` and `alice` are one owner). An `X-API-Key` upload may name its own `permlink`; one that is already taken is refused with HTTP 409 `{"error": "A video with this permlink already exists"}` on every upload path. A token's permlink is fresh by construction.
+Enforced by this service for every app and every upload path (`POST /uploads/token`, tus,
+`/upload/simple`, `/upload/chunk/create`), per owner name, over a rolling 24 hours:
 
-### Request Upload Token
+| Account | Videos | Shorts |
+|---|---|---|
+| Warm-up account (a 3Speak handle with no Hive account yet) | 3 | 3 |
+| Free Hive account | no upload cap (limited when publishing, by the 3Speak checker) | no upload cap |
+| Free Hive account, with `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true` | 1 | 3 |
+| 3Speak Pro, or listed in `UPLOAD_LIMIT_EXEMPT` | unlimited | unlimited |
 
-```http
-POST /uploads/token
-```
-Generates a short-lived, single-use upload token. Requires `X-API-Key` header. See [Authentication](#authentication) for details.
+- **Counts:** uploads whose bytes landed (`processing`, `awaiting_encode`, `published`).
+  In-flight, failed and deleted uploads do not.
+- **Never counts:** verified stream recordings from the 3Speak streaming server, media
+  replacements (`replaces`), and uploads a warm-up account made before it got its Hive
+  account.
+- **Fails open:** if MongoDB, the warm-up registry or Hive cannot answer, the upload is
+  allowed.
 
-### Upload Limits
-
-Warm-up accounts (3Speak users with no Hive account yet) may upload **3 regular videos** and **3 shorts** per **rolling 24 hours**. Free Hive accounts (no 3Speak Pro) have **no upload cap**: their daily limit is on publishing (1 video and 3 shorts per 24 hours, by publish time), which the checker enforces when a post is scheduled, so a video over it is scheduled for a free time instead. An operator can cap their uploads again with `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true`: then they may upload **1 regular video** and **3 shorts** per rolling 24 hours. The limit is enforced by this API for every app that uses it, on every upload path: `POST /uploads/token`, TUS `POST /uploads` (token or `X-API-Key`), `POST /upload/simple` and `POST /upload/chunk/create`.
-
-- **What counts:** uploads whose bytes landed (video status `processing`, `awaiting_encode` or `published`), created in the last 24 hours. Uploads still in flight, failed uploads and deleted videos do not use a slot. Imports (YouTube, TikTok) that arrive here count like any upload.
-- **What never counts:** stream recordings (VODs) published by the 3Speak streaming server, and **media replacements** (see below).
-- **The warm-up backlog never counts for the Hive account** (only matters while free uploads are capped): when a warm-up user gets a Hive account, the uploads made under the warm-up handle become that account's (the checker's claim-assets moves them and stamps `owner_claimed_from`, or the handle already is the Hive name). Neither uses a slot of the Hive account: claimed rows are skipped, and so is every row created before the Hive account itself. Publishing the backlog to Hive afterwards uploads nothing, so it is never refused.
-- **Who is exempt:** 3Speak Pro owners and owners an operator lists in `UPLOAD_LIMIT_EXEMPT`, and free Hive accounts while their uploads are not capped (the default).
-- Shorts and regular videos have separate allowances: using the videos does not touch the shorts.
-- `owner` is the name the limit is kept for (lowercased, so spelling it differently does not give a new allowance); it is not verified by this API.
-
-#### Replacing a video's media is free
-
-An upload that replaces the media of one of the owner's existing videos (the `POST /video/:permlink/replaces` flow, legacy videos included) is never refused and does not use a slot. Say so when the upload starts, by naming the original permlink:
-
-- Upload token: `"replaces": "<original permlink>"` in the `POST /uploads/token` body. The response echoes `"replaces"`: the permlink when it was accepted, `null` when it was not.
-- X-API-Key uploads: a `replaces` field in the TUS metadata, or a `replaces` form field on `/upload/simple` and `/upload/chunk/create`. With an upload token the signed claim is used and a metadata `replaces` is ignored.
-
-The server checks the claim against the database (at token issuance and again when the upload is created): the original must exist, here or in the legacy catalogue, and belong to the same owner. A claim that does not check out makes it an ordinary upload, limited as usual. If the lookup itself fails (database trouble), the upload is let through without the limit, like every other limit lookup, but is not marked as a replacement. A video registered with `POST /video/:permlink/replaces` is free whether or not its upload named the original. A replacement upload stays out of listings, like a registered replacement. It has to be registered with `POST /video/:permlink/replaces` within 6 hours; one that never is counts as a normal upload.
-
-#### Refusal: HTTP 429 `daily_upload_limit`
-
-Every refusal has the same body and a standard `Retry-After` header (seconds), on every path. On TUS uploads it is the response to the creation `POST` (tus-js-client: `error.originalResponse.getBody()` and `getHeader('Retry-After')`); 429 is not retried by tus-js-client.
+A refusal is HTTP 429 with a `Retry-After` header (seconds) and this body on every path.
+tus-js-client does not retry a 429; read it with `error.originalResponse.getBody()`.
 
 ```json
 {
@@ -261,33 +449,15 @@ Every refusal has the same body and a standard `Retry-After` header (seconds), o
   "next_at": "2026-11-21T14:32:00Z",
   "retry_after_seconds": 68400,
   "message": "Warm-up accounts can upload 3 videos per 24 hours. Your next video upload is possible at 2026-11-21T14:32:00Z.",
-  "upgrade_url": "https://3speak.tv/wallet/alice#pro"
+  "upgrade_url": "https://3speak.tv/wallet/badadib#pro"
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `code` | Always `daily_upload_limit`. Branch on this, not on `error` or `message`. |
-| `error` | Short text, stable. |
-| `message` | Full English sentence, safe to show to the user as is. |
-| `kind` | `video` or `short`: which allowance is used up. |
-| `plan` | `warmup` (a warm-up account) or `free` (a Hive account without Pro, only while free uploads are capped). A warm-up refusal's `message` does not mention Pro: Pro needs a Hive account; a free one ends with "3Speak Pro removes this limit." |
-| `limit` / `used` | The allowance and how many counted uploads are in the window. |
-| `next_at` | ISO 8601 (UTC, no milliseconds): when the next slot frees, i.e. when the oldest counted upload turns 24 hours old. |
-| `retry_after_seconds` | Seconds until `next_at`; same value as the `Retry-After` header. |
-| `upgrade_url` | Where the owner can get 3Speak Pro. Only meaningful for `plan: "free"`. |
+Branch on `code`, show `message` as is. `kind` is `video` or `short`; `plan` is `warmup`
+or `free`; `next_at` and `retry_after_seconds` are `null` only when an allowance is set to
+0. `upgrade_url` only matters for `plan: "free"`.
 
-`next_at` and `retry_after_seconds` are `null` (and `Retry-After` is absent) only when an operator sets an allowance to 0.
-
-A refused upload does not use up its upload token: the token is consumed only when an upload is accepted, so the same token can be retried after `Retry-After` while it is still valid (tokens expire, so a long wait usually means asking `POST /uploads/token` for a new one). The same holds for the other upload refusals (file too large for the token, banned owner).
-
-#### Check the allowance first
-
-```http
-GET /uploads/quota?owner=<name>
-```
-
-Requires `X-API-Key`. Lets a frontend show "1 short left today" before the user picks a file.
+**Check the allowance first** with `GET /uploads/quota?owner=<name>` (API key):
 
 ```json
 {
@@ -300,431 +470,114 @@ Requires `X-API-Key`. Lets a frontend show "1 short left today" before the user 
 }
 ```
 
-A free Hive account (uploads not capped, the default):
+For an exempt owner, `exempt` is `true`, `reason` is `pro`, `listed` or `publish_limit`
+(a free Hive account while uploads are not capped), `plan` is `null`, and `limit`,
+`remaining` and `next_at` are `null`. With limits switched off, `enabled` is `false`. 503
+when the count cannot be read (uploads are not blocked then).
 
-```json
-{
-  "enabled": true,
-  "exempt": true,
-  "reason": "publish_limit",
-  "plan": null,
-  "video": { "limit": null, "used": 1, "remaining": null, "next_at": null },
-  "short": { "limit": null, "used": 0, "remaining": null, "next_at": null }
-}
-```
+### Service and encoders
 
-- `reason`: `"pro"`, `"listed"` or `"publish_limit"` (a free Hive account, limited when publishing instead) when `exempt` is true, else `null`. If the warm-up registry cannot answer, `"publish_limit"` is reported and uploads are let through.
-- `plan`: `"warmup"` (3 videos + 3 shorts by default), or `"free"` while free uploads are capped, when not exempt, else `null`. While capped, if the warm-up registry cannot answer, `"free"` is reported, but uploads are let through.
-- For an exempt owner `limit`, `remaining` and `next_at` are `null` (unlimited); `used` is still reported.
-- `next_at` is `null` while `remaining` is above 0.
-- When limits are switched off: `{ "enabled": false, "exempt": true, "reason": null, "plan": null, ... }` with `null` limits.
-- `503` if the count cannot be read right now; uploads are not blocked while that is the case.
-
-#### Configuration
-
-| Env | Default | |
+| Endpoint | Auth | Description |
 |---|---|---|
-| `UPLOAD_DAILY_LIMITS_ENABLED` | on | Set to `false` to switch the limits off. |
-| `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED` | off | Set to `true` to cap free Hive accounts' uploads again (the two limits below). Off: they are only limited when publishing (checker). |
-| `UPLOAD_LIMIT_VIDEOS_PER_DAY` | `1` | Regular videos per rolling 24 hours for a free Hive account, while capped. |
-| `UPLOAD_LIMIT_SHORTS_PER_DAY` | `3` | Shorts per rolling 24 hours for a free Hive account, while capped. |
-| `UPLOAD_LIMIT_WARMUP_VIDEOS_PER_DAY` | `3` | Regular videos per rolling 24 hours for a warm-up account. |
-| `UPLOAD_LIMIT_WARMUP_SHORTS_PER_DAY` | `3` | Shorts per rolling 24 hours for a warm-up account. |
-| `UPLOAD_LIMIT_EXEMPT` | empty | Comma list of owners who are never limited. |
-| `UPLOAD_LIMIT_WARMUP_LOOKUP_URL` | `https://checker.3speak.tv/incubation/authors` | Warm-up registry lookup. |
-| `UPLOAD_LIMIT_HIVE_NODES` | `api.hive.blog`, `api.deathwing.me`, `anyx.io` | Hive API nodes for the warm-up check and the account age (backlog) check. |
-| `UPLOAD_UPGRADE_URL` | `https://3speak.tv/wallet/{owner}#pro` | `upgrade_url`; `{owner}` (or `{user}`) is replaced. |
+| `GET /health` | public | `{status, service, activeUploads, freeDiskPct}`, also a load signal for picking the least busy server |
+| `GET /api/v0/encoders/status` | public | Every encoder: `name`, `access` (`managed` or `community`), `operator`, `lastSeenAt` |
+| `GET /api/v0/encoders/community` | public | Community encoders with `enabled`, `banned`, `lastSeenAt`, `commit`, `behindBy` and `alive` (polled in the last 5 minutes) |
+| `POST /webhook` | `WEBHOOK_API_KEY` or per-job token | Encoder result: `{owner, permlink, status: "complete" \| "failed", manifest_cid, ...}` |
+| `POST /webhook/progress` | `WEBHOOK_API_KEY` or per-job token | `{owner, permlink, progress, stage?}` |
+| `POST /api/v0/gateway/updateNode`, `/myJob`, `/heartbeat` | JWS signed by the encoder's DID | Community encoder registration, job pull and heartbeat |
+| `POST /tusd-hooks` | loopback only | tusd hook receiver, not for clients |
 
-Every lookup behind the limit fails open: if Mongo, the warm-up registry or Hive cannot answer, the upload is allowed.
+Managed encoders receive jobs at `POST {encoder.url}/encode`. Encoder setup lives in
+[3speakencoder](https://github.com/Mantequilla-Soft/3speakencoder).
 
-## Upload Examples
+### Admin
 
-### Direct API Key (Server-to-Server / Mobile)
+`/admin.html` is the admin panel. The `/admin/*` API behind it (API keys, users with ban
+and premium flags, encoders with tier, access and trust, jobs and redispatch, encoder
+stats, temp file cleanup) requires `ADMIN_PASSWORD` in the `X-Admin-Password` header and
+is meant for the instance operator only.
 
-```javascript
-import * as tus from 'tus-js-client';
+## Development and tests
 
-const file = document.getElementById('file-input').files[0];
-
-const upload = new tus.Upload(file, {
-  endpoint: 'https://embed.3speak.tv/uploads',
-  headers: {
-    'X-API-Key': 'your-api-key'
-  },
-  metadata: {
-    filename: file.name,
-    owner: 'chessfighter',
-    frontend_app: 'my-video-app',
-    short: 'false',
-    filetype: file.type
-  },
-  onError: (error) => {
-    console.error('Upload failed:', error);
-  },
-  onProgress: (bytesUploaded, bytesTotal) => {
-    const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2);
-    console.log(`Uploaded ${percentage}%`);
-  },
-  onSuccess: () => {
-    console.log('Upload completed!');
-  },
-  onAfterResponse: (req, res) => {
-    const embedUrl = res.getHeader('X-Embed-URL');
-    console.log('Embed URL:', embedUrl);
-    // Example: https://play.3speak.tv/embed?v=chessfighter/yn77aj9g
-  }
-});
-
-upload.start();
+```bash
+npm run dev            # run src/index.ts with ts-node
+npm run build          # compile to dist/
+npm start              # run dist/index.js
+npm run watch          # tsc --watch
+npm test               # Vitest suite (test/**/*.test.ts)
+npm run test:coverage  # same with coverage; fails below 75% lines
 ```
 
-### Upload Token (Web App — Recommended for Browsers)
+Tests run against a real MongoDB from `mongodb-memory-server`, with IPFS, tusd, encoders,
+the gate and webhooks stubbed per test. `src/index.ts` only connects and listens when run
+directly, so tests import the app and drive it with supertest. CI
+([tests.yml](.github/workflows/tests.yml)) runs `tsc --noEmit` and the coverage suite on
+Node 22 for every pull request and every push to `master`.
 
-**Step 1 — Your backend requests a token:**
+The `scripts/test-*.ts` files are older standalone checks that need no MongoDB; run one
+with `npx ts-node --transpile-only scripts/test-upload-limits.ts`.
 
-```javascript
-// Server-side (Node.js, Python, etc.)
-const response = await fetch('https://embed.3speak.tv/uploads/token', {
-  method: 'POST',
-  headers: {
-    'X-API-Key': process.env.EMBED_API_KEY,
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    owner: 'chessfighter',
-    frontend_app: 'my-video-app',
-    short: false,
-    allowed_origins: ['https://my-video-app.com'],
-    ttl: 600
-  })
-});
-
-const { token, upload_url, permlink, embed_url, expires_at } = await response.json();
-// Send `token`, `upload_url`, and `embed_url` to your frontend.
-// `embed_url` is already final — no need to read it back from a response header.
-```
-
-**Step 2 — Your frontend uploads with the token:**
-
-```javascript
-// Client-side (browser)
-const upload = new tus.Upload(file, {
-  endpoint: uploadUrl,  // from your backend
-  headers: {
-    'Authorization': `Bearer ${token}`  // from your backend
-  },
-  metadata: {
-    filename: file.name,
-    filetype: file.type,
-    // owner, frontend_app, short are already in the token - no need to set them
-  },
-  onError: (error) => {
-    console.error('Upload failed:', error);
-  },
-  onProgress: (bytesUploaded, bytesTotal) => {
-    const percentage = (bytesUploaded / bytesTotal * 100).toFixed(2);
-    console.log(`Uploaded ${percentage}%`);
-  },
-  onSuccess: () => {
-    // `embed_url` was returned by the token request (Step 1) and passed to the
-    // frontend. It is already the canonical URL - no header scraping needed,
-    // which is what makes this reliable for parallel uploads.
-    console.log('Upload completed! Embed URL:', embed_url);
-  }
-});
-
-upload.start();
-```
-
-> For parallel uploads (`parallelUploads: 3` via the TUS Concatenation
-> extension), always use the token's `embed_url`. The `X-Embed-URL` response
-> header is injected per-response and can be missed on the final concatenation
-> request, so relying on it can make a completed upload look like a failure.
-
-## Tracking Progress
-
-After starting an upload, you can track the video's status and encoding progress by polling the public `GET /video/:permlink` endpoint. Use the `permlink` returned by the token request (or extract it from the embed URL).
-
-**Key fields to monitor:**
-
-| Field | Description |
-|-------|-------------|
-| `status` | `uploading` → `processing` → `published` (or `failed`) |
-| `encodingProgress` | Encoding percentage (0–100). Updates in real-time as the encoder works. |
-
-**Example — polling for progress:**
-
-```javascript
-const permlink = embedUrl.split('/').pop(); // e.g. "yn77aj9g"
-
-async function pollProgress() {
-  const res = await fetch(`https://embed.3speak.tv/video/${permlink}`);
-  const video = await res.json();
-
-  console.log(`Status: ${video.status}, Progress: ${video.encodingProgress}%`);
-
-  if (video.status === 'published') {
-    console.log('Video is ready!');
-    console.log('Manifest CID:', video.manifest_cid);
-    return;
-  }
-
-  if (video.status === 'failed') {
-    console.error('Encoding failed');
-    return;
-  }
-
-  // Poll every 5 seconds while uploading/processing
-  setTimeout(pollProgress, 5000);
-}
-
-pollProgress();
-```
-
-**Status lifecycle:**
-
-```text
-uploading → processing → published
-                ↘ failed
-```
-
-The embed player handles all states automatically (showing upload/processing animations), so the embed URL is usable immediately — but polling lets your app show custom progress UI.
-
-## Project Structure
+## Repository layout
 
 ```
-3speakembed/
+.
 ├── src/
-│   ├── config/
-│   │   └── config.ts          # Configuration loader with multi-encoder support
-│   ├── database/
-│   │   └── mongodb.ts         # MongoDB connection and operations
+│   ├── index.ts              # Express app: every route, tusd proxy and hooks, webhooks, startup
+│   ├── config/config.ts      # env loading, encoder seed parsing, upload limit config
+│   ├── database/mongodb.ts   # MongoDB access: videos, users, API keys, jobs, encoders, tokens
 │   ├── dispatcher/
-│   │   └── jobDispatcher.ts   # Job queue manager with round-robin load balancing
+│   │   └── jobDispatcher.ts  # 30 s job loop: tier and trust rules, retries, stall detection
 │   ├── middleware/
-│   │   ├── auth.ts            # API key validation middleware
-│   │   └── adminAuth.ts       # Admin password middleware
-│   ├── utils/
-│   │   ├── videoId.ts         # Video ID generator
-│   │   ├── keyGenerator.ts    # API key generator
-│   │   ├── ipfs.ts            # IPFS pinning utilities
-│   │   └── uploadToken.ts     # Upload token signing and verification
-│   └── index.ts               # Main server file
+│   │   ├── auth.ts           # API key check
+│   │   └── adminAuth.ts      # admin password check
+│   └── utils/
+│       ├── tusd.ts           # spawns tusd on 127.0.0.1
+│       ├── uploadAuth.ts     # one auth path for tus, simple and chunked uploads
+│       ├── uploadToken.ts    # HMAC upload and finalize tokens
+│       ├── uploadLimits.ts   # daily upload limits and quota
+│       ├── ipfs.ts           # pin, unpin and DHT announce on the local daemon
+│       ├── gate.ts           # 3speak-gate registration for gated videos
+│       ├── jws.ts            # DID-signed requests from community encoders
+│       ├── encoderVersion.ts # encoder commit reporting
+│       ├── cleanup.ts        # stale temp file cleanup
+│       ├── ipHash.ts         # keyed uploader address hashes
+│       ├── keyGenerator.ts   # API key generation
+│       └── videoId.ts        # permlink generation
 ├── public/
-│   ├── index.html             # Landing page with integration docs
-│   ├── demo.html              # Upload demo interface
-│   └── admin.html             # Admin panel (API keys & encoder management)
-├── scripts/
-│   ├── dropOldIndex.ts        # Database maintenance utilities
-│   └── testEncoder.ts         # Encoder testing script
-├── uploads/                   # TUS upload storage directory
-├── .env.example               # Environment variables template
-├── .gitignore
-├── package.json
-├── tsconfig.json
-├── ENCODERS.md                # Multi-encoder configuration guide
-└── README.md
+│   ├── index.html            # landing page with integration docs
+│   ├── demo.html             # upload demo
+│   └── admin.html            # admin panel
+├── scripts/                  # install-tusd.sh, maintenance and standalone checks
+├── test/                     # Vitest suites (admin, db, dispatcher, hooks, unit, uploads)
+├── ENCODERS.md               # ENCODERS seed format
+├── CLAUDE.md                 # architecture and design notes
+└── .env.example              # configuration template
 ```
 
-## Data Schemas
+## Security notes
 
-### VideoMetadata
+- **Keep the API key on a server.** For browsers, mint upload tokens on your backend and
+  set `allowed_origins`. Treat the key as something that can leak: gated uploads and
+  deferred encodes are only possible through signed token claims, never through API key
+  metadata, and the daily limits apply to API key uploads too.
+- **`owner` is a claim.** The service records whatever owner your backend names; verifying
+  that the user really is that Hive account is your job.
+- **Gated videos only reach trusted encoders.** An encoder holds the plaintext source of
+  everything it encodes, so gated jobs go only to managed encoders marked `trusted`, with
+  no fallback, and community encoders can never claim them.
+- **Set the secrets.** `ADMIN_PASSWORD` has a placeholder default, and `WEBHOOK_API_KEY`
+  and `UPLOAD_TOKEN_SECRET` are empty by default. Set all three to long random values on
+  any instance reachable from the internet.
+- **tusd and its hooks stay on loopback.** tusd binds to `127.0.0.1`, and `/tusd-hooks`
+  refuses any caller that is not local.
+- **No raw addresses are stored.** With `IP_HASH_SECRET` set, uploads record only keyed
+  hashes of the client address and its network; rotating the key makes old hashes
+  unlinkable.
 
-```typescript
-interface VideoMetadata {
-  owner: string;                // Username
-  permlink: string;             // Random 8-character ID
-  frontend_app: string;         // Frontend application identifier
-  status: 'uploading' | 'processing' | 'published' | 'failed' | 'deleted';
-  input_cid: string | null;     // IPFS CID of uploaded file
-  ipfs_pin_endpoint: string | null; // IPFS endpoint used for pinning
-  manifest_cid: string | null;  // IPFS CID of HLS manifest
-  thumbnail_url: string | null; // Video thumbnail URL
-  short: boolean;               // Is short-form video (≤60s, 480p max)
-  duration: number | null;      // Video duration in seconds
-  size: number | null;          // File size in bytes
-  encodingProgress: number;     // Encoding progress (0-100)
-  originalFilename: string | null; // Original filename
-  hive_author: string | null;   // Linked Hive post author
-  hive_permlink: string | null; // Linked Hive post permlink
-  hive_title: string | null;    // Hive post title
-  hive_body: string | null;     // Hive post body
-  hive_tags: string[] | null;   // Hive post tags
-  embed_url: string | null;     // Embed URL path (e.g., @user/permlink)
-  embed_title: string | null;   // Display title for embed (set by frontend)
-  listed_on_3speak: boolean;    // Whether listed on 3speak.tv
-  processed: boolean;           // Whether fully processed
-  processedAt: Date | null;     // When processing completed (set by frontend)
-  views: number;                // View count (set by player/analytics)
-  createdAt: Date;              // Upload start timestamp
-  updatedAt: Date;              // Last modification timestamp
-}
-```
+## Contributing
 
-### EncodingJob
-
-```typescript
-interface EncodingJob {
-  owner: string;                // Video owner username
-  permlink: string;             // Video ID
-  status: 'pending' | 'encoding' | 'completed' | 'failed';
-  input_cid: string;            // IPFS CID of source video
-  encoder?: string;             // Assigned encoder name
-  attempts: number;             // Retry counter (max 3)
-  error?: string;               // Error message if failed
-  manifest_cid?: string;        // IPFS CID of output manifest
-  thumbnail_url?: string;       // Generated thumbnail URL
-  duration?: number;            // Video duration
-  createdAt: Date;              // Job creation time
-  updatedAt: Date;              // Last update time
-}
-```
-
-### ApiKey
-
-```typescript
-interface ApiKey {
-  key: string;                  // Hashed API key
-  name: string;                 // Application name
-  createdAt: Date;              // Creation timestamp
-}
-```
-
-### Encoder
-
-```typescript
-interface Encoder {
-  name: string;                 // Unique encoder name
-  url: string;                  // Encoder API endpoint URL
-  apiKey: string;               // Encoder authentication key
-  enabled: boolean;             // Whether encoder is active
-  createdAt: Date;              // Creation timestamp
-  updatedAt: Date;              // Last modification timestamp
-}
-```
-
-## Status Flow & Architecture
-
-### Video Processing Pipeline
-
-1. **Upload Start**: TUS creates video record with status `uploading`, returns embed URL immediately
-2. **Upload Complete**: File pinned to IPFS, `input_cid` stored, encoding job created with status `pending`
-3. **Job Dispatch**: Dispatcher picks up pending job, assigns to available encoder via round-robin, status becomes `encoding`
-4. **Encoding**: Encoder processes video and calls webhook with results
-5. **Webhook Update**: Video status set to `published`, `manifest_cid` and `thumbnail_url` stored, job marked `completed`
-6. **Player Ready**: Embed URL now serves encoded HLS video
-
-### Video Status States
-
-- **uploading** - TUS upload in progress
-- **processing** - Upload complete, encoder is working on it
-- **awaiting_encode** - Upload complete and pinned, encode deferred until publish (`defer_encode`)
-- **published** - Video is ready to watch
-- **failed** - Processing failed
-- **deleted** - Video marked for deletion
-
-The video player handles all these states automatically, showing appropriate animations for uploading/processing/failed states, making the embed URL usable immediately.
-
-### Job Dispatcher
-
-The dispatcher runs every 30 seconds:
-1. Queries MongoDB for jobs with status `pending`
-2. Selects next available encoder using round-robin algorithm
-3. Sends job to encoder with IPFS gateway URL and webhook credentials
-4. Updates job status to `encoding` with assigned encoder name
-5. A job that cannot be sent goes back to `pending` for the next cycle (one attempt per job per cycle); the third failed attempt marks it `failed`
-
-See [ENCODERS.md](./ENCODERS.md) for multi-encoder configuration details.
-
-### Automatic File Cleanup
-
-The service includes an automatic cleanup system to prevent disk space exhaustion:
-- **Scheduled Cleanup**: Runs automatically at configurable intervals (default: every 24 hours)
-- **Retention Period**: Deletes temporary upload files older than configured days (default: 7 days)
-- **Manual Trigger**: Admin endpoint to run cleanup on-demand
-- **Preview Mode**: Check what files would be deleted without actually deleting them
-
-**Configuration:**
-```env
-CLEANUP_ENABLED=true                # Enable/disable cleanup (default: true)
-CLEANUP_INTERVAL_HOURS=24          # How often to run cleanup (default: 24)
-CLEANUP_RETENTION_DAYS=7           # Delete files older than this (default: 7)
-```
-
-**Admin Endpoints:**
-- `GET /admin/cleanup/preview` - Preview files that would be deleted
-- `POST /admin/cleanup/run` - Manually trigger cleanup
-
-### Encoder Management
-
-Encoders can be configured via environment variables (for initial seeding) or managed dynamically through the admin panel at `/admin.html`.
-
-**Initial Setup (Environment Variable):**
-```env
-ENCODERS=[{"name":"encoder1","url":"https://encoder.example.com","apiKey":"key","enabled":true}]
-```
-
-On first startup, encoders from the env var are seeded into MongoDB. After that, encoders are managed via the database.
-
-**Admin API Endpoints:**
-- `GET /admin/encoders` - List all encoders (API keys excluded)
-- `POST /admin/encoders` - Add a new encoder
-- `PATCH /admin/encoders/:name` - Update encoder (URL, API key, enable/disable)
-- `DELETE /admin/encoders/:name` - Remove an encoder
-
-**Add Encoder Example:**
-```bash
-curl -X POST http://localhost:3001/admin/encoders \
-  -H "X-Admin-Password: your-admin-password" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "encoder2", "url": "https://encoder2.example.com", "apiKey": "secret-key"}'
-```
-
-**What Gets Cleaned:**
-- Abandoned TUS uploads (files never completed)
-- Failed IPFS pinning uploads (pinning failed, file left behind)
-- Orphaned `.json` metadata files
-- Any temporary files older than retention period
-
-Files are only deleted after successful IPFS pinning or after exceeding the retention period, ensuring no data loss for active uploads.
-
-### User Management
-
-Users are created automatically on first upload. Admins can manage users via the admin panel at `/admin.html` or the API.
-
-**Admin API Endpoints:**
-- `GET /admin/users` - List all users (supports `?search=`, `?limit=`, `?skip=`)
-- `PATCH /admin/users/:username/ban` - Ban/unban a user (body: `{ "banned": true }`)
-- `PATCH /admin/users/:username/premium` - Grant/revoke premium (body: `{ "premium": true }`)
-
-**Premium Users:**
-
-Premium users get multi-resolution encoding (1080p, 720p, 480p) instead of the default 480p-only. The `premium` flag is sent to encoders at dispatch time.
-
-- Frontends check premium status via `GET /users/:username/premium` (API key required)
-- Admins toggle it via `PATCH /admin/users/:username/premium` or the admin panel
-
-**Grant Premium Example:**
-
-```bash
-curl -X PATCH http://localhost:3001/admin/users/coolmole/premium \
-  -H "X-Admin-Password: your-admin-password" \
-  -H "Content-Type: application/json" \
-  -d '{"premium": true}'
-```
-
-## Embed URL Format
-
-Videos are accessible via embed URLs in the following format:
-```
-https://play.3speak.tv/embed?v={username}/{videoId}
-```
-
-Example:
-```
-https://play.3speak.tv/embed?v=chessfighter/yn77aj9g
-```
+Issues and pull requests are welcome. Questions and ideas: [3Speak Discord](https://discord.gg/NSFS2VGj83).
 
 ## License
 
-MIT
+[MIT](LICENSE) © Mantequilla Soft.
