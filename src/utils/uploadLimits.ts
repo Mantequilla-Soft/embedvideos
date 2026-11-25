@@ -1,11 +1,19 @@
 /**
  * Daily upload limits for owners without 3Speak Pro.
  *
- * Rule (owner, 2026-11-20): at most `videosPerDay` regular videos and
- * `shortsPerDay` shorts per ROLLING 24 hours (defaults 1 and 3).
- * Warm-up accounts (owner, 2026-11-22): their own limit, `warmupVideosPerDay`
- * and `warmupShortsPerDay` (defaults 3 and 3). Each answer says which `plan`
- * applied ('free' or 'warmup').
+ * Who is limited (owner, 2026-11-25): warm-up accounts only, by default. Free
+ * Hive accounts have no upload cap: their limit moved to PUBLISHING (1 video
+ * and 3 shorts per 24 hours by publish time), which the checker enforces when
+ * a post is scheduled, so anything over it is scheduled for a free time. Their
+ * quota answers exempt with reason 'publish_limit'.
+ *
+ * Warm-up accounts (owner, 2026-11-22): at most `warmupVideosPerDay` regular
+ * videos and `warmupShortsPerDay` shorts per ROLLING 24 hours (defaults 3 and
+ * 3). They cannot schedule, so their cap stays on uploading.
+ * Free Hive accounts, only with UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true (the
+ * rule of 2026-11-20): `videosPerDay` regular videos and `shortsPerDay` shorts
+ * per rolling 24 hours (defaults 1 and 3). Each refusal and quota says which
+ * `plan` applied ('free' or 'warmup').
  *
  * What counts: rows in embed-video created in the last 24 hours whose status
  * says the bytes landed (COUNTED_UPLOAD_STATUSES in database/mongodb.ts). An
@@ -16,16 +24,18 @@
  * verifyReplacementTarget), as long as it is then registered as one.
  *
  * Who is exempt: owners listed in UPLOAD_LIMIT_EXEMPT and 3Speak Pro owners
- * (embed-users `premium`).
+ * (embed-users `premium`), and free Hive accounts while their uploads are not
+ * capped.
  *
- * The warm-up backlog never counts for a Hive account (owner, 2026-11-22). A
- * warm-up user (incubating, no Hive account yet) uploads under the bare handle
- * as `owner`. At graduation those uploads become the new Hive account's: either
- * the checker's claim-assets rewrites `owner` and stamps `owner_claimed_from`,
- * or the handle IS the Hive name and the rows stay as they are. Neither kind
- * uses a slot of the Hive account: rows with `owner_claimed_from` are dropped,
- * and so are rows created before the Hive account itself (nobody could have
- * uploaded as that Hive account before it existed).
+ * The warm-up backlog never counts for a Hive account (owner, 2026-11-22; it
+ * only matters while free uploads are capped). A warm-up user (incubating, no
+ * Hive account yet) uploads under the bare handle as `owner`. At graduation
+ * those uploads become the new Hive account's: either the checker's
+ * claim-assets rewrites `owner` and stamps `owner_claimed_from`, or the handle
+ * IS the Hive name and the rows stay as they are. Neither kind uses a slot of
+ * the Hive account: rows with `owner_claimed_from` are dropped, and so are rows
+ * created before the Hive account itself (nobody could have uploaded as that
+ * Hive account before it existed).
  *
  * Enforced server side for every app on this API: at POST /uploads/token and
  * again when an upload is created (TUS pre-create, /upload/simple,
@@ -49,7 +59,8 @@ import type { CountedUploadRow, Database } from '../database/mongodb';
 import type { Config, UploadLimitsConfig } from '../config/config';
 
 export type UploadKind = 'video' | 'short';
-export type ExemptReason = 'pro' | 'listed';
+/** 'publish_limit' = a free Hive account while its uploads are not capped (limited when publishing instead). */
+export type ExemptReason = 'pro' | 'listed' | 'publish_limit';
 /** Which limit applied: the free plan of a Hive account, or a warm-up account's. */
 export type UploadPlan = 'free' | 'warmup';
 
@@ -183,6 +194,11 @@ export class UploadLimiter {
     return this.cfg?.enabled === true;
   }
 
+  /** Are free Hive accounts held to an upload cap? Off by default: they are limited when publishing. */
+  get freeUploadsCapped(): boolean {
+    return this.cfg?.freeUploadsCapped === true;
+  }
+
   private now(): number {
     return this.deps.now ? this.deps.now() : Date.now();
   }
@@ -299,7 +315,8 @@ export class UploadLimiter {
     const warmup = await this.deps.isWarmup(owner);
     if (warmup === null) return null;
     if (warmup) return { plan: 'warmup', notBefore: null };
-    if (!this.deps.hiveAccountCreatedAt) return { plan: 'free', notBefore: null };
+    // Uncapped, no free row is ever counted: no need to know the account's age.
+    if (!this.freeUploadsCapped || !this.deps.hiveAccountCreatedAt) return { plan: 'free', notBefore: null };
     try {
       return { plan: 'free', notBefore: await this.deps.hiveAccountCreatedAt(owner) };
     } catch (err) {
@@ -312,8 +329,8 @@ export class UploadLimiter {
    * May `owner` upload one more `kind`? Returns null to allow, or the refusal.
    *
    * Cheapest first: the count needs one indexed query, and only an owner who
-   * has used as many slots as the smaller of the two limits pays for the Pro,
-   * warm-up and Hive account lookups.
+   * has used as many slots as the smallest limit that can apply pays for the
+   * Pro, warm-up and Hive account lookups.
    */
   async check(rawOwner: string, kind: UploadKind): Promise<LimitRefusal | null> {
     if (!this.enabled) return null;
@@ -321,11 +338,16 @@ export class UploadLimiter {
     try {
       if (this.isListed(owner)) return null;
       const all = (await this.usage(owner))[kind];
-      if (all.length < Math.min(this.limitFor(kind, 'free'), this.limitFor(kind, 'warmup'))) return null;
+      const floor = this.freeUploadsCapped
+        ? Math.min(this.limitFor(kind, 'free'), this.limitFor(kind, 'warmup'))
+        : this.limitFor(kind, 'warmup');
+      if (all.length < floor) return null;
       if (await this.deps.isUserPremium(owner)) return null;
       // null = a lookup could not answer: fail open.
       const p = await this.planFor(owner);
       if (!p) return null;
+      // A free Hive account is limited when it publishes, not here.
+      if (p.plan === 'free' && !this.freeUploadsCapped) return null;
       const limit = this.limitFor(kind, p.plan);
       const times = p.notBefore != null ? all.filter((t) => t >= p.notBefore!) : all;
       if (times.length < limit) return null;
@@ -337,10 +359,16 @@ export class UploadLimiter {
     }
   }
 
-  /** Why `owner` is exempt, or null. Warm-up accounts are not exempt: they have their own limit. */
+  /**
+   * Why `owner` is exempt, or null. Warm-up accounts are not exempt: they have
+   * their own limit. While free uploads are not capped, every other owner is
+   * ('publish_limit'), including one whose warm-up lookup cannot answer: its
+   * upload is let through then anyway (check() fails open).
+   */
   async exemptReason(owner: string): Promise<ExemptReason | null> {
     if (this.isListed(owner)) return 'listed';
     if (await this.deps.isUserPremium(owner)) return 'pro';
+    if (!this.freeUploadsCapped && (await this.deps.isWarmup(owner)) !== true) return 'publish_limit';
     return null;
   }
 
@@ -356,9 +384,12 @@ export class UploadLimiter {
       const unlimited = (kind: UploadKind): KindQuota => ({ limit: null, used: usage[kind].length, remaining: null, next_at: null });
       return { enabled: true, exempt: true, reason, plan: null, video: unlimited('video'), short: unlimited('short') };
     }
-    // A lookup that cannot answer reports the free plan over every row: the
-    // upload itself is let through then (check() fails open).
-    const p = (await this.planFor(owner)) ?? { plan: 'free' as UploadPlan, notBefore: null };
+    // Uncapped, only a warm-up account gets this far (see exemptReason).
+    // Capped, a lookup that cannot answer reports the free plan over every
+    // row: the upload itself is let through then (check() fails open).
+    const p = !this.freeUploadsCapped
+      ? { plan: 'warmup' as UploadPlan, notBefore: null }
+      : (await this.planFor(owner)) ?? { plan: 'free' as UploadPlan, notBefore: null };
     const usage = await this.usage(owner, p.notBefore);
     const kindQuota = (kind: UploadKind): KindQuota => {
       const used = usage[kind].length;

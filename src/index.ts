@@ -195,7 +195,8 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       }
     }
 
-    // Daily upload limit for owners without Pro. Checked here so a client is
+    // Daily upload limit for warm-up accounts (free Hive accounts too, only
+    // with UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true). Checked here so a client is
     // refused before any bytes move; checked again when the upload is created
     // (validateUploadAuth), which also covers X-API-Key uploads that never come
     // through this route. `owner` is not verified here (the API key is public),
@@ -306,8 +307,10 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
 });
 
 // GET /uploads/quota?owner=<name>: an owner's daily upload allowance, so a
-// frontend can say "1 video left today" before the user picks a file. Must stay
-// registered before the app.all('/uploads/*') tusd proxy, like /uploads/token.
+// frontend can say "1 video left today" before the user picks a file. A free
+// Hive account answers exempt (reason 'publish_limit') while its uploads are
+// not capped. Must stay registered before the app.all('/uploads/*') tusd
+// proxy, like /uploads/token.
 app.get('/uploads/quota', requireApiKey, async (req: Request, res: Response) => {
   const owner = typeof req.query.owner === 'string' ? req.query.owner.trim() : '';
   if (!owner) {

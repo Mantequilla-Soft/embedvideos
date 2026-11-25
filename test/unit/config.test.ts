@@ -10,7 +10,7 @@ const KEYS = [
   'WEBHOOK_API_KEY', 'WEBHOOK_URL', 'CLEANUP_ENABLED', 'CLEANUP_INTERVAL_HOURS', 'CLEANUP_RETENTION_DAYS',
   'UPLOAD_TOKEN_SECRET', 'UPLOAD_TOKEN_DEFAULT_TTL', 'UPLOAD_TOKEN_MAX_TTL', 'UPLOAD_TOKEN_MAX_FILE_SIZE',
   'MAX_UPLOAD_SIZE', 'DISPATCHER_ENABLED', 'GATE_URL', 'GATE_INTERNAL_API_KEY', 'GATE_CDN_BASE',
-  'UPLOAD_DAILY_LIMITS_ENABLED', 'UPLOAD_LIMIT_VIDEOS_PER_DAY', 'UPLOAD_LIMIT_SHORTS_PER_DAY',
+  'UPLOAD_DAILY_LIMITS_ENABLED', 'UPLOAD_LIMIT_FREE_UPLOADS_CAPPED', 'UPLOAD_LIMIT_VIDEOS_PER_DAY', 'UPLOAD_LIMIT_SHORTS_PER_DAY',
   'UPLOAD_LIMIT_EXEMPT', 'UPLOAD_LIMIT_WARMUP_LOOKUP_URL', 'UPLOAD_LIMIT_HIVE_NODES', 'UPLOAD_UPGRADE_URL',
 ];
 let saved: Record<string, string | undefined>;
@@ -63,6 +63,7 @@ describe('loadConfig defaults', () => {
     expect(c.demoApiKey).toMatch(/^sk_demo_/);
     expect(c.uploadLimits).toEqual({
       enabled: true,
+      freeUploadsCapped: false,
       videosPerDay: 1,
       shortsPerDay: 3,
       warmupVideosPerDay: 3,
@@ -153,6 +154,7 @@ describe('loadUploadLimitsConfig', () => {
   it('parses counts, exempt list and hive nodes from an explicit env', () => {
     expect(loadUploadLimitsConfig({
       UPLOAD_DAILY_LIMITS_ENABLED: 'false',
+      UPLOAD_LIMIT_FREE_UPLOADS_CAPPED: 'true',
       UPLOAD_LIMIT_VIDEOS_PER_DAY: '5',
       UPLOAD_LIMIT_SHORTS_PER_DAY: '0',
       UPLOAD_LIMIT_WARMUP_VIDEOS_PER_DAY: '2',
@@ -163,6 +165,7 @@ describe('loadUploadLimitsConfig', () => {
       UPLOAD_UPGRADE_URL: 'https://up/{user}',
     })).toEqual({
       enabled: false,
+      freeUploadsCapped: true,
       videosPerDay: 5,
       shortsPerDay: 0,
       warmupVideosPerDay: 2,
@@ -179,5 +182,13 @@ describe('loadUploadLimitsConfig', () => {
     expect(c.videosPerDay).toBe(1);
     expect(c.shortsPerDay).toBe(3);
     expect(c.enabled).toBe(true);
+    expect(c.freeUploadsCapped).toBe(false);
+  });
+
+  it('caps free uploads only for exactly "true"', () => {
+    for (const v of ['1', 'yes', 'TRUE', ' true', '']) {
+      expect(loadUploadLimitsConfig({ UPLOAD_LIMIT_FREE_UPLOADS_CAPPED: v }).freeUploadsCapped).toBe(false);
+    }
+    expect(loadUploadLimitsConfig({ UPLOAD_LIMIT_FREE_UPLOADS_CAPPED: 'true' }).freeUploadsCapped).toBe(true);
   });
 });

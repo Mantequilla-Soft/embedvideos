@@ -23,7 +23,8 @@ vi.mock('../../src/utils/ipfs', async () => {
 
 const GB = 1024 * 1024 * 1024;
 process.env.MAX_UPLOAD_SIZE = String(30 * GB);
-installFetchStub();
+// `chunkwarm` is a warm-up account (3 videos a day); free Hive accounts have no upload cap.
+installFetchStub({ incubating: ['chunkwarm'] });
 
 let database: Database;
 let config: any;
@@ -98,11 +99,11 @@ describe('POST /upload/chunk/create', () => {
   });
 
   it('refuses past the daily limit with 429 and Retry-After', async () => {
-    const who = owner();
-    await seedVideo(database, who);
+    const who = 'chunkwarm';
+    for (let i = 0; i < 3; i++) await seedVideo(database, who);
     const res = await create({ owner: who, size: String(SIZE), chunkSize: String(MIN) });
     expect(res.status).toBe(429);
-    expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', used: 1 });
+    expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', plan: 'warmup', used: 3 });
     expect(Number(res.headers['retry-after'])).toBeGreaterThan(0);
   });
 

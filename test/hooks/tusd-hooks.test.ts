@@ -296,13 +296,14 @@ describe('pre-create', () => {
   });
 
   it('passes the daily-limit 429 and its Retry-After through to tusd', async () => {
-    // One counted upload already today, the warm-up registry says "not incubating",
-    // and Hive has an account `ivan` from long before it (so the upload counts).
-    await insertVideo(database, { owner: 'ivan', status: 'published', createdAt: new Date() });
+    // Three counted uploads already today by `ivan`, a warm-up account: the
+    // registry says "incubating" and Hive has no account of that name. (Free
+    // Hive accounts have no upload cap.)
+    for (let i = 0; i < 3; i++) await insertVideo(database, { owner: 'ivan', status: 'published', createdAt: new Date() });
     fetchMock.mockImplementation(async (url: unknown) => new Response(JSON.stringify(
       String(url).includes('/incubation/authors')
-        ? { authors: { ivan: { status: 'graduated' } } }
-        : { result: [{ name: 'ivan', created: '2020-01-01T00:00:00' }] },
+        ? { authors: { ivan: { status: 'incubating' } } }
+        : { result: [] },
     ), { status: 200 }));
     const permlink = uid('lim');
     const res = await preCreate({ headers: { 'X-Api-Key': [apiKey] }, meta: { owner: 'ivan', permlink } });

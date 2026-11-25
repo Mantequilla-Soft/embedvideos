@@ -27,7 +27,8 @@ vi.mock('../../src/utils/ipfs', async () => {
 });
 
 process.env.MAX_UPLOAD_SIZE = '4096';
-installFetchStub();
+// `simplewarm` is a warm-up account (3 videos a day); free Hive accounts have no upload cap.
+installFetchStub({ incubating: ['simplewarm'] });
 
 let database: Database;
 let config: any;
@@ -135,11 +136,11 @@ describe('POST /upload/simple', () => {
   });
 
   it('refuses past the daily limit with the 429 body and Retry-After', async () => {
-    const who = owner();
-    await seedVideo(database, who);
+    const who = 'simplewarm';
+    for (let i = 0; i < 3; i++) await seedVideo(database, who);
     const res = await (await api()).post('/upload/simple').set('X-API-Key', key).field('owner', who).attach('file', FILE, 'a.mp4');
     expect(res.status).toBe(429);
-    expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video' });
+    expect(res.body).toMatchObject({ code: 'daily_upload_limit', kind: 'video', plan: 'warmup' });
     expect(Number(res.headers['retry-after'])).toBeGreaterThan(0);
     expect(leftovers()).toEqual([]);
   });

@@ -139,12 +139,12 @@ Tests: `npx ts-node --transpile-only scripts/test-encoder-version.ts` (31 checks
 
 ### Daily upload limits (`src/utils/uploadLimits.ts`)
 
-Non-Pro owners: `UPLOAD_LIMIT_VIDEOS_PER_DAY` (1) videos and `UPLOAD_LIMIT_SHORTS_PER_DAY` (3) shorts per rolling 24h. On unless `UPLOAD_DAILY_LIMITS_ENABLED=false`. Checked at `POST /uploads/token` AND inside `validateUploadAuth` (so X-API-Key uploads on TUS, simple and chunked are held to it too; the key is public). Refusal is a 429 with `code: 'daily_upload_limit'` (contract in README "Upload Limits"); `GET /uploads/quota` reports the allowance.
+Warm-up accounts: `UPLOAD_LIMIT_WARMUP_VIDEOS_PER_DAY` (3) videos and `UPLOAD_LIMIT_WARMUP_SHORTS_PER_DAY` (3) shorts per rolling 24h. Free Hive accounts have no upload cap (their limit is on publishing, enforced by the checker; quota answers `exempt: true, reason: 'publish_limit'`) unless `UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true`, which brings back `UPLOAD_LIMIT_VIDEOS_PER_DAY` (1) videos and `UPLOAD_LIMIT_SHORTS_PER_DAY` (3) shorts. On unless `UPLOAD_DAILY_LIMITS_ENABLED=false`. Checked at `POST /uploads/token` AND inside `validateUploadAuth` (so X-API-Key uploads on TUS, simple and chunked are held to it too; the key is public). Refusal is a 429 with `code: 'daily_upload_limit'` (contract in README "Upload Limits"); `GET /uploads/quota` reports the allowance.
 
 - Counts rows with `COUNTED_UPLOAD_STATUSES` (`processing`, `awaiting_encode`, `published`) in `embed-video`, index `{ owner: 1, createdAt: -1 }`.
 - Stream VODs: X-API-Key + `frontend_app: '3speak-hangouts'` + not short is only a CLAIM (the hangouts server uses the same public key as the browser). It is verified against `stream-stats` / `stream-golive` (owner + permlink = room name) and stored as `stream_vod` on the row; `true` rows never count.
 - Media replacements are free: `replaces` (signed token claim, or `replaces` metadata on X-API-Key uploads) is verified by `verifyReplacementTarget` (target exists in embed-video or legacy `videos` AND same owner), stored as `replaces_existing` / `replaces_target`, unlisted from creation. Not counted once registered (`replacesPermlink` set) or within `REPLACEMENT_REGISTER_GRACE_MS` (6h); unregistered after that it counts.
-- Exempt: `UPLOAD_LIMIT_EXEMPT`, `isUserPremium`, warm-up (checker `POST /incubation/authors` says `incubating` AND Hive has no account of that name; cached 5 min).
+- Exempt: `UPLOAD_LIMIT_EXEMPT`, `isUserPremium`, and free Hive accounts while uncapped. Warm-up = checker `POST /incubation/authors` says `incubating` AND Hive has no account of that name; cached 5 min.
 - Everything fails open.
 
 Tests: `npx ts-node --transpile-only scripts/test-upload-limits.ts` (no MongoDB, no network).

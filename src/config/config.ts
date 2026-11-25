@@ -47,16 +47,26 @@ export interface Config {
   // CDN base the gate fetches encrypted manifests from. Must be a host in the
   // gate's own GATE_UPSTREAM_HOSTS allowlist or registration is rejected.
   gateCdnBase: string;
-  /** Daily upload limits for non-Pro owners. See src/utils/uploadLimits.ts. */
+  /**
+   * Daily upload limits: warm-up accounts always, free Hive accounts only when
+   * UPLOAD_LIMIT_FREE_UPLOADS_CAPPED=true. See src/utils/uploadLimits.ts.
+   */
   uploadLimits: UploadLimitsConfig;
 }
 
 export interface UploadLimitsConfig {
   /** UPLOAD_DAILY_LIMITS_ENABLED. On unless set to exactly "false". */
   enabled: boolean;
-  /** Regular (non-short) videos per rolling 24 hours. */
+  /**
+   * UPLOAD_LIMIT_FREE_UPLOADS_CAPPED. Off unless set to exactly "true": free
+   * Hive accounts have no upload cap, their limit is on publishing (the checker
+   * enforces it when a post is scheduled). "true" brings back the free plan's
+   * upload cap below.
+   */
+  freeUploadsCapped: boolean;
+  /** Regular (non-short) videos per rolling 24 hours for a free Hive account (only while capped). */
   videosPerDay: number;
-  /** Shorts per rolling 24 hours. */
+  /** Shorts per rolling 24 hours for a free Hive account (only while capped). */
   shortsPerDay: number;
   /** Regular videos per rolling 24 hours for a warm-up account (no Hive account yet). */
   warmupVideosPerDay: number;
@@ -88,6 +98,7 @@ export function loadUploadLimitsConfig(env: NodeJS.ProcessEnv = process.env): Up
   const hiveNodes = (env.UPLOAD_LIMIT_HIVE_NODES || '').split(',').map((s) => s.trim()).filter(Boolean);
   return {
     enabled: env.UPLOAD_DAILY_LIMITS_ENABLED !== 'false',
+    freeUploadsCapped: env.UPLOAD_LIMIT_FREE_UPLOADS_CAPPED === 'true',
     videosPerDay: parseCount(env.UPLOAD_LIMIT_VIDEOS_PER_DAY, 1),
     shortsPerDay: parseCount(env.UPLOAD_LIMIT_SHORTS_PER_DAY, 3),
     warmupVideosPerDay: parseCount(env.UPLOAD_LIMIT_WARMUP_VIDEOS_PER_DAY, 3),
