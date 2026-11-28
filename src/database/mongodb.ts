@@ -318,9 +318,20 @@ export interface EncodingJob {
    * field existed, which means "none".
    */
   failedWorkers?: string[];
+  /**
+   * Set by the checker (points shop `encode` item) on a pending job so it is
+   * taken before the others: pending jobs are picked by priority, highest
+   * first, then oldest first. A job without it sorts after every job that has
+   * one (Mongo puts a missing field below any number). Never changes which
+   * encoders may take the job.
+   */
+  priority?: number;
   createdAt: Date;
   updatedAt: Date;
 }
+
+/** The order pending jobs are picked in: priority first (missing sorts last), then oldest first. */
+export const PENDING_JOB_SORT = { priority: -1, createdAt: 1 } as const;
 
 export class Database {
   private client: MongoClient;
@@ -377,6 +388,8 @@ export class Database {
     // Index for community job claiming (findOneAndUpdate filter)
     const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
     await this.ensureIndex(jobsCollection, { status: 1, premium: 1, short: 1, createdAt: 1 });
+    // Managed dispatch: pending jobs by priority, then oldest first.
+    await this.ensureIndex(jobsCollection, { status: 1, priority: -1, createdAt: 1 });
 
     console.log('Connected to MongoDB');
   }
@@ -652,13 +665,14 @@ export class Database {
     const jobsCollection = this.db.collection<EncodingJob>('embed-jobs');
     return jobsCollection
       .find({ status: 'pending' })
-      .sort({ createdAt: 1 })
+      .sort(PENDING_JOB_SORT)
       .limit(limit)
       .toArray();
   }
 
   /**
-   * Atomically claim the next pending managed job (premium or free, non-short or short).
+   * Atomically claim the next pending managed job (premium or free, non-short or short),
+   * highest `priority` first, then oldest first (PENDING_JOB_SORT).
    * Uses findOneAndUpdate so two concurrent dispatchers cannot claim the same job.
    * Returns null if no pending job matches.
    */
@@ -674,7 +688,7 @@ export class Database {
     return jobsCollection.findOneAndUpdate(
       query,
       { $set: { status: 'encoding' as JobStatus, updatedAt: new Date() } },
-      { sort: { createdAt: 1 }, returnDocument: 'after' }
+      { sort: PENDING_JOB_SORT, returnDocument: 'after' }
     );
   }
 
@@ -1118,7 +1132,7 @@ export class Database {
           callbackToken,
         },
       },
-      { sort: { createdAt: 1 }, returnDocument: 'after' }
+      { sort: PENDING_JOB_SORT, returnDocument: 'after' }
     );
 
     return result;

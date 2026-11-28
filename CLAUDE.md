@@ -63,6 +63,10 @@ Community pull uses `failedWorkers: { $ne: encoderName }`, which also matches jo
 
 Tests: `npx ts-node --transpile-only scripts/test-retry-dispatch.ts` (18 checks, no MongoDB required).
 
+### Pick order
+
+Pending jobs are taken by `priority` descending, then `createdAt` ascending (`PENDING_JOB_SORT`, index `{ status: 1, priority: -1, createdAt: 1 }`), by the managed dispatcher and by community pull alike. The 3Speak checker sets `priority: 1` on a pending job when its owner spends points on a faster encode. It only changes the order: tier, trust and community filters are untouched.
+
 ### Gated (paid) content and encoder trust
 
 Videos with `gated: true` are AES-128 encrypted at encode time; only `3speak-gate` can hand a viewer the key. Dispatch is restricted to encoders carrying `trusted: true`.

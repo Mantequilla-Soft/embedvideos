@@ -117,6 +117,15 @@ describe('successful dispatch', () => {
     expect((await database.getPendingJobs()).map((j) => j.permlink)).toEqual(['batch-5', 'batch-6']);
   });
 
+  it('a prioritised job jumps the queue; the rest stay oldest first', async () => {
+    await addEncoder();
+    for (let i = 0; i < 6; i++) await seedVideoAndJob({ permlink: `q-${i}` }, { createdAt: minutesAgo(100 - i) });
+    await seedVideoAndJob({ permlink: 'q-boosted' }, { priority: 1, createdAt: minutesAgo(1) });
+    await run(new JobDispatcher(database, config));
+    expect(fetchMock.mock.calls.map((_, i) => sentBody(i).permlink)).toEqual(['q-boosted', 'q-0', 'q-1', 'q-2', 'q-3']);
+    expect((await database.getPendingJobs()).map((j) => j.permlink)).toEqual(['q-4', 'q-5']);
+  });
+
   it('round robins across a cycle', async () => {
     await addEncoder({ name: 'a', url: 'http://a.test', createdAt: minutesAgo(10) });
     await addEncoder({ name: 'b', url: 'http://b.test', createdAt: minutesAgo(5) });
