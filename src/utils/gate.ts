@@ -11,6 +11,34 @@ import { Config } from '../config/config';
 
 const REQUEST_TIMEOUT_MS = 10_000;
 
+/** How far ahead an early-access end may be set. Catches typos like year 20270. */
+export const MAX_PUBLIC_AT_AHEAD_MS = 366 * 24 * 60 * 60 * 1000;
+
+/**
+ * Validates an early-access end (`public_at`) for a members-only video: from
+ * that moment on the gate treats the video as public for everyone.
+ *
+ * Accepts an ISO date string or epoch milliseconds. Absent (undefined / null)
+ * means "members-only for good". The date must be in the future and at most
+ * MAX_PUBLIC_AT_AHEAD_MS ahead.
+ */
+export function parsePublicAt(
+  value: unknown,
+  now: number = Date.now(),
+): { ok: true; date: Date | null } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, date: null };
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return { ok: false, error: 'public_at must be an ISO date string or epoch milliseconds' };
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return { ok: false, error: 'public_at is not a valid date' };
+  if (date.getTime() <= now) return { ok: false, error: 'public_at must be in the future' };
+  if (date.getTime() > now + MAX_PUBLIC_AT_AHEAD_MS) {
+    return { ok: false, error: 'public_at may be at most a year ahead' };
+  }
+  return { ok: true, date };
+}
+
 export function isGateConfigured(config: Config): boolean {
   return Boolean(config.gateUrl && config.gateInternalApiKey);
 }
@@ -29,8 +57,10 @@ export async function registerGatedVideo(
     creator: string;
     manifestCid: string;
     previewPath?: string;
-    /** Named accounts that may watch without Pro. Omitted when empty. */
+    /** Named accounts that may watch without a membership. Omitted when empty. */
     allowlist?: string[];
+    /** Early-access end: public for everyone from then on. Omitted when unset. */
+    publicAt?: Date | string | null;
   }
 ): Promise<void> {
   if (!isGateConfigured(config)) {
@@ -49,6 +79,7 @@ export async function registerGatedVideo(
     // The encoder writes an unencrypted trailer beside the encrypted renditions.
     previewUrl: `${upstreamBaseUrl}${params.previewPath ?? 'preview/index.m3u8'}`,
     ...(params.allowlist?.length ? { allowlist: params.allowlist } : {}),
+    ...(params.publicAt ? { publicAt: new Date(params.publicAt).toISOString() } : {}),
   };
 
   const response = await fetch(`${config.gateUrl.replace(/\/+$/, '')}/internal/videos`, {

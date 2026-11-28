@@ -30,6 +30,11 @@ export interface UploadTokenClaims {
    * the Hive post, so the recipient list is not published on-chain.
    */
   allowlist?: string[];
+  /**
+   * Early access for this gated video, as an ISO date: members (and guests)
+   * first, everyone from this moment on. Signed-claim only, like `gated`.
+   */
+  publicAt?: string;
   /** Max upload size in bytes */
   maxFileSize: number;
   /** Allowed CORS origins */

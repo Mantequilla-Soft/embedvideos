@@ -19,7 +19,7 @@ import { JobDispatcher } from './dispatcher/jobDispatcher';
 import { unwrapJWS, JWSAuthError } from './utils/jws';
 import { CleanupService } from './utils/cleanup';
 import { signUploadToken, verifyUploadToken, generateTokenId, UploadTokenClaims } from './utils/uploadToken';
-import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted } from './utils/gate';
+import { registerGatedVideo, isGateConfigured, verifyGatedManifestEncrypted, parsePublicAt } from './utils/gate';
 import { clientIpFrom, ipHashes } from './utils/ipHash';
 import { parseReportedVersion, buildRegistrationVersionUpdate, buildHeartbeatVersionUpdate } from './utils/encoderVersion';
 import { getUploadLimiter, normalizeOwner, verifyReplacementTarget } from './utils/uploadLimits';
@@ -141,7 +141,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     }
 
     const {
-      owner: rawOwner, frontend_app, short = false, gated = false, allowlist,
+      owner: rawOwner, frontend_app, short = false, gated = false, allowlist, public_at,
       allowed_origins = [], max_file_size, ttl, defer_encode = false, replaces,
     } = req.body;
 
@@ -156,6 +156,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
     // place the gated flag can be granted, because it is the only place with a
     // verified owner and a signing key. Everything downstream reads it from the
     // signed claim rather than from client-supplied metadata.
+    let publicAt: Date | null = null;
     if (gated) {
       if (typeof gated !== 'boolean') {
         return res.status(422).json({ error: 'gated must be a boolean' });
@@ -184,6 +185,13 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
           return res.status(422).json({ error: `"${bad}" is not a valid Hive account name` });
         }
       }
+      // Early access: members first, everyone from public_at on. Signed into
+      // the token like the guest list, so an API-key caller cannot set it.
+      const parsedPublicAt = parsePublicAt(public_at);
+      if (!parsedPublicAt.ok) {
+        return res.status(422).json({ error: parsedPublicAt.error });
+      }
+      publicAt = parsedPublicAt.date;
 
       const isPro = await database.isUserPremium(owner);
       if (!isPro) {
@@ -248,6 +256,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
       ...(gated && Array.isArray(allowlist) && allowlist.length
         ? { allowlist: [...new Set(allowlist.map((u: string) => String(u).trim().toLowerCase().replace(/^@/, '')))] }
         : {}),
+      ...(publicAt ? { publicAt: publicAt.toISOString() } : {}),
       maxFileSize,
       allowedOrigins: Array.isArray(allowed_origins) ? allowed_origins : [],
       permlink,
@@ -275,6 +284,7 @@ app.post('/uploads/token', requireApiKey, async (req: Request, res: Response) =>
           maxFileSize: 0,
           gated: false,
           allowlist: [],
+          publicAt: undefined,
           iat: now,
           exp: now + FINALIZE_TOKEN_TTL_SECONDS,
         },
@@ -443,13 +453,13 @@ app.post('/upload/simple', (req: Request, res: Response) => {
     const auth = await validateUploadAuth(authHeaders(), authMetadata(), receivedSize, database, config, false);
     if (!auth.ok) return fail(auth.status, auth.error, auth.body, auth.headers);
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
+    const { owner, permlink, frontend_app, short, gated, allowlist, publicAt, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
 
     await database.createVideoEntry({
       owner, permlink, frontend_app,
       status: 'uploading',
       input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-      short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: receivedSize,
+      short, gated, gate_video_id: gated ? permlink : null, allowlist, public_at: publicAt, defer_encode: deferEncode, duration, size: receivedSize,
       ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
       ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
       encodingProgress: 0,
@@ -652,14 +662,14 @@ app.post('/upload/chunk/create', async (req: Request, res: Response) => {
     if (auth.headers) res.set(auth.headers);
     return res.status(auth.status).json(auth.body ?? { error: auth.error });
   }
-  const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
+  const { owner, permlink, frontend_app, short, gated, allowlist, publicAt, deferEncode, originalFilename, duration, streamVod, replacesExisting } = auth;
 
   try {
     await database.createVideoEntry({
       owner, permlink, frontend_app,
       status: 'uploading',
       input_cid: null, ipfs_pin_endpoint: null, manifest_cid: null, thumbnail_url: null,
-      short, gated, gate_video_id: gated ? permlink : null, allowlist, defer_encode: deferEncode, duration, size: totalSize,
+      short, gated, gate_video_id: gated ? permlink : null, allowlist, public_at: publicAt, defer_encode: deferEncode, duration, size: totalSize,
       ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
       ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
       encodingProgress: 0,
@@ -877,7 +887,7 @@ async function handleTusdHook(req: Request, res: Response) {
       return res.json({});
     }
 
-    const { owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod, replacesExisting } = authResult;
+    const { owner, permlink, frontend_app, short, gated, allowlist, publicAt, deferEncode, originalFilename, duration, size, streamVod, replacesExisting } = authResult;
 
     // Hard size cap, enforced for every upload regardless of auth method.
     // For parallel/Concatenation uploads this fires on the final concat, whose
@@ -905,6 +915,7 @@ async function handleTusdHook(req: Request, res: Response) {
       gated,
       gate_video_id: gated ? permlink : null,
       allowlist,
+      public_at: publicAt,
       defer_encode: deferEncode,
       ...(streamVod !== undefined ? { stream_vod: streamVod } : {}),
       ...(replacesExisting ? { replaces_existing: true, replaces_target: replacesExisting } : {}),
@@ -1040,12 +1051,14 @@ async function commissionEncode(
   db: Database,
   video: VideoMetadata,
   gated: boolean,
-  allowlist: string[]
+  allowlist: string[],
+  publicAt: Date | null = null
 ): Promise<void> {
   await db.updateVideoStatus(video.permlink, 'processing', {
     gated,
     gate_video_id: gated ? video.permlink : null,
     allowlist,
+    public_at: gated ? publicAt : null,
   });
 
   try {
@@ -1069,6 +1082,7 @@ async function commissionEncode(
         gated: video.gated,
         gate_video_id: video.gate_video_id ?? null,
         allowlist: video.allowlist,
+        public_at: video.public_at ?? null,
         // Kept, so the deferred-heal sweep (which waits for idle rows) retries it.
         updatedAt: video.updatedAt,
       }).catch((revertErr) => console.error(`Failed to revert ${video.owner}/${video.permlink} after a job insert error:`, revertErr));
@@ -1281,6 +1295,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
             creator: owner,
             manifestCid: manifest_cid,
             allowlist: gatedVideo.allowlist,
+            publicAt: gatedVideo.public_at ?? null,
           });
           console.log(`🔐 Gated video registered with gate: ${owner}/${permlink}`);
         }
@@ -1666,12 +1681,13 @@ app.post('/video/:permlink/encode', async (req: Request, res: Response) => {
       return res.status(409).json({ error: 'Upload has no pinned input yet', code: 'not_pinned' });
     }
 
-    const { gated = false, allowlist } = req.body || {};
+    const { gated = false, allowlist, public_at } = req.body || {};
     if (typeof gated !== 'boolean') {
       return res.status(422).json({ error: 'gated must be a boolean' });
     }
 
     let cleanAllowlist: string[] = [];
+    let publicAt: Date | null = null;
     if (gated) {
       if (!isGateConfigured(config)) {
         console.error('Gated encode requested but GATE_URL / GATE_INTERNAL_API_KEY are not set');
@@ -1694,6 +1710,12 @@ app.post('/video/:permlink/encode', async (req: Request, res: Response) => {
         cleanAllowlist = [...new Set(allowlist.map((u: string) => String(u).trim().toLowerCase().replace(/^@/, '')))];
       }
 
+      const parsedPublicAt = parsePublicAt(public_at);
+      if (!parsedPublicAt.ok) {
+        return res.status(422).json({ error: parsedPublicAt.error });
+      }
+      publicAt = parsedPublicAt.date;
+
       // Re-checked here rather than trusted from issuance: Pro can lapse
       // between picking a file and pressing publish, and this is the moment the
       // capability is actually granted.
@@ -1704,9 +1726,12 @@ app.post('/video/:permlink/encode', async (req: Request, res: Response) => {
       }
     }
 
-    await commissionEncode(database, video, gated, cleanAllowlist);
+    await commissionEncode(database, video, gated, cleanAllowlist, publicAt);
 
-    res.status(201).json({ success: true, gated, allowlist: cleanAllowlist });
+    res.status(201).json({
+      success: true, gated, allowlist: cleanAllowlist,
+      ...(publicAt ? { public_at: publicAt.toISOString() } : {}),
+    });
   } catch (error) {
     console.error('Error commissioning encode:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -2011,7 +2036,7 @@ export async function sweepHealableDeferred(): Promise<void> {
           }
         }
 
-        await commissionEncode(database, v, gated, Array.isArray(v.allowlist) ? v.allowlist : []);
+        await commissionEncode(database, v, gated, Array.isArray(v.allowlist) ? v.allowlist : [], v.public_at ? new Date(v.public_at) : null);
         console.log(`Heal sweep: commissioned stalled encode for ${v.owner}/${v.permlink} (Hive post present, finalize signal never arrived)`);
       } catch (err) {
         console.error(`Heal sweep: failed to heal ${v.permlink}:`, err);

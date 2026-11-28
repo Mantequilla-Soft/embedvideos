@@ -340,7 +340,8 @@ API key required. Returns 201.
 | `replaces` | string | Permlink of the owner's existing video whose media this upload replaces (free under the daily limit) |
 | `defer_encode` | boolean | Upload now, start the encode later with `POST /video/:permlink/encode` |
 | `gated` | boolean | Paid video, encrypted at encode time. Requires 3Speak Pro and a configured gate |
-| `allowlist` | string[] | Gated only: up to 500 Hive accounts that may watch without Pro |
+| `allowlist` | string[] | Gated only: up to 500 Hive accounts that may watch without being a member |
+| `public_at` | ISO date or epoch ms | Gated only: early access. Members first, public for everyone from this moment on. Must be in the future, at most a year ahead. Signed into the token and forwarded to the gate at registration |
 
 ```json
 {
@@ -359,7 +360,7 @@ API key required. Returns 201.
 `gated`, `defer_encode` and `replaces` are echoed so a client can confirm what was
 honoured (`replaces` is `null` when the target did not check out). With
 `defer_encode: true` the response also carries a `finalize_token` (valid 12 hours).
-Errors: 422 (bad `owner`, `gated` or `allowlist`), 403 `pro_required`, 503 (tokens or gate
+Errors: 422 (bad `owner`, `gated`, `allowlist` or `public_at`), 403 `pro_required`, 503 (tokens or gate
 not configured), 429 [`daily_upload_limit`](#daily-upload-limits).
 
 #### `POST /uploads` (tus)
@@ -409,7 +410,7 @@ hours idle, so send every request of one session to the same server.
 | `GET /video/:permlink` | public | The video row: `status`, `encodingProgress`, `manifest_cid`, `thumbnail_url`, `duration`, `short`, `hive_*`, timestamps. 404 if unknown |
 | `POST /video/:permlink/hive` | API key | Link the Hive post: `{hive_author, hive_permlink, hive_title?, hive_body?, hive_tags?}`. First link wins (see [step 5](#5-link-the-hive-post-optional)) |
 | `POST /video/:permlink/thumbnail` | API key | Set a custom thumbnail: `{thumbnail_url}` |
-| `POST /video/:permlink/encode` | finalize token | Deferred uploads: `{gated, allowlist?}` writes the gating choice and queues the encode in one step. Idempotent (`already_queued: true`); 409 `not_awaiting_encode` / `not_pinned` |
+| `POST /video/:permlink/encode` | finalize token | Deferred uploads: `{gated, allowlist?, public_at?}` writes the gating choice and queues the encode in one step. Idempotent (`already_queued: true`); 409 `not_awaiting_encode` / `not_pinned` |
 | `GET /video/:permlink/replace-target` | API key | Can this video's media be replaced? `{found, kind: "embed" \| "legacy", owner, status}` |
 | `POST /video/:permlink/replaces` | API key | Register `:permlink` (the new upload) as the replacement for `{replaces}` (the original, same owner). When the new upload finishes encoding, its media moves onto the original row, which keeps its permlink, views and Hive post |
 | `GET /users/:username/premium` | API key | `{username, premium}`; premium (3Speak Pro) owners get multi-resolution encodes. 404 if the user has never uploaded |

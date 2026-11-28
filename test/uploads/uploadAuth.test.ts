@@ -101,7 +101,7 @@ describe('token claims and metadata', () => {
     const r = await auth(bearer(t.token), { owner: 'spoof', permlink: 'spoofed', frontend_app: 'x', short: 'false', filename: 'a.mp4', duration: '12.5' });
     expect(r).toEqual({
       ok: true, owner: who, permlink: 'tokperm1', frontend_app: 'signed-app', short: true, gated: true,
-      allowlist: ['guest1'], deferEncode: true, originalFilename: 'a.mp4', duration: 12.5, size: SIZE,
+      allowlist: ['guest1'], publicAt: null, deferEncode: true, originalFilename: 'a.mp4', duration: 12.5, size: SIZE,
       streamVod: undefined, replacesExisting: null,
     });
     // The user row is created on first upload.
@@ -112,6 +112,18 @@ describe('token claims and metadata', () => {
     const who = owner();
     const r = await auth({ 'x-api-key': [key] }, { owner: who, gated: 'true', allowlist: 'x', defer_encode: 'true', short: 'true', permlink: 'akperm1', frontend_app: 'app1' }, false, null);
     expect(r).toMatchObject({ ok: true, owner: who, permlink: 'akperm1', frontend_app: 'app1', short: true, gated: false, allowlist: [], deferEncode: false, size: null, duration: null, originalFilename: null });
+  });
+
+  it('takes publicAt from a gated token only', async () => {
+    const at = '2027-03-04T05:06:07.000Z';
+    const gated = mintToken(config.uploadTokenSecret, { owner: owner(), gated: true, publicAt: at });
+    expect(await auth(bearer(gated.token))).toMatchObject({ ok: true, gated: true, publicAt: new Date(at) });
+    const ungated = mintToken(config.uploadTokenSecret, { owner: owner(), publicAt: at });
+    expect(await auth(bearer(ungated.token))).toMatchObject({ ok: true, gated: false, publicAt: null });
+    const junk = mintToken(config.uploadTokenSecret, { owner: owner(), gated: true, publicAt: 'not a date' });
+    expect(await auth(bearer(junk.token))).toMatchObject({ ok: true, publicAt: null });
+    const apiKey = await auth({ 'x-api-key': [key] }, { owner: owner(), public_at: at, publicAt: at }, false, null);
+    expect(apiKey).toMatchObject({ ok: true, publicAt: null });
   });
 
   it('drops an allowlist on a token that is not gated', async () => {

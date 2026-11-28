@@ -80,6 +80,12 @@ export interface VideoMetadata {
    */
   allowlist?: string[];
   /**
+   * Early access: members of the owner's channel (and guests) watch first, and
+   * from this moment on the gate treats the video as public for everyone.
+   * Forwarded to the gate at registration. Null / absent = members-only for good.
+   */
+  public_at?: Date | null;
+  /**
    * Hold the encode until the client explicitly asks for it.
    *
    * Gating has to be decided before encoding starts, because it is the encoder

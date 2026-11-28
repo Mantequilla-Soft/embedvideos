@@ -145,6 +145,31 @@ describe('POST /video/:permlink/encode', () => {
     expect(await database.getJob('paula', v.permlink)).toMatchObject({ gated: true, gateVideoId: v.permlink, short: true, premium: true });
   });
 
+  it('stores public_at on a gated encode and answers with it', async () => {
+    await insertUser(database, 'pia', { premium: true });
+    const v = await parked({ owner: 'pia' });
+    const at = new Date(Date.now() + 2 * 24 * 3600 * 1000).toISOString();
+    const res = await encode(v.permlink, finalizeFor(v.permlink, 'pia'), { gated: true, public_at: at });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ success: true, gated: true, allowlist: [], public_at: at });
+    expect((await database.getVideo(v.permlink)).public_at).toEqual(new Date(at));
+  });
+
+  it('ignores public_at on an ungated encode and validates it on a gated one', async () => {
+    await insertUser(database, 'pim', { premium: true });
+    const open = await parked({ owner: 'pim' });
+    const at = new Date(Date.now() + 3600 * 1000).toISOString();
+    const res = await encode(open.permlink, finalizeFor(open.permlink, 'pim'), { gated: false, public_at: at });
+    expect(res.body).toEqual({ success: true, gated: false, allowlist: [] });
+    expect((await database.getVideo(open.permlink)).public_at).toBeNull();
+
+    const v = await parked({ owner: 'pim' });
+    const bad = await encode(v.permlink, finalizeFor(v.permlink, 'pim'), { gated: true, public_at: '2001-01-01T00:00:00Z' });
+    expect(bad.status).toBe(422);
+    expect(bad.body.error).toBe('public_at must be in the future');
+    expect(await database.getJob('pim', v.permlink)).toBeNull();
+  });
+
   it('refuses videos that are not parked or not pinned', async () => {
     const live = await parked({ status: 'processing' });
     const r1 = await encode(live.permlink, finalizeFor(live.permlink));
@@ -445,11 +470,11 @@ describe('sweepHealableDeferred', () => {
 
   it('carries gating forward for Pro owners and skips gated videos whose Pro lapsed', async () => {
     await insertUser(database, 'gpro', { premium: true });
-    const gated = await stalled({ owner: 'gpro', gated: true, allowlist: ['amy'] });
+    const gated = await stalled({ owner: 'gpro', gated: true, allowlist: ['amy'], public_at: new Date('2027-05-06T00:00:00Z') });
     const lapsed = await stalled({ owner: 'glapsed', gated: true, allowlist: 'not-an-array' });
     await mod.sweepHealableDeferred();
     expect(await database.getJob('gpro', gated.permlink)).toMatchObject({ gated: true, gateVideoId: gated.permlink, premium: true });
-    expect(await database.getVideo(gated.permlink)).toMatchObject({ gated: true, gate_video_id: gated.permlink, allowlist: ['amy'] });
+    expect(await database.getVideo(gated.permlink)).toMatchObject({ gated: true, gate_video_id: gated.permlink, allowlist: ['amy'], public_at: new Date('2027-05-06T00:00:00Z') });
     expect(await database.getJob('glapsed', lapsed.permlink)).toBeNull();
     expect((await database.getVideo(lapsed.permlink)).status).toBe('awaiting_encode');
     await database.updateVideoStatus(lapsed.permlink, 'failed');
