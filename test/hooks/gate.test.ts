@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { isGateConfigured, registerGatedVideo, verifyGatedManifestEncrypted } from '../../src/utils/gate';
+import { MAX_PUBLIC_AT_AHEAD_MS, isGateConfigured, parsePublicAt, registerGatedVideo, verifyGatedManifestEncrypted } from '../../src/utils/gate';
 
 const cfg = (overrides: Record<string, unknown> = {}) =>
   ({ gateUrl: 'https://gate.test//', gateInternalApiKey: 'k', gateCdnBase: 'https://cdn.test/ipfs///', ...overrides }) as any;
@@ -49,6 +49,14 @@ describe('registerGatedVideo', () => {
     fetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
     await registerGatedVideo(cfg(), { videoId: 'v', creator: 'c', manifestCid: 'Qm', allowlist: ['bob'] });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).allowlist).toEqual(['bob']);
+  });
+
+  it('sends publicAt as an ISO date when set, and omits it when not', async () => {
+    fetchMock.mockResolvedValue(new Response('{}', { status: 201 }));
+    await registerGatedVideo(cfg(), { videoId: 'v', creator: 'c', manifestCid: 'Qm', publicAt: new Date('2027-01-02T03:04:05Z') });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).publicAt).toBe('2027-01-02T03:04:05.000Z');
+    await registerGatedVideo(cfg(), { videoId: 'v', creator: 'c', manifestCid: 'Qm', publicAt: null });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).not.toHaveProperty('publicAt');
   });
 
   it('throws with the gate\'s answer on failure', async () => {
@@ -107,5 +115,26 @@ describe('verifyGatedManifestEncrypted', () => {
     expect(await verifyGatedManifestEncrypted(cfg(), 'QmM')).toEqual({ encrypted: false, reason: 'Could not fetch manifest at https://cdn.test/ipfs/QmM/manifest.m3u8' });
     fetchMock.mockRejectedValueOnce(new Error('ECONNRESET'));
     expect((await verifyGatedManifestEncrypted(cfg(), 'QmM')).encrypted).toBe(false);
+  });
+});
+
+describe('parsePublicAt', () => {
+  const now = Date.parse('2026-11-28T12:00:00Z');
+
+  it('treats absent as members-only for good', () => {
+    expect(parsePublicAt(undefined, now)).toEqual({ ok: true, date: null });
+    expect(parsePublicAt(null, now)).toEqual({ ok: true, date: null });
+  });
+
+  it('accepts an ISO string or epoch milliseconds in the future', () => {
+    expect(parsePublicAt('2026-12-01T00:00:00Z', now)).toEqual({ ok: true, date: new Date('2026-12-01T00:00:00Z') });
+    expect(parsePublicAt(now + 1000, now)).toEqual({ ok: true, date: new Date(now + 1000) });
+  });
+
+  it('rejects other types, unparseable, past and too-far dates', () => {
+    expect(parsePublicAt(true, now)).toMatchObject({ ok: false });
+    expect(parsePublicAt('soon', now)).toEqual({ ok: false, error: 'public_at is not a valid date' });
+    expect(parsePublicAt(now, now)).toEqual({ ok: false, error: 'public_at must be in the future' });
+    expect(parsePublicAt(now + MAX_PUBLIC_AT_AHEAD_MS + 1, now)).toEqual({ ok: false, error: 'public_at may be at most a year ahead' });
   });
 });

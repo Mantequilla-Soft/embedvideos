@@ -14,6 +14,8 @@ export interface AuthSuccess {
   gated: boolean;
   /** 🔐 Named accounts that may watch without Pro. Signed-claim only, like `gated`. */
   allowlist: string[];
+  /** 🔐 Early-access end (members first, public from then on). Signed-claim only, like `gated`. */
+  publicAt: Date | null;
   /** Hold the encode until publish commissions it. Signed-claim only. */
   deferEncode: boolean;
   originalFilename: string | null;
@@ -130,6 +132,8 @@ export async function validateUploadAuth(
   // POST /uploads/token, which checks 3Speak Pro status first.
   const gated = tokenClaims?.gated === true;
   const allowlist = gated && Array.isArray(tokenClaims?.allowlist) ? tokenClaims.allowlist : [];
+  const publicAtDate = gated && typeof tokenClaims?.publicAt === 'string' ? new Date(tokenClaims.publicAt) : null;
+  const publicAt = publicAtDate && !Number.isNaN(publicAtDate.getTime()) ? publicAtDate : null;
   // Signed claim only, for the same reason as `gated`: deferring decides when
   // the job is created, and an API-key caller must not be able to leave uploads
   // parked with no encode.
@@ -250,5 +254,5 @@ export async function validateUploadAuth(
     }
   }
 
-  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, deferEncode, originalFilename, duration, size, streamVod, replacesExisting };
+  return { ok: true, owner, permlink, frontend_app, short, gated, allowlist, publicAt, deferEncode, originalFilename, duration, size, streamVod, replacesExisting };
 }

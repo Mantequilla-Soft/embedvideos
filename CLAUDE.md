@@ -63,6 +63,10 @@ Community pull uses `failedWorkers: { $ne: encoderName }`, which also matches jo
 
 Tests: `npx ts-node --transpile-only scripts/test-retry-dispatch.ts` (18 checks, no MongoDB required).
 
+### Pick order
+
+Pending jobs are taken by `priority` descending, then `createdAt` ascending (`PENDING_JOB_SORT`, index `{ status: 1, priority: -1, createdAt: 1 }`), by the managed dispatcher and by community pull alike. The 3Speak checker sets `priority: 1` on a pending job when its owner spends points on a faster encode. It only changes the order: tier, trust and community filters are untouched.
+
 ### Gated (paid) content and encoder trust
 
 Videos with `gated: true` are AES-128 encrypted at encode time; only `3speak-gate` can hand a viewer the key. Dispatch is restricted to encoders carrying `trusted: true`.
@@ -119,7 +123,7 @@ Gating must be decided **before** the encoder runs: the encoder is what encrypts
 
 1. The token response also returns a `finalize_token` (12h TTL, `scope: 'finalize'`).
 2. The upload runs normally; `post-finish` pins the input but creates **no job**, parking the video at `status: 'awaiting_encode'`.
-3. `POST /video/:permlink/encode` (Bearer finalize token, body `{ gated, allowlist }`) writes the gating and queues the job atomically — gating first, so the dispatcher can never see a job whose video is not yet marked gated.
+3. `POST /video/:permlink/encode` (Bearer finalize token, body `{ gated, allowlist, public_at }`) writes the gating and queues the job atomically, gating first, so the dispatcher can never see a job whose video is not yet marked gated.
 
 Pro status is re-checked at step 3, not trusted from issuance, because it can lapse in between and that is the moment the capability is granted.
 

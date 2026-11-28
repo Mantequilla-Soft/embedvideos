@@ -129,6 +129,7 @@ describe('POST /uploads/token', () => {
     expect(claimsOf(res.body.token).deferEncode).toBe(true);
     const fin = claimsOf(res.body.finalize_token);
     expect(fin).toMatchObject({ scope: 'finalize', maxFileSize: 0, gated: false, allowlist: [], permlink: res.body.permlink });
+    expect(fin).not.toHaveProperty('publicAt');
     expect(fin.exp - fin.iat).toBe(12 * 60 * 60);
     expect(fin.jti).not.toBe(claimsOf(res.body.token).jti);
   });
@@ -172,6 +173,25 @@ describe('POST /uploads/token', () => {
       // An empty guest list is not signed at all.
       const none = await token({ owner: who, gated: true, allowlist: [] });
       expect(claimsOf(none.body.token).allowlist).toBeUndefined();
+    });
+
+    it('validates public_at', async () => {
+      expect((await token({ owner: 'x', gated: true, public_at: 'soon' })).body).toEqual({ error: 'public_at is not a valid date' });
+      expect((await token({ owner: 'x', gated: true, public_at: Date.now() - 1000 })).body).toEqual({ error: 'public_at must be in the future' });
+      expect((await token({ owner: 'x', gated: true, public_at: { at: 1 } })).status).toBe(422);
+    });
+
+    it('signs public_at for Pro owners, and never on an ungated token', async () => {
+      const who = owner('pro');
+      await makePro(who);
+      const at = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+      const res = await token({ owner: who, gated: true, public_at: at, defer_encode: true });
+      expect(res.status).toBe(201);
+      expect(claimsOf(res.body.token).publicAt).toBe(at);
+      expect(claimsOf(res.body.finalize_token)).not.toHaveProperty('publicAt');
+      const ungated = await token({ owner: who, public_at: at });
+      expect(ungated.status).toBe(201);
+      expect(claimsOf(ungated.body.token)).not.toHaveProperty('publicAt');
     });
 
     it('answers 500 when the Pro lookup fails', async () => {

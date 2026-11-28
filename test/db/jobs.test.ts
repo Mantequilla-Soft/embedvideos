@@ -39,6 +39,15 @@ describe('getPendingJobs', () => {
     expect((await database.getPendingJobs()).map((j) => j.permlink)).toEqual(['p1', 'p2', 'p3']);
     expect((await database.getPendingJobs(2)).map((j) => j.permlink)).toEqual(['p1', 'p2']);
   });
+
+  it('puts prioritised jobs first, then keeps oldest first', async () => {
+    await database.createJob(job({ permlink: 'old', createdAt: minutesAgo(30) }));
+    await database.createJob(job({ permlink: 'boosted-new', priority: 1, createdAt: minutesAgo(1) }));
+    await database.createJob(job({ permlink: 'boosted-old', priority: 1, createdAt: minutesAgo(5) }));
+    await database.createJob(job({ permlink: 'zero', priority: 0, createdAt: minutesAgo(20) }));
+    // Mongo sorts a missing field below every number, so an explicit 0 still comes before none.
+    expect((await database.getPendingJobs()).map((j) => j.permlink)).toEqual(['boosted-old', 'boosted-new', 'zero', 'old']);
+  });
 });
 
 describe('claimNextManagedJob', () => {
@@ -61,6 +70,20 @@ describe('claimNextManagedJob', () => {
     expect((await database.claimNextManagedJob({ short: true }))?.permlink).toBe('short');
     expect(await database.claimNextManagedJob({ premium: true })).toBeNull();
     expect((await database.claimNextManagedJob({ premium: false, short: false }))?.permlink).toBe('free');
+  });
+
+  it('claims a prioritised job before older ones, the filters still apply', async () => {
+    await database.createJob(job({ permlink: 'old', createdAt: minutesAgo(30) }));
+    await database.createJob(job({ permlink: 'boosted', priority: 1, createdAt: minutesAgo(1) }));
+    await database.createJob(job({ permlink: 'boosted-short', short: true, priority: 1, createdAt: minutesAgo(2) }));
+    expect((await database.claimNextManagedJob({ short: false }))?.permlink).toBe('boosted');
+    expect((await database.claimNextManagedJob({}))?.permlink).toBe('boosted-short');
+    expect((await database.claimNextManagedJob({}))?.permlink).toBe('old');
+  });
+
+  it('declares the priority index for pending jobs', async () => {
+    const idx = await jobs().indexes();
+    expect(idx.some((i) => JSON.stringify(i.key) === '{"status":1,"priority":-1,"createdAt":1}')).toBe(true);
   });
 
   it('two concurrent claims never get the same job', async () => {
@@ -203,6 +226,16 @@ describe('claimNextCommunityJob', () => {
     expect(second?.permlink).toBe('ok-gated-false');
     expect(second?.callbackToken).not.toBe(first?.callbackToken);
 
+    expect(await database.claimNextCommunityJob('community-1', null)).toBeNull();
+  });
+
+  it('community nodes also take a prioritised job first', async () => {
+    await database.createJob(job({ permlink: 'old', createdAt: minutesAgo(30) }));
+    await database.createJob(job({ permlink: 'boosted', priority: 1, createdAt: minutesAgo(1) }));
+    // A prioritised premium job still never reaches a community node.
+    await database.createJob(job({ permlink: 'boosted-prem', premium: true, priority: 1, createdAt: minutesAgo(2) }));
+    expect((await database.claimNextCommunityJob('community-1', null))?.permlink).toBe('boosted');
+    expect((await database.claimNextCommunityJob('community-1', null))?.permlink).toBe('old');
     expect(await database.claimNextCommunityJob('community-1', null)).toBeNull();
   });
 

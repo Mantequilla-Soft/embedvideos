@@ -104,7 +104,7 @@ describe('POST /webhook complete', () => {
 
   it('verifies a gated video\'s encryption and registers it with the gate', async () => {
     gateWorld();
-    const v = await insertVideo(database, { owner: 'alice', status: 'processing', gated: true, gate_video_id: 'gate-vid', allowlist: ['bob'] });
+    const v = await insertVideo(database, { owner: 'alice', status: 'processing', gated: true, gate_video_id: 'gate-vid', allowlist: ['bob'], public_at: new Date('2027-01-01T00:00:00Z') });
     const res = await hook({ owner: 'alice', permlink: v.permlink, status: 'complete', manifest_cid: 'QmGated' });
     expect(res.status).toBe(200);
     expect((await database.getVideo(v.permlink)).status).toBe('published');
@@ -124,6 +124,7 @@ describe('POST /webhook complete', () => {
       manifestPath: 'manifest.m3u8',
       previewUrl: 'https://cdn.test/ipfs/QmGated/preview/index.m3u8',
       allowlist: ['bob'],
+      publicAt: '2027-01-01T00:00:00.000Z',
     });
   });
 
